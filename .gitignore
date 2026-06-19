@@ -1,0 +1,27 @@
+# Rust build outputs in any crate (lib, firmware/, bench-fw-*/, examples/, ...).
+target/
+Cargo.lock
+
+# Built firmware images (objcopy output); rebuilt from source, never tracked.
+*.bin
+
+# Firmware build artifacts (the .bin images are built by the human before flashing).
+/firmware/dist
+
+# Python bytecode cache from the config tool.
+__pycache__/
+*.pyc
+
+# Local bench + test-infra notes (hardware, flashing, our concrete test setup); not published
+/bench/
+
+# Harness: venv, build artifacts, caches, and per-vector snippet-crate target dirs are not published.
+/harness/.venv/
+/harness/build/
+/harness/snippet-crate/target/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Reverse-engineering-derived spec/plan/research docs; kept local, not published.
+/specs/

@@ -1,0 +1,33 @@
+[package]
+name = "runtime-hal"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Runtime HAL for STM32F1-compatible Cortex-M3 MCUs (GD32 F1x0/F10x): one binary boots on any supported part and uses heuristics to detect the MCU family and measure its peripheral capabilities at runtime, then drives the correct register model. Board-agnostic. See README.md."
+repository = "https://github.com/hoverboardhavoc/runtime-hal"
+readme = "README.md"
+keywords = ["gd32", "cortex-m", "hal", "embedded", "no-std"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[dependencies]
+cortex-m = "0.7"
+embedded-hal = "1.0"
+embedded-io = "0.6"
+heapless = "0.8"
+# runtime-hal must NOT depend on the firmware crate.
+
+[dev-dependencies]
+embedded-hal-mock = "0.11"
+# proptest drives the T6 BRR baud sweep against the SPL formula oracle (host tests only).
+proptest = "1"
+
+[features]
+# `mock` is a dev / host-test feature only (DECISIONS.md #8: features never gate a family path).
+# It enables std for host tests and switches the Reg accessor to a backing-array backend so tests
+# can read/write the "register space" without real MMIO. The normal build is real volatile MMIO.
+#
+# Runtime heuristic detection is the ONLY way the HAL learns its chip identity (the family probe plus
+# the peripheral-presence measurement); it is always compiled in, not gated behind a feature. The
+# bus-fault probe is hardware-only and is simply not exercised under `mock` (no host/emulator raises
+# the reserved-region bus fault it relies on).
+mock = []

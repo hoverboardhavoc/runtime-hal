@@ -1,0 +1,223 @@
+name: harness
+
+# Golden-comparison harness (tier 2): build the runtime-hal MMIO snippets,
+# extract their register traces under Unicorn, and diff them against the
+# COMMITTED GD SPL goldens (compare --against-trace), plus the planted-bug
+# self-test and the pure-python harness tests.
+#
+# CI has no local GD32Firmware SPL tree and no bench/harness.toml, so the
+# SPL-rebuild + capture path cannot run here. The harness gates every SPL-build
+# test on the bench config being present (paths.bench_config_present()), so on
+# CI those tests skip cleanly while the runtime-hal-side build + against-trace
+# compare + self-test + pure-python tests all run. Regenerating goldens (which
+# DOES need the local SPL) is a separate manual/dispatch job below, expected to
+# run only on a machine that has the SPL tree and bench config.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  harness:
+    name: runtime-hal trace vs committed goldens
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust thumbv7m target: the runtime-hal snippet crate is a no_std
+      # thumbv7m-none-eabi staticlib.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7m-none-eabi
+
+      # arm-none-eabi toolchain: used as the LINKER for the runtime-hal snippet
+      # staticlib (gcc links the staticlib + startup.S into the trace ELF). The
+      # SPL C build also uses it, but that path is gated off on CI. Pinned to the
+      # same Arm GNU Toolchain release line the local goldens were captured with.
+      - name: Install arm-none-eabi-gcc
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: "13.2.Rel1"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install harness package
+        working-directory: harness
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install --upgrade pip
+          ./.venv/bin/pip install -e . pytest
+
+      # The external CBOR descriptor and its config tool were removed: runtime heuristic detection is
+      # now the only chip-identity path, so there is no blob to build/validate/round-trip. The chip
+      # model and the family -> descriptor synthesis are covered by the host unit tests below; the
+      # on-silicon family probe + peripheral-presence measurement are validated by the bench firmware
+      # (bench-fw/detect, bench-fw/probe), not on CI (no host/emulator raises the bus fault).
+
+      # M3 T12: the full host test suite under the mock feature. This is what carries the
+      # RAM-vector-table tests (slot-by-slot for BOTH irq layouts, the exception-after-flip
+      # sequencing test, the grouped combined-demux routing, the registration no-op-default guard,
+      # and the misplaced-vector-slot planted-bug self-test) onto the fast PR path, alongside every
+      # other src/ unit test (timer-PWM / injected-ADC config arithmetic, etc). The runtime-hal
+      # crate is a no_std HAL, so the host tests need the `mock` feature (host std + the mock
+      # register space). Unicorn models no NVIC, so these IRQ checks are host-side, not emulated.
+      - name: Cargo host tests --features mock (RAM vector table + units)
+        run: cargo test --features mock
+
+      # The full matrix as committed-golden compares (fast: no SPL rebuild). Each
+      # exits 0 only if the freshly built runtime-hal trace matches its golden.
+      - name: Matrix compare --against-trace (committed goldens)
+        working-directory: harness
+        run: |
+          set -euo pipefail
+          fail=0
+          # $3 = golden library dir (default gd-spl; the runtime-hal-only
+          # with_polling self-test goldens live under runtime-hal/).
+          run() {
+            local vector="$1" family="$2" lib="${3:-gd-spl}"
+            local golden="golden/${lib}/local/${family}/${vector}.trace"
+            echo "::group::compare ${vector}"
+            if ./.venv/bin/regcmp compare "${vector}" --against-trace "${golden}"; then
+              echo "  -> match"
+            else
+              echo "::error::${vector} diverged from committed golden ${golden}"
+              fail=1
+            fi
+            echo "::endgroup::"
+          }
+          run clock_enable_usart1_gpioa_f1x0           gd32f1x0
+          run clock_enable_usart1_gpioa_f10x           gd32f10x
+          run gpio_af_usart1_tx_pa2_f1x0               gd32f1x0
+          run gpio_af_usart1_rx_pa3_f1x0               gd32f1x0
+          run gpio_af_usart1_tx_pa2_f10x               gd32f10x
+          run gpio_af_usart1_rx_pa3_f10x               gd32f10x
+          run usart_bringup_usart1_115200_8n1_f1x0     gd32f1x0
+          run usart_bringup_usart1_115200_8n1_f10x     gd32f10x
+
+          # --- M2 cold-path matrix: {gd32f1x0, gd32f10x} x {clock-tree, i2c, spi, adc} ---
+          # Each peripheral has its config golden (vs GD SPL, final_state) and its
+          # transfer-sequencing golden (vs the runtime-hal with_polling oracle), plus the T4/T5
+          # bus clock-enable + bus-pin gpio-AF config goldens the clock-tree key rides on.
+
+          # clock-tree: full 72 MHz IRC8M->PLL tree config (vs GD SPL) + the poll-sequence golden.
+          run clock_tree_72m_irc8m_f1x0                gd32f1x0
+          run clock_tree_72m_irc8m_f10x                gd32f10x
+          run clock_tree_polling_72m_f1x0              gd32f1x0  runtime-hal
+          run clock_tree_polling_72m_f10x              gd32f10x  runtime-hal
+          # T4/T5: bus + ADC clock enables and bus-pin gpio AF (part of the clock-tree key path).
+          run clock_enable_i2c0_gpiob_f1x0             gd32f1x0
+          run clock_enable_i2c0_gpiob_f10x             gd32f10x
+          run clock_enable_spi0_gpioa_f1x0             gd32f1x0
+          run clock_enable_spi0_gpioa_f10x             gd32f10x
+          run clock_enable_adc0_f1x0                   gd32f1x0
+          run clock_enable_adc0_f10x                   gd32f10x
+          run gpio_af_i2c0_scl_sda_f1x0                gd32f1x0
+          run gpio_af_i2c0_scl_sda_f10x                gd32f10x
+          run gpio_af_spi0_pins_f1x0                   gd32f1x0
+          run gpio_af_spi0_pins_f10x                   gd32f10x
+
+          # i2c: bring-up config (vs GD SPL) + the IMU WHO_AM_I transfer poll-sequence golden.
+          run i2c_bringup_i2c0_100k_f1x0               gd32f1x0
+          run i2c_bringup_i2c0_100k_f10x               gd32f10x
+          run i2c_transfer_whoami_f1x0                 gd32f1x0  runtime-hal
+          run i2c_transfer_whoami_f10x                 gd32f10x  runtime-hal
+
+          # spi: bring-up config (vs GD SPL) + the loopback full-duplex transfer poll-sequence golden.
+          run spi_bringup_spi0_1m_mode0_f1x0           gd32f1x0
+          run spi_bringup_spi0_1m_mode0_f10x           gd32f10x
+          run spi_transfer_loopback_f1x0               gd32f1x0  runtime-hal
+          run spi_transfer_loopback_f10x               gd32f10x  runtime-hal
+
+          # adc: regular bring-up config (vs GD SPL) + the calibration and VREFINT-read
+          # poll-sequence goldens (the calibration-done and EOC waits).
+          run adc_bringup_adc0_vrefint_f1x0            gd32f1x0
+          run adc_bringup_adc0_vrefint_f10x            gd32f10x
+          run adc_calibrate_adc0_f1x0                  gd32f1x0  runtime-hal
+          run adc_calibrate_adc0_f10x                  gd32f10x  runtime-hal
+          run adc_transfer_vrefint_f1x0                gd32f1x0  runtime-hal
+          run adc_transfer_vrefint_f10x                gd32f10x  runtime-hal
+
+          # --- M3 hot-path matrix: {gd32f1x0, gd32f10x} x {timer-pwm, timer-trigger, injected-adc} ---
+          # The advanced-timer complementary PWM, the timer trigger output, and the timer-triggered
+          # injected ADC, each as committed-golden compares (fast: no SPL rebuild). The config goldens
+          # diff vs the GD SPL (final_state); the injected-read transfer-sequencing golden diffs vs the
+          # runtime-hal with_polling oracle (busy->done EOIC then read). F10x dual injected (T11) is
+          # deferred and intentionally NOT in this matrix. The cross-peripheral trigger-matrix
+          # invariant + the planted-bug self-test (incl the wrong-dead-time, wrong-trigger-source,
+          # dropped-EOIC-poll, and misplaced-vector-slot classes) ride in the pytest / cargo-test steps.
+
+          # timer-pwm: center-aligned complementary bring-up config (vs GD SPL) + the set_duties
+          # resolve-once handle writes (the three CHxCV phase compares), both vs GD SPL.
+          run timer_pwm_bringup_timer0_f1x0            gd32f1x0
+          run timer_pwm_bringup_timer0_f10x            gd32f10x
+          run timer_pwm_setduties_timer0_f1x0          gd32f1x0
+          run timer_pwm_setduties_timer0_f10x          gd32f10x
+          # timer-trigger: the CH3 trigger compare (~CAR-1) + the CR2/CTL1 MMC TRGO select (vs GD SPL).
+          run timer_trgo_trigger_timer0_f1x0           gd32f1x0
+          run timer_trgo_trigger_timer0_f10x           gd32f10x
+          # injected-adc: the timer-triggered injected-group bring-up config (vs GD SPL) + the
+          # "trigger then read injected" poll-sequence golden (vs the runtime-hal with_polling oracle).
+          run adc_inject_bringup_adc0_f1x0             gd32f1x0
+          run adc_inject_bringup_adc0_f10x             gd32f10x
+          run adc_inject_read_adc0_f1x0                gd32f1x0  runtime-hal
+          run adc_inject_read_adc0_f10x                gd32f10x  runtime-hal
+          exit $fail
+
+      # The planted-bug self-test (harness self-validation) + the pure-python and
+      # runtime-hal-side tests. The SPL-build tests skip because there is no
+      # bench config on CI.
+      - name: Harness pytest (self-test + against-trace + python)
+        working-directory: harness
+        run: ./.venv/bin/pytest -q -rs
+
+  # Manual/dispatch only: regenerate the GD SPL goldens. This NEEDS the local
+  # GD32Firmware SPL tree and a bench/harness.toml, neither of which exist on a
+  # stock CI runner, so it is expected to run on a self-hosted runner / bench
+  # machine. It is documented here so the golden-pin-bump path is discoverable;
+  # do not enable it on the PR path.
+  goldens:
+    name: regenerate GD SPL goldens (manual; needs local SPL)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, gd-spl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7m-none-eabi
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install harness package
+        working-directory: harness
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install -e . pytest
+      - name: Recapture goldens (requires bench/harness.toml + local SPL)
+        working-directory: harness
+        run: |
+          set -euo pipefail
+          for v in \
+            gpio_af_usart1_tx_pa2_f1x0 \
+            clock_enable_usart1_gpioa_f1x0 clock_enable_usart1_gpioa_f10x \
+            gpio_af_usart1_rx_pa3_f1x0 gpio_af_usart1_tx_pa2_f10x gpio_af_usart1_rx_pa3_f10x \
+            usart_bringup_usart1_115200_8n1_f1x0 usart_bringup_usart1_115200_8n1_f10x \
+            clock_tree_72m_irc8m_f1x0 clock_tree_72m_irc8m_f10x \
+            timer_pwm_bringup_timer0_f1x0 timer_pwm_bringup_timer0_f10x \
+            timer_pwm_setduties_timer0_f1x0 timer_pwm_setduties_timer0_f10x \
+            timer_trgo_trigger_timer0_f1x0 timer_trgo_trigger_timer0_f10x \
+            adc_inject_bringup_adc0_f1x0 adc_inject_bringup_adc0_f10x; do
+            ./.venv/bin/regcmp capture "$v"
+          done
+          # The clock with_polling goldens are runtime-hal-only self-tests; capture them too
+          # (capture auto-selects the runtime-hal slug when there is no gd-spl impl). The M3 injected
+          # "trigger then read" with_polling oracle is runtime-hal-only as well.
+          for v in clock_tree_polling_72m_f1x0 clock_tree_polling_72m_f10x \
+                   adc_inject_read_adc0_f1x0 adc_inject_read_adc0_f10x; do
+            ./.venv/bin/regcmp capture "$v"
+          done
+          git diff --stat golden/
