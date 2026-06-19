@@ -1,0 +1,26 @@
+[package]
+name = "bench-fw-detect"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "On-silicon acceptance firmware for runtime family detection: runs the bus-fault-safe GPIO+RCU family probe and the family -> chip synthesis ENTIRELY through runtime-hal (real MMIO, NOT the mock feature), and publishes the probe + synthesis result in a fixed-layout RAM struct a human reads over SWD. Builds for the F130 (F1x0) and F103 (F10x); each board confirms its family."
+
+[dependencies]
+# runtime-hal in its normal real-MMIO no_std build. NOT the `mock` feature (the probe relies on a
+# REAL bus fault, which no host/emulator raises). Runtime detection is always compiled in now.
+runtime-hal = { path = "../..", default-features = false }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-detect"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

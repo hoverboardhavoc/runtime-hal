@@ -1,0 +1,9 @@
+# Cortex-M3 target (both the GD32F130 and GD32F103 are Cortex-M3 / thumbv7m).
+[build]
+target = "thumbv7m-none-eabi"
+
+[target.thumbv7m-none-eabi]
+rustflags = [
+    # cortex-m-rt's linker script; it pulls in OUT_DIR/memory.x (placed by build.rs).
+    "-C", "link-arg=-Tlink.x",
+]

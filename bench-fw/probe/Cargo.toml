@@ -1,0 +1,27 @@
+[package]
+name = "bench-fw-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Peripheral-presence probe firmware / standalone validator for the library's MEASURE step: runs the family probe, then measures which advanced timers and ADCs the chip actually has (rather than inferring counts from a family constant). For each candidate peripheral it records two independent presence signals (RCU enable-bit stickiness and a fault-safe base read + benign scratch write-back) and a classified status, in a fixed-layout RAM struct read over SWD. Strictly read-only on hardware: clock-enable + enable-bit-readback + register read + benign scratch-write-restore. NEVER configures PWM, sets MOE/POEN/BKDT, channel enables, or gate pins. Builds for both the F130 (F1x0) and F103 (F10x); one binary runs on both."
+
+[dependencies]
+# runtime-hal in its normal real-MMIO no_std build (it carries the bus-fault-safe probe machinery the
+# sweep reuses). NOT the `mock` feature (the probe relies on a REAL bus fault, which no host/emulator
+# raises). Runtime detection + measurement is always compiled in now.
+runtime-hal = { path = "../..", default-features = false }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-probe"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false
