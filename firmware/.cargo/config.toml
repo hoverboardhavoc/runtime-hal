@@ -1,0 +1,9 @@
+# Cortex-M3 target for both F103 and F130 (both are Cortex-M3 / thumbv7m).
+[build]
+target = "thumbv7m-none-eabi"
+
+[target.thumbv7m-none-eabi]
+rustflags = [
+    # cortex-m-rt's linker script; it pulls in OUT_DIR/memory.x (placed by build.rs).
+    "-C", "link-arg=-Tlink.x",
+]

@@ -1,0 +1,36 @@
+[package]
+name = "runtime-hal-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "M1 inter-board UART bench firmware: F103 master + F130 slave from ONE binary. The chip is detected at runtime through runtime-hal (no compile-time chip selection); the master/slave role is chosen by the detected family."
+
+# ONE source runs on either board: the chip is detected at runtime through runtime-hal, and the
+# master/slave role is chosen by the detected family (F10x = master, F1x0 = slave, matching the proven
+# SPL bench setup). The `f103` / `f130` feature now selects ONLY the linker memory.x (RAM size differs
+# per board: F103C8 20 KiB, F130C8 8 KiB), a property of the flashed image, not of the code. Exactly
+# one must be set; default f103.
+[features]
+default = ["f103"]
+f103 = []
+f130 = []
+
+[dependencies]
+# runtime-hal in its normal (real volatile MMIO, no_std) build: NOT the `mock` feature.
+runtime-hal = { path = "..", default-features = false }
+embedded-hal = "1.0"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false
