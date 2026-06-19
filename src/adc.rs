@@ -503,5 +503,29 @@ impl Adc {
     }
 }
 
+/// What ADC sampling this chip can do, as a capability "fruit": the caller matches on the silicon
+/// SHAPE, never on the MCU family. Returned by [`crate::Chip::adc`].
+///
+/// - [`AdcCapability::Single`]: one ADC (the F1x0 baseline). Sample channels in sequence.
+/// - [`AdcCapability::Dual`]: two ADCs (the F10x dual-ADC parts), handed back as `primary` +
+///   `secondary`. The pair can be driven for at-the-same-instant phase-current sampling; this fruit
+///   hands back BOTH handles so each is usable today. (The hardware regular-simultaneous trigger
+///   coupling is a future bring-up; the two handles are independently usable now.)
+///
+/// Because a caller `match`es this exhaustively, firmware that uses the ADC handles BOTH shapes and so
+/// runs on either family by construction, with no family test.
+#[derive(Debug, Clone, Copy)]
+pub enum AdcCapability {
+    /// A single ADC.
+    Single(Adc),
+    /// Two ADCs (F10x dual-ADC parts): the primary (ADC0) and secondary (ADC1).
+    Dual {
+        /// The primary ADC (ADC0).
+        primary: Adc,
+        /// The secondary ADC (ADC1).
+        secondary: Adc,
+    },
+}
+
 #[cfg(test)]
 mod tests;

@@ -12,6 +12,7 @@
 //! resolves a base once via `Chip`, constructs the handle, and the per-cycle path holds raw bases.
 
 use crate::addr::PeriphLabel;
+use crate::adc::{Adc, AdcCapability};
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
 use crate::error::DescriptorError;
 use crate::gpio::{
@@ -233,6 +234,21 @@ impl Chip {
         self.desc.addrs.check_adc_base(label).is_ok()
     }
 
+    /// The chip's ADC sampling capability as a "fruit" (silicon shape, never a family flag): one ADC,
+    /// or two (the F10x dual-ADC parts). The ADC base(s) are resolved INTERNALLY and handed back as
+    /// [`crate::adc::Adc`] handle(s); the caller never sees a base, and matches the returned
+    /// [`AdcCapability`] exhaustively (so its firmware handles both shapes and runs on either family).
+    /// Returns [`DescriptorError::MissingBase`] if ADC0 (or, on a dual part, ADC1) is absent.
+    pub fn adc(&self) -> Result<AdcCapability, DescriptorError> {
+        let primary = Adc::at(self.base(PeriphLabel::Adc0)?);
+        if self.adc_count() >= 2 {
+            let secondary = Adc::at(self.base(PeriphLabel::Adc1)?);
+            Ok(AdcCapability::Dual { primary, secondary })
+        } else {
+            Ok(AdcCapability::Single(primary))
+        }
+    }
+
     /// Route `pin` to the general-purpose-timer PWM output (TIMER1_CH1), doing ALL the family-specific
     /// register work INTERNALLY so the caller never names a family. Used by [`crate::pwm::PwmOut`] so
     /// pin routing folds into the PWM bring-up.
@@ -312,6 +328,26 @@ mod tests {
         // (The HAL no longer exposes a family() tag: the caller never branches on family.)
         assert_eq!(Chip::from_descriptor(descriptor_f103()).gpio(), GpioPath::ApbCrlCrh);
         assert_eq!(Chip::from_descriptor(descriptor_f130()).gpio(), GpioPath::AhbCtlAfsel);
+    }
+
+    #[test]
+    fn adc_fruit_is_single_or_dual_by_count() {
+        use crate::adc::AdcCapability;
+        // One ADC (the F1x0 baseline): Single.
+        let single = Chip::from_descriptor(descriptor_f130());
+        assert!(matches!(single.adc(), Ok(AdcCapability::Single(_))));
+
+        // Two ADCs (as detect_chip populates for adc_count == 2): Dual, with ADC1 carried.
+        let mut d = descriptor_f103();
+        d.adc_count = 2;
+        d.addrs.set(PeriphLabel::Adc1, 0x4001_2800);
+        let dual = Chip::from_descriptor(d);
+        assert!(matches!(dual.adc(), Ok(AdcCapability::Dual { .. })));
+
+        // A part that claims 2 ADCs but is missing the ADC1 base fails loud (no fake handle).
+        let mut bad = descriptor_f103();
+        bad.adc_count = 2;
+        assert!(Chip::from_descriptor(bad).adc().is_err());
     }
 
     #[test]

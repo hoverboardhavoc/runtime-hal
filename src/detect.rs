@@ -62,6 +62,10 @@ pub enum Family {
 /// resolves `Timer7` as [`crate::error::DescriptorError::MissingBase`].
 const TIMER7_BASE: u32 = 0x4001_3400;
 
+/// ADC1 base on the F10x dual-ADC parts (APB2 ADC window, ADC0 + 0x400). Added by [`detect_chip`]
+/// only when a second ADC is measured, so single-ADC parts resolve `Adc1` as `MissingBase`.
+const ADC1_BASE: u32 = 0x4001_2800;
+
 // --- the per-family chip descriptor constants (the register-model + base-address facts) -------
 //
 // These are the family-correct selectors and base addresses. `adv_timers` / `adc_count` carry the
@@ -218,6 +222,11 @@ pub fn detect_chip() -> Result<Chip, DetectError> {
     //    fixed by the family at the APB2 advanced-timer window (TIM8 = 0x4001_3400 on the F10x).
     if desc.adv_timers >= 2 {
         desc.addrs.set(PeriphLabel::Timer7, TIMER7_BASE);
+    }
+    // Likewise a part with a SECOND ADC (the F10x dual-ADC parts) carries ADC1's base, so the dual
+    // capability resolves; single-ADC parts (the F1x0 baseline) leave it absent.
+    if desc.adc_count >= 2 {
+        desc.addrs.set(PeriphLabel::Adc1, ADC1_BASE);
     }
 
     Ok(Chip::from_descriptor(desc))

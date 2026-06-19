@@ -46,7 +46,7 @@ pub mod usart;
 /// one model parameterised by base, no per-family register branch.
 pub mod watchdog;
 
-pub use adc::{is_internal_channel, Adc};
+pub use adc::{is_internal_channel, Adc, AdcCapability};
 pub use addr::{AddrTable, PeriphLabel};
 pub use chip::Chip;
 pub use clock::{
