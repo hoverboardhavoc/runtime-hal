@@ -267,6 +267,149 @@ impl Chip {
     pub const fn adc_count(&self) -> u8 {
         self.desc.adc_count
     }
+
+    /// The architecture-specific bring-up witness for family-divergent setup the HAL does not
+    /// abstract (general-purpose timer / PWM pin routing).
+    ///
+    /// Unlike [`Chip::family`] (which hands back a bare [`Family`] tag that says nothing about WHICH
+    /// register model is legal), `arch()` returns an [`Arch`] carrying a family-specific TOKEN. The
+    /// token's methods bake in the correct [`GpioPath`] internally, so the wrong-architecture register
+    /// model is not reachable: you cannot ask an [`F10xArch`] token to do the F1x0 per-pin `AFSEL`
+    /// write, and `remap_timer1_partial1` (an F10x-only AFIO operation) exists ONLY on [`F10xArch`].
+    /// A mis-paired call is a COMPILE error, not a silent bad write to a reserved region.
+    ///
+    /// This is the type-safe replacement for branching on `family()` and then calling the raw
+    /// [`crate::gpio::configure_af`] with a hand-picked [`GpioPath`] (where passing the wrong path
+    /// compiles fine and faults at runtime).
+    ///
+    /// ```rust,ignore
+    /// use runtime_hal::{Arch, PinRole};
+    ///
+    /// // Drive TIMER1_CH1 onto PB3 on either board, with the wrong-family path made unrepresentable:
+    /// fn route_pb3_timer(chip: &runtime_hal::Chip) {
+    ///     const PB3: u8 = (1 << 4) | 3;
+    ///     match chip.arch() {
+    ///         Arch::F10x(f10x) => {
+    ///             f10x.free_jtag_pins().ok();          // F10x-only: release PB3 from JTAG (keeps SWD)
+    ///             f10x.remap_timer1_partial1().ok();   // F10x-only: AFIO TIMER1_REMAP = partial-1
+    ///             f10x.configure_pin_af(PB3, PinRole::GenTimerAfPushPull).ok();
+    ///         }
+    ///         Arch::F1x0(f1x0) => {
+    ///             f1x0.configure_pin_af(PB3, PinRole::GenTimerAfPushPull).ok(); // one AFSEL field
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn arch(&self) -> Arch<'_> {
+        match self.desc.gpio {
+            GpioPath::ApbCrlCrh => Arch::F10x(F10xArch { chip: self }),
+            GpioPath::AhbCtlAfsel => Arch::F1x0(F1x0Arch { chip: self }),
+        }
+    }
+}
+
+/// Map a logical pin byte (`port << 4 | pin`) to its GPIO port label. The high nibble is the port
+/// index (0 = A, 1 = B, 2 = C, 3 = D, 5 = F), matching [`PeriphLabel`]'s GPIO variants. A port index
+/// this crate does not model (E, and any > F) resolves to the GPIOA label, which then fails the base
+/// lookup as [`DescriptorError::MissingBase`] (no part carries an out-of-range GPIO port).
+fn gpio_port_label(pin: u8) -> Result<PeriphLabel, DescriptorError> {
+    match pin >> 4 {
+        0 => Ok(PeriphLabel::Gpioa),
+        1 => Ok(PeriphLabel::Gpiob),
+        2 => Ok(PeriphLabel::Gpioc),
+        3 => Ok(PeriphLabel::Gpiod),
+        5 => Ok(PeriphLabel::Gpiof),
+        // No Gpioe label in this crate's catalog; report a GPIO base miss rather than guess a port.
+        _ => Err(DescriptorError::MissingBase(PeriphLabel::Gpioa)),
+    }
+}
+
+/// The architecture-specific bring-up witness returned by [`Chip::arch`].
+///
+/// Each variant carries a family TOKEN borrowing the [`Chip`]. The token's methods bake in the
+/// correct [`GpioPath`], so the wrong-family register model is not reachable, and F10x-only
+/// operations (AFIO remap, JTAG-pin freeing) live ONLY on the [`F10xArch`] variant. This makes a
+/// mis-paired architecture call a compile error instead of a runtime fault. See [`Chip::arch`].
+#[derive(Debug)]
+pub enum Arch<'c> {
+    /// The GD32F103 (F10x) family: CRL/CRH mode/cnf nibbles plus AFIO remap groups.
+    F10x(F10xArch<'c>),
+    /// The GD32F130 (F1x0) family: per-pin `AFSEL` alternate-function mux.
+    F1x0(F1x0Arch<'c>),
+}
+
+/// F10x (GD32F103) architecture token: family-correct timer / PWM pin-routing setup, plus the
+/// F10x-only AFIO operations. Obtained from [`Chip::arch`]. Holds a borrow of the [`Chip`].
+#[derive(Debug, Clone, Copy)]
+pub struct F10xArch<'c> {
+    chip: &'c Chip,
+}
+
+/// F1x0 (GD32F130) architecture token: family-correct timer / PWM pin-routing setup. Obtained from
+/// [`Chip::arch`]. Holds a borrow of the [`Chip`].
+#[derive(Debug, Clone, Copy)]
+pub struct F1x0Arch<'c> {
+    chip: &'c Chip,
+}
+
+impl F10xArch<'_> {
+    /// The underlying [`Chip`] this token borrows.
+    #[inline]
+    pub const fn chip(&self) -> &Chip {
+        self.chip
+    }
+
+    /// Configure `pin` (a `port << 4 | pin` byte) for an alternate-function `role` on the F10x
+    /// CRL/CRH register model. Resolves the pin's GPIO port to a base from the chip's address table,
+    /// then writes the CRL/CRH mode/cnf nibble (the F10x [`GpioPath`] is baked in, so the F1x0
+    /// per-pin `AFSEL` write is not reachable here). Returns [`DescriptorError::MissingBase`] if the
+    /// port is not in the address table.
+    #[inline]
+    pub fn configure_pin_af(&self, pin: u8, role: gpio::PinRole) -> Result<(), DescriptorError> {
+        let base = self.chip.base(gpio_port_label(pin)?)?;
+        gpio::configure_af(base, GpioPath::ApbCrlCrh, pin, role);
+        Ok(())
+    }
+
+    /// Set the AFIO `TIMER1_REMAP` field to partial-remap-1 (maps `TIMER1_CH1` -> PB3). This is an
+    /// F10x-ONLY operation: the F1x0 has no AFIO, so this method does not exist on [`F1x0Arch`] and a
+    /// call on the wrong family will not compile. Enables the AFIO clock as part of the remap. Returns
+    /// [`DescriptorError::MissingBase`] if the descriptor did not carry the RCU base.
+    #[inline]
+    pub fn remap_timer1_partial1(&self) -> Result<(), DescriptorError> {
+        let rcu = self.chip.rcu_base()?;
+        gpio::remap_timer1_partial1(rcu);
+        Ok(())
+    }
+
+    /// Free the JTAG-overlay pins (PA15 / PB3 / PB4) for GPIO while keeping SWD live (F10x-only; the
+    /// F1x0 has no such overlay). Delegates to [`Chip::free_jtag_pins`]. F10x-only by construction:
+    /// absent on [`F1x0Arch`].
+    #[inline]
+    pub fn free_jtag_pins(&self) -> Result<(), DescriptorError> {
+        self.chip.free_jtag_pins()
+    }
+}
+
+impl F1x0Arch<'_> {
+    /// The underlying [`Chip`] this token borrows.
+    #[inline]
+    pub const fn chip(&self) -> &Chip {
+        self.chip
+    }
+
+    /// Configure `pin` (a `port << 4 | pin` byte) for an alternate-function `role` on the F1x0
+    /// per-pin `AFSEL` register model. Resolves the pin's GPIO port to a base from the chip's address
+    /// table, then writes the per-pin AF mux (the F1x0 [`GpioPath`] is baked in, so the F10x CRL/CRH
+    /// write is not reachable here). Returns [`DescriptorError::MissingBase`] if the port is not in
+    /// the address table.
+    #[inline]
+    pub fn configure_pin_af(&self, pin: u8, role: gpio::PinRole) -> Result<(), DescriptorError> {
+        let base = self.chip.base(gpio_port_label(pin)?)?;
+        gpio::configure_af(base, GpioPath::AhbCtlAfsel, pin, role);
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "mock"))]
@@ -368,6 +511,64 @@ mod tests {
         // Drive low: reset half (bit 15+16).
         led.set_low().unwrap();
         assert_eq!(Reg32::new(0x4001_0800, 0x10).read(), 1 << (15 + 16));
+    }
+
+    // PB3 (port B = 1, pin 3): the green LED / TIMER1_CH1, the pin pwm_fade routes via the arch token.
+    const PB3: u8 = (1 << 4) | 3;
+    // GPIOB bases for each descriptor (one APB/AHB 0x400 stride above GPIOA).
+    const F10X_GPIOB_BASE: u32 = 0x4001_0C00;
+    const F1X0_GPIOB_BASE: u32 = 0x4800_0400;
+
+    #[test]
+    fn arch_returns_f10x_token_for_f103() {
+        let chip = Chip::from_descriptor(descriptor_f103());
+        assert!(matches!(chip.arch(), Arch::F10x(_)));
+    }
+
+    #[test]
+    fn arch_returns_f1x0_token_for_f130() {
+        let chip = Chip::from_descriptor(descriptor_f130());
+        assert!(matches!(chip.arch(), Arch::F1x0(_)));
+    }
+
+    #[test]
+    fn f10x_arch_configure_pin_af_writes_crl_af_nibble() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f103());
+        let Arch::F10x(f10x) = chip.arch() else {
+            panic!("f103 descriptor must yield the F10x arch token");
+        };
+        assert_eq!(f10x.configure_pin_af(PB3, gpio::PinRole::GenTimerAfPushPull), Ok(()));
+        // F10x: PB3 lives in CTL0 (pins 0..7) at offset 0x00, nibble [15:12]; AF push-pull 50 MHz = 0xB.
+        assert_eq!(Reg32::new(F10X_GPIOB_BASE, 0x00).read() & (0xF << 12), 0xB << 12);
+    }
+
+    #[test]
+    fn f1x0_arch_configure_pin_af_writes_afsel_and_ctl() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f130());
+        let Arch::F1x0(f1x0) = chip.arch() else {
+            panic!("f130 descriptor must yield the F1x0 arch token");
+        };
+        assert_eq!(f1x0.configure_pin_af(PB3, gpio::PinRole::GenTimerAfPushPull), Ok(()));
+        // F1x0: PB3 CTL [7:6] = AF mode (2); AFSEL0 nibble [15:12] = AF2 (TIMER1_CH1). No AFIO.
+        assert_eq!(Reg32::new(F1X0_GPIOB_BASE, 0x00).read() & (0x3 << 6), 2 << 6);
+        assert_eq!(Reg32::new(F1X0_GPIOB_BASE, 0x20).read() & (0xF << 12), 2 << 12);
+    }
+
+    #[test]
+    fn f10x_arch_remap_timer1_partial1_sets_afio_pcf0_field() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f103());
+        let Arch::F10x(f10x) = chip.arch() else {
+            panic!("f103 descriptor must yield the F10x arch token");
+        };
+        assert_eq!(f10x.remap_timer1_partial1(), Ok(()));
+        // AFIO_PCF0 TIMER1_REMAP[9:8] = 0b01 (partial remap 1 -> TIMER1_CH1 / PB3).
+        assert_eq!(Reg32::new(AFIO_PCF0, 0).read() & (0b11 << 8), 0b01 << 8);
     }
 
     #[test]

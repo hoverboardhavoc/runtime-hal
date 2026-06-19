@@ -304,6 +304,26 @@ pub fn enable_timer(
     Ok(())
 }
 
+/// Enable the peripheral clock for a GENERAL-purpose timer instance (G3).
+///
+/// `timer_label` must be a general-timer label (`Timer1`). **TIMER1** is on **APB1EN bit 0** on both
+/// families (`RCU_APB1EN_TIMER1EN = BIT(0)`, confirmed against the GD32F10x User Manual line 5425
+/// `0 TIMER1EN TIMER1 clock enable` and the GD32F1x0 User Manual RCU APB1EN; the SPL
+/// `rcu_periph_clock_enable(RCU_TIMER1)` sets exactly this bit). The enable register + bit are the
+/// SAME on both families, so there is no [`ClockPath`] branch (the `path` is accepted for symmetry
+/// with the other enables and to document the family). Returns
+/// [`DescriptorError::UnknownSelector`] for a non-general-timer label (including the ADVANCED timers
+/// `Timer0`/`Timer7`, which the cold-path general PWM must never enable through this path).
+pub fn enable_general_timer(
+    rcu_base: u32,
+    path: ClockPath,
+    timer_label: PeriphLabel,
+) -> Result<(), DescriptorError> {
+    let _ = path; // same enable register + bit on both families.
+    general_timer_enable_bit(timer_label)?.apply(rcu_base);
+    Ok(())
+}
+
 // --- LSI / IRC40K (the free-watchdog clock source) + reset-cause flags (G-WDG) ----------------
 //
 // The free watchdog (FWDGT) is clocked from the always-available ~40 kHz internal RC oscillator
@@ -497,6 +517,20 @@ fn timer_enable_bit(path: ClockPath, timer: PeriphLabel) -> Result<EnableBit, De
         }),
         (ClockPath::F1x0Rcu, PeriphLabel::Timer7) => Err(DescriptorError::SelectorAddrMismatch),
         // Not a timer label.
+        _ => Err(DescriptorError::UnknownSelector),
+    }
+}
+
+/// The enable register + bit for a GENERAL-purpose timer (G3). TIMER1 is on **APB1EN bit 0** on both
+/// families. A non-general-timer label (including the advanced `Timer0`/`Timer7`) is
+/// [`DescriptorError::UnknownSelector`].
+fn general_timer_enable_bit(timer: PeriphLabel) -> Result<EnableBit, DescriptorError> {
+    match timer {
+        // TIMER1 (the general level-0 timer) is APB1EN bit 0 on both families.
+        PeriphLabel::Timer1 => Ok(EnableBit {
+            reg: APB1EN,
+            bit: 0,
+        }),
         _ => Err(DescriptorError::UnknownSelector),
     }
 }

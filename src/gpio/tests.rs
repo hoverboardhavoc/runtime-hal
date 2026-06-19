@@ -334,6 +334,79 @@ fn f1x0_timer_gate_pb13_low_side_is_af_pp_af2() {
 // AF2 numeric value (the F1x0 TIMER0 AF mux), local to the tests for readability.
 const F1X0_AF2: u32 = 2;
 
+// --- G3: general-purpose-timer PWM routing (TIMER1_CH1 -> PB3) ---------------------------------
+//
+// The cold-path general PWM fades the green LED on PB3. The two families route the SAME timer
+// channel to the SAME pin by DIFFERENT mechanisms (the deliberate visible difference):
+//  - F1x0: per-pin AFSEL mux. PB3 -> TIMER1_CH1 is AF2 (GD32F130xx Datasheet Port B AF summary).
+//  - F10x: AFIO TIMER1_REMAP partial-remap-1 (AFIO_PCF0[9:8] = 01) + the CRL AF push-pull nibble.
+
+// PB3 logical byte (port B = 1, pin 3).
+const PB3: u8 = (1u8 << 4) | 3;
+
+#[test]
+fn f1x0_gen_timer_pb3_is_af_pp_af2() {
+    let _g = seed();
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        PB3,
+        PinRole::GenTimerAfPushPull,
+    );
+    // CTL: pin 3, 2 bits at [7:6], AF = 2.
+    assert_eq!(read(CTL), 2 << 6);
+    // AFSEL0: pin 3 -> 4*3 = 12, nibble at [15:12], AF2 (PB3 = TIMER1_CH1 on AF2).
+    assert_eq!(read(AFSEL0), F1X0_AF2 << 12);
+    assert_eq!(read(AFSEL1), 0);
+    // Push-pull, 50 MHz, no pull.
+    assert_eq!(read(OMODE) & (1 << 3), 0);
+    assert_eq!(read(OSPD), 3 << 6);
+    assert_eq!(read(PUD) & (0x3 << 6), 0);
+}
+
+#[test]
+fn f10x_gen_timer_pb3_is_af_pp_nibble() {
+    let _g = seed();
+    // On F10x the AF is implied by the CRL nibble (AF push-pull 50 MHz = 0xB); the per-pin AF mux
+    // does not exist. PB3 is pin 3 -> CTL0 nibble at [15:12].
+    configure_af(
+        PORT_BASE,
+        GpioPath::ApbCrlCrh,
+        PB3,
+        PinRole::GenTimerAfPushPull,
+    );
+    assert_eq!(read(CTL0), 0xB << 12);
+    assert_eq!(read(CTL1), 0);
+}
+
+#[test]
+fn f10x_remap_timer1_partial1_sets_pcf0_field_to_01_and_enables_afio() {
+    let _g = seed();
+    // The AFIO peripheral-config block lives at the fixed F10x absolute base 0x4001_0000; AFIO_PCF0
+    // is at offset 0x04. The RCU base is the F10x RCU base.
+    const RCU_BASE: u32 = 0x4002_1000;
+    const AFIO_PCF0: u32 = 0x4001_0004;
+    crate::gpio::remap_timer1_partial1(RCU_BASE);
+    // AFIO clock enabled: RCU_APB2EN (0x18) bit 0.
+    assert_eq!(Reg32::new(RCU_BASE, 0x18).read() & 1, 1);
+    // TIMER1_REMAP[9:8] = 0b01 (partial remap 1: TIMER1_CH1 -> PB3); no other PCF0 bits set.
+    assert_eq!(Reg32::new(AFIO_PCF0, 0).read(), 0b01 << 8);
+}
+
+#[test]
+fn f10x_remap_timer1_partial1_preserves_swj_cfg() {
+    let _g = seed();
+    // free_jtag_pins sets SWJ_CFG (AFIO_PCF0[26:24]) = 0b010; the TIMER1 remap RMW must not disturb
+    // it (the green-LED routing frees JTAG first, then remaps TIMER1).
+    const RCU_BASE: u32 = 0x4002_1000;
+    const AFIO_PCF0: u32 = 0x4001_0004;
+    Reg32::new(AFIO_PCF0, 0).write(0b010 << 24); // pretend free_jtag_pins ran
+    crate::gpio::remap_timer1_partial1(RCU_BASE);
+    let pcf0 = Reg32::new(AFIO_PCF0, 0).read();
+    assert_eq!(pcf0 & (0b111 << 24), 0b010 << 24, "SWJ_CFG preserved");
+    assert_eq!(pcf0 & (0b11 << 8), 0b01 << 8, "TIMER1_REMAP = 01");
+}
+
 // --- general-purpose push-pull output (configure_output / set_pin / GpioOutput) ---------------
 //
 // The blinky / firmware indicator path: a plain digital output that owns the F10x/F1x0 register

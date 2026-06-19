@@ -68,11 +68,21 @@ pub enum PeriphLabel {
     /// FWDGT (the free / independent watchdog; ST `IWDG`). On APB1 at `0x4000_3000` on BOTH families.
     /// The register block is identical on both, so one model parameterised by this base drives it.
     Fwdgt = 18,
+    // --- G3 (general PWM) addition. APPENDED after `Fwdgt` so the M1/M2/M3/G-WDG discriminants
+    // (0..=18) and their `AddrTable` indices stay stable (the index-stability invariant). Additive,
+    // DECISIONS.md #3.
+    /// TIMER1 (a GENERAL-purpose level-0 timer, NOT the advanced bridge; ST `TIM2`). On APB1 at
+    /// `0x4000_0000` on BOTH families (`GD32F10x_User_Manual` memory map line 1853:
+    /// `0x4000 0000 - 0x4000 03FF TIMER1`; `GD32F1x0_User_Manual` 15.2 "General level0 timer
+    /// (TIMERx, x=1, 2)"). Its PWM register block (CTL0/CHCTL0/CHCTL2/PSC/CAR/CHxCV) has the same
+    /// offsets as the advanced TIMER0 in [`crate::timer`], MINUS the bridge-only fields. The
+    /// cold-path general-PWM target ([`crate::pwm`]).
+    Timer1 = 19,
 }
 
 impl PeriphLabel {
     /// Number of labels; the [`AddrTable`] capacity.
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
 
     /// Index of this label into the address-table backing array.
     #[inline]
@@ -122,6 +132,14 @@ impl PeriphLabel {
     #[inline]
     pub const fn is_fwdgt(self) -> bool {
         matches!(self, PeriphLabel::Fwdgt)
+    }
+
+    /// True for a GENERAL-purpose-timer label (G3): `Timer1`. Distinct from [`Self::is_timer`]
+    /// (the ADVANCED timers `Timer0`/`Timer7`): the general PWM path ([`crate::pwm`]) explicitly
+    /// REFUSES the advanced timers (never touch TIMER0 / the MOE-POEN gate), so it gates on this.
+    #[inline]
+    pub const fn is_general_timer(self) -> bool {
+        matches!(self, PeriphLabel::Timer1)
     }
 }
 
@@ -199,6 +217,17 @@ pub(crate) mod ranges {
     /// (inclusive_lo, exclusive_hi) for the FWDGT base on **APB1**: `0x4000_3000`, a single 0x400
     /// peripheral slot (the next slot at `0x4000_3400` is SPI/the F1x0 SPI block).
     pub const FWDGT_APB1: (u32, u32) = (0x4000_3000, 0x4000_3400);
+
+    // --- G3 general-timer window. Confirmed against the GD32 memory maps (gd32f10x.h / gd32f1x0.h:
+    // `TIMER_BASE = APB1_BUS_BASE + 0`, `TIMER1 = TIMER_BASE + 0`) and the manuals (GD32F10x User
+    // Manual memory map line 1853: `0x4000 0000 - 0x4000 03FF TIMER1`; GD32F1x0 User Manual 15.2
+    // "General level0 timer (TIMERx, x=1, 2)"). TIMER1 sits at the very bottom of APB1, a single
+    // 0x400 peripheral slot. The base is identical on both families, so the window is
+    // family-independent.
+
+    /// (inclusive_lo, exclusive_hi) for the general TIMER1 base on **APB1**: `0x4000_0000`, a single
+    /// 0x400 peripheral slot (the next slot at `0x4000_0400` is TIMER2 on parts that have it).
+    pub const GEN_TIMER1_APB1: (u32, u32) = (0x4000_0000, 0x4000_0400);
 
     /// The GPIO range the selected gpio path expects.
     pub const fn gpio_for(gpio: crate::descriptor::GpioPath) -> (u32, u32) {
@@ -402,6 +431,25 @@ impl AddrTable {
             None => Err(DescriptorError::MissingBase(fwdgt)),
         }
     }
+
+    /// Validate that a GENERAL-timer label's base sits in the APB1 general-timer window (G3).
+    ///
+    /// `Timer1` is at `0x4000_0000` on both families. A base outside the window is
+    /// [`DescriptorError::SelectorAddrMismatch`]; a non-general-timer label (including the ADVANCED
+    /// timers `Timer0`/`Timer7`) is [`DescriptorError::UnknownSelector`]. This is the parse-time
+    /// guard that keeps the cold-path general PWM ([`crate::pwm`]) off the advanced-timer bridge.
+    /// Same shape as [`Self::check_timer_base`].
+    pub fn check_general_timer_base(&self, timer: PeriphLabel) -> Result<(), DescriptorError> {
+        if !timer.is_general_timer() {
+            return Err(DescriptorError::UnknownSelector);
+        }
+        let (lo, hi) = ranges::GEN_TIMER1_APB1;
+        match self.get(timer) {
+            Some(base) if base >= lo && base < hi => Ok(()),
+            Some(_) => Err(DescriptorError::SelectorAddrMismatch),
+            None => Err(DescriptorError::MissingBase(timer)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -435,14 +483,17 @@ mod tests {
         assert_eq!(PeriphLabel::Timer7 as u8, 17);
         // G-WDG label APPENDED after Timer7.
         assert_eq!(PeriphLabel::Fwdgt as u8, 18);
+        // G3 (general PWM) label APPENDED after Fwdgt.
+        assert_eq!(PeriphLabel::Timer1 as u8, 19);
         // index() doubles as the discriminant.
         assert_eq!(PeriphLabel::Rcu.index(), 9);
         assert_eq!(PeriphLabel::Adc1.index(), 15);
         assert_eq!(PeriphLabel::Timer0.index(), 16);
         assert_eq!(PeriphLabel::Timer7.index(), 17);
         assert_eq!(PeriphLabel::Fwdgt.index(), 18);
+        assert_eq!(PeriphLabel::Timer1.index(), 19);
         // COUNT grew to cover the new labels.
-        assert_eq!(PeriphLabel::COUNT, 19);
+        assert_eq!(PeriphLabel::COUNT, 20);
     }
 
     #[test]
@@ -452,10 +503,16 @@ mod tests {
         assert!(PeriphLabel::Adc0.is_adc() && PeriphLabel::Adc1.is_adc());
         assert!(PeriphLabel::Timer0.is_timer() && PeriphLabel::Timer7.is_timer());
         assert!(PeriphLabel::Fwdgt.is_fwdgt());
+        assert!(PeriphLabel::Timer1.is_general_timer());
         assert!(!PeriphLabel::Rcu.is_i2c());
         assert!(!PeriphLabel::Usart1.is_spi());
         assert!(!PeriphLabel::Adc0.is_timer());
         assert!(!PeriphLabel::Timer0.is_fwdgt());
+        // The ADVANCED timers are NOT general timers (the cold-path guard's distinction), and
+        // TIMER1 is NOT an advanced timer.
+        assert!(!PeriphLabel::Timer0.is_general_timer());
+        assert!(!PeriphLabel::Timer7.is_general_timer());
+        assert!(!PeriphLabel::Timer1.is_timer());
     }
 
     #[test]
@@ -509,6 +566,26 @@ mod tests {
         assert_eq!(
             t.check_timer_base(PeriphLabel::Timer7),
             Err(DescriptorError::MissingBase(PeriphLabel::Timer7))
+        );
+    }
+
+    #[test]
+    fn check_general_timer_base_accepts_apb1_window_and_rejects_others() {
+        let mut t = AddrTable::new();
+        // TIMER1 = 0x4000_0000 on both families (the bottom of APB1).
+        t.set(PeriphLabel::Timer1, 0x4000_0000);
+        assert_eq!(t.check_general_timer_base(PeriphLabel::Timer1), Ok(()));
+        // TIMER2's slot (0x4000_0400) is above TIMER1's window: a mismatch.
+        t.set(PeriphLabel::Timer1, 0x4000_0400);
+        assert_eq!(
+            t.check_general_timer_base(PeriphLabel::Timer1),
+            Err(DescriptorError::SelectorAddrMismatch)
+        );
+        // The ADVANCED timer TIMER0 is NOT a general timer: UnknownSelector (the guard keeps the
+        // cold-path general PWM off the bridge).
+        assert_eq!(
+            t.check_general_timer_base(PeriphLabel::Timer0),
+            Err(DescriptorError::UnknownSelector)
         );
     }
 

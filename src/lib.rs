@@ -29,6 +29,10 @@ pub mod gpio;
 pub mod hotpath;
 pub mod i2c;
 pub mod irq;
+/// General single-channel PWM on a GENERAL-purpose timer (G3): the cold-path duty setter
+/// ([`pwm::PwmOut`]) that fades an LED / drives a buzzer tone. Refuses the advanced timers, never
+/// touches the MOE/POEN gate; implements the embedded-hal 1.0 `pwm::SetDutyCycle` trait.
+pub mod pwm;
 pub mod reg;
 pub mod serial;
 pub mod spi;
@@ -44,11 +48,11 @@ pub mod watchdog;
 
 pub use adc::{is_internal_channel, Adc};
 pub use addr::{AddrTable, PeriphLabel};
-pub use chip::Chip;
+pub use chip::{Arch, Chip, F10xArch, F1x0Arch};
 pub use clock::{
-    clear_reset_flags, configure_tree, configure_tree_timeout, enable_adc, enable_gpio_port,
-    enable_i2c, enable_lsi, enable_spi, enable_usart, was_fwdgt_reset, ClockConfig, ClockSource,
-    DEFAULT_CLOCK_SPIN_CAP,
+    clear_reset_flags, configure_tree, configure_tree_timeout, enable_adc, enable_general_timer,
+    enable_gpio_port, enable_i2c, enable_lsi, enable_spi, enable_timer, enable_usart,
+    was_fwdgt_reset, ClockConfig, ClockSource, DEFAULT_CLOCK_SPIN_CAP,
 };
 pub use config::{
     decode_pin, AdcChannel, AdcClockDiv, AdcConfig, BreakConfig, ClockDiv, InjectedAdcConfig,
@@ -70,9 +74,9 @@ pub use error::{
     UsartError, WatchdogError,
 };
 pub use gpio::{
-    configure_af, configure_output, read_pin, set_pin, Floating, GpioOutput, GpioPort, Input,
-    Output, Pin, PinRole, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins, PortPins,
-    PullDown, PullUp, PushPull,
+    configure_af, configure_output, read_pin, remap_timer1_partial1, set_pin, Floating, GpioOutput,
+    GpioPort, Input, Output, Pin, PinRole, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins,
+    PortPins, PullDown, PullUp, PushPull,
 };
 pub use hotpath::dump::{AdcInjectedRegs, HotpathConfig, TimerRegs};
 pub use hotpath::hall::HallReader;
@@ -84,6 +88,7 @@ pub use irq::{
     build_table, clear_tick_count, clear_tick_handler, on_systick, register_control_handler,
     register_tick_handler, tick_count, Handler, RamVectorTable, TickHandler,
 };
+pub use pwm::PwmOut;
 pub use reg::{Reg16, Reg32};
 pub use serial::{Serial, UsartSerial};
 pub use spi::{mode_bits, prescaler_for, spi_input_clock, DataSize, Spi};

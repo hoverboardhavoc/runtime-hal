@@ -145,6 +145,14 @@ pub enum PinRole {
     /// Advanced-timer complementary-PWM gate (CHx / CHxN): alternate-function push-pull output,
     /// 50 MHz, AF2 (TIMER0 on F1x0).
     TimerAfPushPull,
+    /// General-purpose-timer PWM output (G3): alternate-function push-pull output, 50 MHz, **AF2**
+    /// (TIMER1 on F1x0). On F1x0 the general timers TIMER0/TIMER1/TIMER14/15/16 all sit on AF2
+    /// (`GD32F130xx Datasheet` Port B alternate-function summary: PB3 AF2 = `TIMER1_CH1`); the AF
+    /// number happens to equal the advanced-timer gate's AF2 (they share the AF group), but this is
+    /// a distinct role so the general-PWM path documents its own routing. On F10x the AF is implied
+    /// by the AF-push-pull nibble (0xB), and TIMER1's channels reach PB3 only through the AFIO
+    /// `TIMER1_REMAP` field (see [`remap_timer1_partial1`]); the per-pin AF mux does not exist there.
+    GenTimerAfPushPull,
 }
 
 /// The role-independent configuration a role resolves to, shared by both register models.
@@ -199,6 +207,15 @@ impl PinRole {
             // (AF2 on F1x0; F10x has no AF mux, so the AF-PP nibble carries it). The AF number is
             // carried by the role here, exactly as the SPI/USART/I2C roles carry theirs.
             PinRole::TimerAfPushPull => PinConfig {
+                output: true,
+                open_drain: false,
+                pull_up: false,
+                af: F1X0_AF_2,
+            },
+            // General-purpose-timer PWM (G3): AF push-pull on the F1x0 general-timer AF (AF2; the
+            // `GD32F130xx Datasheet` puts PB3's TIMER1_CH1 on AF2). On F10x the AF is implied by the
+            // nibble and TIMER1's pin is reached through the AFIO TIMER1_REMAP field, not this AF.
+            PinRole::GenTimerAfPushPull => PinConfig {
                 output: true,
                 open_drain: false,
                 pull_up: false,
@@ -305,6 +322,61 @@ fn configure_f1x0(port_base: u32, n: u32, cfg: &PinConfig) {
         let sp_shift = 2 * n;
         Reg32::new(port_base, F1X0_OSPD).modify(0x3u32 << sp_shift, F1X0_OSPEED_50MHZ << sp_shift);
     }
+}
+
+// --- F10x AFIO alternate-function remap (G3 general-timer routing) -----------------------------
+//
+// On the F10x the alternate function is implied by the CRL/CRH mode/cnf nibble, NOT a per-pin AF
+// mux, so a peripheral whose default pins are unwanted (or, for TIMER1, whose CH1 lands on a
+// JTAG-overlay pin) is moved by the AFIO peripheral-config registers instead. This is the F10x-ONLY
+// mechanism; the F1x0 has no AFIO and routes a pin purely through its per-pin `AFSEL` mux (the
+// `configure_af` path above), so there is no equivalent F1x0 function here.
+
+/// The F10x AFIO base. The AFIO peripheral-config registers (`AFIO_PCF0` etc.) live here. Fixed by
+/// the part family at this absolute address on every F10x (the same base [`crate::Chip::free_jtag_pins`]
+/// uses for the SWJ remap); the descriptor does not carry it.
+const F10X_AFIO_BASE: u32 = 0x4001_0000;
+/// `AFIO_PCF0` (AF port-config register 0) offset, 0x04 (GD32F10x User Manual 7.5.9: "AFIO port
+/// configuration register 0 (AFIO_PCF0) ... Address offset: 0x04"). Word-access only.
+const F10X_AFIO_PCF0: u32 = 0x04;
+/// `TIMER1_REMAP[1:0]` field in `AFIO_PCF0`, bits `[9:8]` (GD32F10x User Manual 7.5.9, line 9206:
+/// `9:8 TIMER1_REMAP[1:0] TIMER1 remapping`).
+const F10X_PCF0_TIMER1_REMAP: u32 = 0b11 << 8;
+/// `TIMER1_REMAP` partial-remap-1 value `01`: maps `TIMER1_CH0-ETI / PA15, TIMER1_CH1 / PB3,
+/// TIMER1_CH2 / PA2, TIMER1_CH3 / PA3` (GD32F10x User Manual 7.5.9, line 9208-9209: "01: Enable the
+/// remapping function partially (TIMER1_CH0-TIMER1_ETI / PA15, TIMER1_CH1 / PB3, ...)"). This is the
+/// value that puts TIMER1_CH1 onto PB3 (the green LED), the G3 target.
+const F10X_PCF0_TIMER1_REMAP_PARTIAL1: u32 = 0b01 << 8;
+
+/// **F10x-only**: remap TIMER1 to partial-remap-1, putting `TIMER1_CH1` onto **PB3** (and
+/// `TIMER1_CH0` onto PA15), by writing the `TIMER1_REMAP[1:0]` field of `AFIO_PCF0` to `01`.
+///
+/// This is the F10x half of the G3 general-timer routing (the F1x0 routes purely through the per-pin
+/// `AFSEL` mux in [`configure_af`], so this primitive does NOT exist for the F1x0 and is never called
+/// there). The AFIO peripheral clock MUST be enabled before `AFIO_PCF0` is written; on F10x
+/// [`crate::Chip::free_jtag_pins`] already sets `RCU_APB2EN.AFIOEN`, and the G3 routing calls it
+/// (to free PB3 = JTDO) before this, so the clock is on. `rcu_base` is accepted so this can enable
+/// the AFIO clock itself if a caller has not already (idempotent RMW), keeping the primitive
+/// self-contained.
+///
+/// The write is a read-modify-write of only the `TIMER1_REMAP` field, so the SWJ_CFG bits
+/// `free_jtag_pins` set (and every other remap field) are left untouched. It does NOT touch any
+/// timer register, TIMER0, or any arming gate.
+///
+/// Register facts (GD32F10x User Manual 7.5.9 "AFIO port configuration register 0 (AFIO_PCF0)"):
+/// `AFIO_PCF0` at AFIO base `0x4001_0000` offset `0x04`; `TIMER1_REMAP[1:0]` is bits `[9:8]`;
+/// value `01` = partial remap 1 = `TIMER1_CH1 / PB3`. (TIMER1 remap is not available on a 36-pin
+/// package; the bench parts are 48-pin C8, so PB3 is reachable. TIMER2 remap by contrast needs a
+/// 64/100/144-pin package, which is why the G3 target is TIMER1, not TIMER2.)
+pub fn remap_timer1_partial1(rcu_base: u32) {
+    // Ensure the AFIO peripheral clock is on (RCU_APB2EN.AFIOEN, bit 0) before touching AFIO_PCF0.
+    // Idempotent RMW: harmless if free_jtag_pins already enabled it.
+    const RCU_APB2EN_OFFSET: u32 = 0x18;
+    const AFIOEN: u32 = 1 << 0;
+    Reg32::new(rcu_base, RCU_APB2EN_OFFSET).modify(AFIOEN, AFIOEN);
+    // TIMER1_REMAP = 0b01 (partial remap 1): TIMER1_CH1 -> PB3.
+    Reg32::new(F10X_AFIO_BASE, F10X_AFIO_PCF0)
+        .modify(F10X_PCF0_TIMER1_REMAP, F10X_PCF0_TIMER1_REMAP_PARTIAL1);
 }
 
 // --- general-purpose digital input ------------------------------------------------------------

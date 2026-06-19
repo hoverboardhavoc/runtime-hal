@@ -7,7 +7,8 @@
 
 use crate::addr::PeriphLabel;
 use crate::clock::{
-    enable_adc, enable_gpio_port, enable_i2c, enable_spi, enable_timer, enable_usart,
+    enable_adc, enable_general_timer, enable_gpio_port, enable_i2c, enable_spi, enable_timer,
+    enable_usart,
 };
 use crate::descriptor::ClockPath;
 use crate::error::DescriptorError;
@@ -377,6 +378,53 @@ fn enable_timer0_preserves_other_apb2en_bits() {
     Reg32::new(RCU_BASE, APB2EN).write(1 << 2);
     enable_timer(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::Timer0).unwrap();
     assert_eq!(read(APB2EN), (1 << 2) | (1 << 11));
+}
+
+// --- G3: the GENERAL-purpose timer clock enable (TIMER1 on APB1EN bit 0, BOTH families) --------
+
+#[test]
+fn f1x0_enable_general_timer1_sets_apb1en_bit0() {
+    let _g = seed_reset();
+    enable_general_timer(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Timer1).unwrap();
+    // TIMER1EN = BIT(0) on APB1EN (GD32F1x0 User Manual RCU APB1EN); nothing else touched.
+    assert_eq!(read(APB1EN), 1 << 0);
+    assert_eq!(read(APB2EN), 0);
+    assert_eq!(read(AHBEN), 0);
+}
+
+#[test]
+fn f10x_enable_general_timer1_sets_apb1en_bit0() {
+    let _g = seed_reset();
+    enable_general_timer(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::Timer1).unwrap();
+    // TIMER1EN = BIT(0) on APB1EN: the SAME bit on both families (GD32F10x User Manual line 5425).
+    assert_eq!(read(APB1EN), 1 << 0);
+    assert_eq!(read(APB2EN), 0);
+    assert_eq!(read(AHBEN), 0);
+}
+
+#[test]
+fn enable_general_timer_rejects_advanced_and_non_timer_labels() {
+    let _g = seed_reset();
+    // The ADVANCED timers are NOT general timers: this path must never enable TIMER0 (the bridge).
+    assert_eq!(
+        enable_general_timer(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::Timer0),
+        Err(DescriptorError::UnknownSelector)
+    );
+    assert_eq!(
+        enable_general_timer(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::Usart1),
+        Err(DescriptorError::UnknownSelector)
+    );
+    assert_eq!(read(APB1EN), 0);
+    assert_eq!(read(APB2EN), 0);
+}
+
+#[test]
+fn enable_general_timer1_preserves_other_apb1en_bits() {
+    let _g = seed_reset();
+    // A pre-existing APB1 enable (e.g. USART1 on bit 17) must survive the RMW.
+    Reg32::new(RCU_BASE, APB1EN).write(1 << 17);
+    enable_general_timer(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Timer1).unwrap();
+    assert_eq!(read(APB1EN), (1 << 17) | (1 << 0));
 }
 
 // --- T2: full clock tree (configure_tree) -----------------------------------------------------
