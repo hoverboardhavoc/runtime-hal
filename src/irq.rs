@@ -48,9 +48,11 @@
 //!
 //! The table is built as plain data ([`build_table`]) so a host test asserts it slot-by-slot
 //! against the expected handler addresses (cross-checked against the GD SPL layout above). The
-//! early-boot handoff is modelled by [`mock_vtor::dispatch`], which looks up a slot and calls it the way
-//! hardware would after `VTOR` points at the table, so the flip ordering and the grouped demux are
-//! host-testable; see `irq/tests.rs` for the gap vs a real Unicorn exception injection.
+//! early-boot handoff is modelled by `mock_vtor::dispatch` (a `mock`-feature module), which looks up
+//! a slot and calls it the way hardware would after `VTOR` points at the table, so the flip ordering
+//! and the grouped demux are host-testable; see `irq/tests.rs` for the gap vs a real Unicorn
+//! exception injection. (Plain-code, not an intra-doc link: `mock_vtor` is compiled only under the
+//! `mock` feature, so the default `cargo doc` build has no such item to link to.)
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
