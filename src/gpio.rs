@@ -739,13 +739,18 @@ impl embedded_hal::digital::OutputPin for Pin<Output<PushPull>> {
 }
 
 impl embedded_hal::digital::StatefulOutputPin for Pin<Output<PushPull>> {
-    /// Report the last commanded level by reading back the family's GPIO output-data register
-    /// (`GPIO_OCTL`, offset `0x0C` on both register models): the `Pin` is `Copy` and carries no
-    /// tracked state field, so the live level is read from hardware rather than remembered.
+    /// Report the last commanded level by reading back the family's GPIO output-data register: the
+    /// `Pin` is `Copy` and carries no tracked state field, so the live level is read from hardware
+    /// rather than remembered. The register offset differs by family: F10x `GPIO_ODR` at `0x0C`, F1x0
+    /// `GPIO_OCTL` at `0x14` (the F1x0's `0x0C` is `GPIO_PUD`, not the output data).
     #[inline]
     fn is_set_high(&mut self) -> Result<bool, Self::Error> {
-        let octl = Reg32::new(self.port_base, GPIO_OCTL).read();
-        Ok(octl & (1u32 << (self.pin as u32 & 0x0F)) != 0)
+        let odr_off = match self.path {
+            GpioPath::ApbCrlCrh => F10X_ODR,
+            GpioPath::AhbCtlAfsel => F1X0_OCTL,
+        };
+        let level = Reg32::new(self.port_base, odr_off).read();
+        Ok(level & (1u32 << (self.pin as u32 & 0x0F)) != 0)
     }
 
     #[inline]
@@ -783,10 +788,13 @@ impl<PULL> embedded_hal::digital::InputPin for Pin<Input<PULL>> {
     }
 }
 
-/// `GPIO_OCTL` (output-data control) register offset, identical on both register models (F10x
-/// `GPIO_OCTL` and F1x0 `GPIO_OCTL` are both at offset `0x0C`). Read back to report the set level
-/// of a stateless [`Pin<Output<PushPull>>`].
-const GPIO_OCTL: u32 = 0x0C;
+/// Output-data register offsets, READ to report the set level of a stateless
+/// [`Pin<Output<PushPull>>`]. These are NOT at the same offset across the families: the F10x
+/// `GPIO_ODR` is at `0x0C`, but the F1x0 `GPIO_OCTL` is at `0x14` (on the F1x0, offset `0x0C` is
+/// `GPIO_PUD`, see [`F1X0_PUD`]). The earlier "identical 0x0C" assumption read the pull register on
+/// the F1x0 and broke `is_set_high` / `toggle()` there.
+const F10X_ODR: u32 = 0x0C;
+const F1X0_OCTL: u32 = 0x14;
 
 /// A resolved GPIO port, parameterised by which port's pin bag it [`split`](GpioPort::split)s into.
 ///

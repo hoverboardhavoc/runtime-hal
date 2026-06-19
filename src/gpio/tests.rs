@@ -513,10 +513,10 @@ fn pin_output_set_high_low_drives_bop_f10x() {
 #[test]
 fn pin_output_is_set_high_reads_back_octl() {
     let _g = seed();
-    // is_set_high reads GPIO_OCTL (0x0C), not the write-only BOP. Seed OCTL bit 15 and confirm.
+    // is_set_high reads the family output-data register (F1x0 OCTL at 0x14), not the write-only BOP.
     let mut out = make_pin(PORT_BASE, GpioPath::AhbCtlAfsel, 15).into_push_pull_output();
     assert_eq!(out.is_set_low(), Ok(true)); // OCTL still 0
-    Reg32::new(PORT_BASE, 0x0C).write(1 << 15);
+    Reg32::new(PORT_BASE, 0x14).write(1 << 15);
     assert_eq!(out.is_set_high(), Ok(true));
     assert_eq!(out.is_set_low(), Ok(false));
 }
@@ -684,4 +684,37 @@ fn width_strict_afsel_is_32_bit() {
     let p7 = 7u8;
     configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, p7, PinRole::Tx);
     assert_eq!(read(AFSEL0), 1u32 << 28);
+}
+
+#[test]
+fn f1x0_is_set_high_reads_octl_at_0x14_not_pud_at_0x0c() {
+    // Regression: on the F1x0 the output-data register OCTL is at 0x14; offset 0x0C is PUD. is_set_high
+    // (which backs StatefulOutputPin::toggle) must read OCTL (0x14), not PUD (0x0C). Reading 0x0C made
+    // toggle() never see the pin as high on the F1x0, so it stayed solid instead of blinking.
+    let _g = seed();
+    let mut out = make_pin(PORT_BASE, GpioPath::AhbCtlAfsel, 5).into_push_pull_output();
+    // A 1 in PUD (0x0C, the WRONG register) must NOT read back as "set high".
+    Reg32::new(PORT_BASE, 0x0C).write(1u32 << 5);
+    assert!(
+        out.is_set_low().unwrap(),
+        "F1x0 is_set_high must not read PUD at 0x0C"
+    );
+    // A 1 in OCTL (0x14, the correct register) MUST read back as "set high".
+    Reg32::new(PORT_BASE, 0x14).write(1u32 << 5);
+    assert!(
+        out.is_set_high().unwrap(),
+        "F1x0 is_set_high must read OCTL at 0x14"
+    );
+}
+
+#[test]
+fn f10x_is_set_high_reads_odr_at_0x0c() {
+    // On the F10x the output-data register ODR is at 0x0C.
+    let _g = seed();
+    let mut out = make_pin(PORT_BASE, GpioPath::ApbCrlCrh, 5).into_push_pull_output();
+    Reg32::new(PORT_BASE, 0x0C).write(1u32 << 5);
+    assert!(
+        out.is_set_high().unwrap(),
+        "F10x is_set_high must read ODR at 0x0C"
+    );
 }
