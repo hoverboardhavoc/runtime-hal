@@ -13,6 +13,7 @@
 
 use crate::addr::PeriphLabel;
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
+use crate::detect::Family;
 use crate::error::DescriptorError;
 use crate::gpio::{
     self, GpioOutput, GpioPort, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins, PortPins,
@@ -38,6 +39,58 @@ impl Chip {
     #[inline]
     pub const fn descriptor(&self) -> &McuDescriptor {
         &self.desc
+    }
+
+    /// The runtime-detected MCU [`Family`] ([`Family::F10x`] vs [`Family::F1x0`]).
+    ///
+    /// This is a DELIBERATE escape hatch from the HAL's usual rule of absorbing the family difference
+    /// so the application never sees it. It exists ONLY for the peripherals the HAL deliberately does
+    /// NOT abstract: architecture-specific setup such as general-purpose timer / PWM routing, where the
+    /// two families diverge too far for one model (different timer catalog, different alternate-function
+    /// mechanism, different modes). For everything the HAL already unifies (GPIO, USART, I2C, clock),
+    /// do NOT branch on this: use the unified bring-up calls, which own the per-family branch internally
+    /// (e.g. [`Chip::output_pin`] / [`Chip::gpioa`], the `Usart` / `I2c` / `Serial` bring-ups, and the
+    /// [`ClockPath`] enable model). Reaching for `family()` to special-case those would re-leak the
+    /// split the rest of the crate works to hide.
+    ///
+    /// The key differences a caller legitimately branches on (see the README's "GD32F103 (F10x) vs
+    /// GD32F130 (F1x0) peripheral differences" section for the full list):
+    ///
+    /// - **GPIO alternate function.** F10x ([`Family::F10x`]) selects AF through the `CRL`/`CRH`
+    ///   mode/cnf nibbles plus the AFIO remap groups; F1x0 ([`Family::F1x0`]) selects it per pin
+    ///   through `AFSEL` and a per-pin AF mux. (For the unified GPIO paths this is already handled by
+    ///   [`crate::gpio::configure_af`]; the escape hatch is for setup the HAL does not cover.)
+    /// - **Timer / peripheral catalog.** The two families carry different advanced/general-purpose
+    ///   timer instances and different ADC/SPI/USART instance counts, so timer/PWM routing (which timer
+    ///   drives which pin, with which AF) is genuinely family-specific.
+    ///
+    /// Derived from the descriptor's existing register-model selector ([`McuDescriptor::gpio`]), the
+    /// single source of truth: [`GpioPath::ApbCrlCrh`] is the F10x register model, so it maps to
+    /// [`Family::F10x`]; [`GpioPath::AhbCtlAfsel`] is the F1x0 register model, so it maps to
+    /// [`Family::F1x0`]. No redundant family field is stored.
+    ///
+    /// ```rust,ignore
+    /// use runtime_hal::{Chip, Family};
+    ///
+    /// // Architecture-specific general-purpose timer / PWM routing, the kind of family-divergent
+    /// // setup the HAL does NOT abstract:
+    /// fn route_pwm_timer(chip: &Chip) {
+    ///     match chip.family() {
+    ///         Family::F10x => {
+    ///             // F10x: configure the CRL/CRH AF nibble and any AFIO remap for the timer pin.
+    ///         }
+    ///         Family::F1x0 => {
+    ///             // F1x0: set the per-pin AFSEL to the timer's AF number.
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub const fn family(&self) -> Family {
+        match self.desc.gpio {
+            GpioPath::ApbCrlCrh => Family::F10x,
+            GpioPath::AhbCtlAfsel => Family::F1x0,
+        }
     }
 
     /// Resolve a label to its base address ([`DescriptorError::MissingBase`] if absent).
@@ -227,6 +280,25 @@ mod tests {
     const RCU_BASE: u32 = 0x4002_1000;
     const RCU_APB2EN: u32 = 0x18;
     const AFIO_PCF0: u32 = 0x4001_0004;
+
+    #[test]
+    fn family_is_f10x_for_f103_descriptor() {
+        let chip = Chip::from_descriptor(descriptor_f103());
+        assert_eq!(chip.family(), Family::F10x);
+    }
+
+    #[test]
+    fn family_is_f1x0_for_f130_descriptor() {
+        let chip = Chip::from_descriptor(descriptor_f130());
+        assert_eq!(chip.family(), Family::F1x0);
+    }
+
+    #[test]
+    fn family_matches_the_descriptor_gpio_selector() {
+        // family() is derived from the GpioPath (single source of truth), so it must agree with it.
+        assert_eq!(Chip::from_descriptor(descriptor_f103()).gpio(), GpioPath::ApbCrlCrh);
+        assert_eq!(Chip::from_descriptor(descriptor_f130()).gpio(), GpioPath::AhbCtlAfsel);
+    }
 
     #[test]
     fn free_jtag_pins_f10x_enables_afio_and_sets_swj_sw_only() {
