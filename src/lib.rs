@@ -69,6 +69,7 @@ pub use gpio::{
     Output, Pin, PinRole, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins, PortPins,
     PullDown, PullUp, PushPull,
 };
+pub use hotpath::dump::{AdcInjectedRegs, HotpathConfig, TimerRegs};
 pub use hotpath::hall::HallReader;
 pub use hotpath::{
     ComplementaryPwm, InjectedAdcController, InjectedHandle, PwmController, PwmHandle, TriggeredAdc,

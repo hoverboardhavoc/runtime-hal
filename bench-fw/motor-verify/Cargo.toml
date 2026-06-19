@@ -1,0 +1,26 @@
+[package]
+name = "bench-fw-motor-verify"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "On-silicon hot-path configure-then-verify firmware: runs the advanced-timer complementary-PWM bring-up CONFIG-ONLY (MOE off, bridge disarmed) through runtime-hal, reads the timer registers back via the read-only HotpathConfig::dump surface, and checks that period/prescaler/dead-time match the config and the bridge is disarmed. Reports the verdict by blinking PB3 (slow = verified + disarmed, fast = mismatch). Never arms MOE. Builds for both the F130 (F1x0) and F103 (F10x)."
+
+[dependencies]
+# runtime-hal in its normal real-MMIO no_std build. NOT the `mock` feature.
+runtime-hal = { path = "../..", default-features = false }
+embedded-hal = "1.0"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-motor-verify"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

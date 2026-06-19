@@ -42,6 +42,8 @@ use crate::error::{AdcError, HotPathError, PwmError};
 use crate::reg::Reg32;
 use crate::timer::PwmTimer;
 
+pub mod dump;
+
 // --- TIMER0 register offsets (identical on both families; see addr.rs ADV_TIMER_APB2 note) ------
 //
 // Confirmed against the GD SPL peripheral headers (gd32f10x_timer.h / gd32f1x0_timer.h): the
