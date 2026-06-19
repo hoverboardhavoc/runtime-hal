@@ -15,15 +15,15 @@
 //!   clock-division field in CTL0, the repetition counter (CREP = 0), then the update-generate
 //!   software event (SWEVG UPG) that latches the shadowed PSC/CAR.
 //! - `timer_channel_output_config` + `timer_channel_output_mode_config` +
-//!   `timer_channel_output_shadow_config` + `timer_channel_output_pulse_value_config` per phase
-//!   channel (T3 sets PWM mode0 + the compare shadow + a zero initial duty; T4 adds the
+//!   `timer_channel_output_shadow_config` + `timer_channel_output_pulse_value_config` per channel
+//!   (T3 sets PWM mode0 + the compare shadow + a zero initial duty; T4 adds the
 //!   complementary-output enable, the per-channel polarity and idle state).
 //! - `timer_auto_reload_shadow_enable` (CTL0 ARSE).
 //! - `timer_break_config` (T4): the CCHP dead-time / break / off-state / protect word, written as
 //!   one assignment exactly as the SPL does. The reference DISABLES break; the path expresses
 //!   enabling it.
 //! - **MOE is left OFF.** `timer_primary_output_config(ENABLE)` (CCHP POEN) is NOT called here: the
-//!   bridge stays disarmed at bring-up. MOE is owned by [`crate::hotpath::arming::ArmGate`], the
+//!   bridge stays disarmed at bring-up. MOE is owned by [`arming::ArmGate`], the
 //!   only MOE writer, a SAFETY invariant (DECISIONS.md #4 + the M3 SAFETY section). Nothing in this
 //!   module touches CCHP POEN.
 //!
@@ -49,16 +49,16 @@
 //! | `CCHP`   | `0x44` | `DTCFG[7:0]` / `PROT[9:8]` / IOS(10) / ROS(11) / BRKEN(12) / BRKP(13) / OAEN(14) / POEN(15) |
 //!
 //! The per-cycle compare writes (CH0CV/CH1CV/CH2CV + the CH3CV trigger compare) and the MOE gate
-//! (CCHP POEN) live in [`crate::hotpath`] (the resolve-once handle + the arming layer); this module
-//! is the one-time bring-up.
+//! (CCHP POEN) live in this module too (the resolve-once [`PwmHandle`] + the [`arming`] layer); the
+//! bring-up below is the one-time config that they build on.
 
 use crate::chip::Chip;
 use crate::config::{OcMode, PwmConfig, TrgoSource};
 use crate::descriptor::MAX_PWM_CHANNELS;
-use crate::error::DescriptorError;
-use crate::hotpath::arming::ArmGate;
-use crate::hotpath::PwmHandle;
+use crate::error::{DescriptorError, BringUpError, PwmError};
 use crate::reg::Reg32;
+
+use arming::ArmGate;
 
 // --- register offsets (identical on both families) --------------------------------------------
 
@@ -147,7 +147,7 @@ const CTL1_ISO_CHAN_FIELDS: u32 = 0b11;
 /// Dead-time configure field, CCHP[7:0] (`TIMER_CCHP_DTCFG`).
 const CCHP_DTCFG: u32 = 0xFF;
 /// Run-mode off-state enable (`TIMER_ROS_STATE_ENABLE`), bit 11. With POEN set, the configured
-/// idle drives the disabled channels; the reference enables it so a running but disabled phase
+/// idle drives the disabled channels; the reference enables it so a running but disabled channel
 /// sits safe.
 const CCHP_ROS: u32 = 1 << 11;
 /// Idle-mode off-state enable (`TIMER_IOS_STATE_ENABLE`), bit 10. With POEN clear (disarmed), the
@@ -184,7 +184,7 @@ impl PwmTimer {
     /// with the compare shadow + a zero initial duty; T4 adds the complementary-output enable, the
     /// per-channel polarity + idle state, and the CCHP dead-time / break / off-state word. The
     /// returned [`PwmTimer`] is the resolved base; the caller builds the resolve-once
-    /// [`crate::hotpath::PwmHandle`] from it (T5).
+    /// [`PwmHandle`] from it (T5).
     pub fn configure(chip: &Chip, cfg: &PwmConfig) -> Result<PwmTimer, DescriptorError> {
         // Guard: the config's timer label must be an ADVANCED timer in the APB2 advanced-timer
         // window, else a non-advanced label (e.g. the general-purpose Timer1) would run the full
@@ -197,7 +197,7 @@ impl PwmTimer {
             period: cfg.period,
         };
         dev.timer_init(cfg);
-        // Per-phase channel output config (mode + shadow + zero duty, enable/per-side idle/polarity).
+        // Per-channel output config (mode + shadow + zero duty, enable/per-side idle/polarity).
         for (n, ch) in cfg.channels.iter().enumerate() {
             dev.channel_output_config(n as u32, ch.polarity, ch.idle_high, ch.idle_high_n);
             dev.channel_output_mode_pwm0(n as u32);
@@ -219,13 +219,13 @@ impl PwmTimer {
 
     /// T6: configure CH3 as the ADC-trigger compare channel and set the TRGO master-mode source.
     ///
-    /// CH3 (channel index 3) is NOT a bridge phase output: its compare match is used as the injected
-    /// ADC's external trigger (the reference samples the phase currents at the PWM centre). It is
+    /// CH3 (channel index 3) is NOT a bridge output channel: its compare match is used as the injected
+    /// ADC's external trigger (the reference samples the injected channels at the PWM centre). It is
     /// programmed as an output-compare channel in PWM mode 0 with the compare shadow enabled (so a
-    /// re-arm is buffered like the phase duties), its compare value (CH3CV) set near the up-count top
+    /// re-arm is buffered like the channel duties), its compare value (CH3CV) set near the up-count top
     /// (`trigger_compare`, ~CAR-1), exactly as the SPL `timer_channel_output_*` + `..._pulse_value_*`
     /// recipe for CH3. The channel OUTPUT-enable (CH3EN) is left OFF: the compare event drives the
-    /// internal trigger; no CH3 pin is wired (so this does not disturb CHCTL2's phase fields).
+    /// internal trigger; no CH3 pin is wired (so this does not disturb CHCTL2's channel fields).
     ///
     /// Then `timer_master_output_trigger_source_select(TIMER_TRI_OUT_SRC_UPDATE)`: CTL1 MMC = UPDATE,
     /// so the timer also presents UPDATE on TRGO (the second coexisting trigger expression, HP-5).
@@ -288,7 +288,7 @@ impl PwmTimer {
         self.swevg().write(SWEVG_UPG);
     }
 
-    /// `timer_channel_output_config` for phase channel `n` (0..2): enable the main + complementary
+    /// `timer_channel_output_config` for channel `n` (0..2): enable the main + complementary
     /// outputs, set the per-channel polarity, and set the idle state, all positioned by `4*n`
     /// (CHCTL2) / `2*n` (CTL1). `polarity == true` inverts the **complementary (low-side, CHxN)**
     /// output polarity to active-low while the main (high-side, CHx) stays active-high (the
@@ -296,7 +296,7 @@ impl PwmTimer {
     /// idle level HIGH on both outputs of the pair.
     ///
     /// The main + complementary outputs are ENABLED here (CHxEN / CHxNEN). They only reach the pins
-    /// once MOE is set ([`crate::hotpath::arming::ArmGate::arm`]); with MOE clear the timer counts
+    /// once MOE is set ([`arming::ArmGate::arm`]); with MOE clear the timer counts
     /// and the compare event toggles the internal channel, but no current flows. This is the
     /// disarmed-but-configured state the SAFETY section calls electrically safe to scope.
     fn channel_output_config(&self, n: u32, polarity: bool, idle_high: bool, idle_high_n: bool) {
@@ -414,7 +414,7 @@ impl PwmTimer {
     // --- register accessors -------------------------------------------------------------------
 
     /// CHCTL register + the field shift for channel `n`: CH0/CH1 in CHCTL0 (shift 0 / 8), CH2/CH3
-    /// in CHCTL1 (shift 0 / 8). The phase channels are 0..2; the trigger CH3 (T6) is in CHCTL1[15:8].
+    /// in CHCTL1 (shift 0 / 8). The bridge channels are 0..2; the trigger CH3 (T6) is in CHCTL1[15:8].
     #[inline]
     fn chctl_half(&self, n: u32) -> (Reg32, u32) {
         if n < 2 {
@@ -458,7 +458,206 @@ impl PwmTimer {
     }
 }
 
-/// Compile-time guard: the phase channel count this module loops over matches the descriptor's.
+// --- TIMER0 register offsets for the per-cycle handle + arming gate (identical on both families) -
+//
+// Confirmed against the GD SPL peripheral headers (gd32f10x_timer.h / gd32f1x0_timer.h): the
+// advanced-timer register block is the same offsets on F10x and F1x0, so one model parameterised by
+// base (data, from the AddrTable). The per-cycle path touches the compare-value registers each cycle.
+
+/// TIMER0 channel-0 capture/compare value register (CH0CV), the channel-0 high-side duty.
+pub(crate) const TIMER_CH0CV: u32 = 0x34;
+/// TIMER0 channel-1 capture/compare value register (CH1CV).
+pub(crate) const TIMER_CH1CV: u32 = 0x38;
+/// TIMER0 channel-2 capture/compare value register (CH2CV).
+pub(crate) const TIMER_CH2CV: u32 = 0x3C;
+/// TIMER0 channel-3 capture/compare value register (CH3CV), the ADC-trigger compare.
+pub(crate) const TIMER_CH3CV: u32 = 0x40;
+/// TIMER0 counter auto-reload register (CAR/ARR), the PWM period; the duty clamp references it.
+#[allow(dead_code)]
+pub(crate) const TIMER_CAR: u32 = 0x2C;
+/// TIMER0 complementary-channel protection register (CCHP), which holds MOE (bit 15). Owned by the
+/// [`arming`] layer ONLY; the per-cycle handle never names this offset.
+pub(crate) const TIMER_CCHP: u32 = 0x44;
+/// MOE (main output enable) bit in CCHP (`TIMER_CCHP_POEN`, bit 15).
+pub(crate) const CCHP_MOE: u32 = 1 << 15;
+
+/// The advanced-timer complementary-PWM capability (M3 T5 fills the bodies). SPEC.md: configure
+/// center-aligned PWM at a given period/prescaler, three complementary channel pairs with
+/// dead-time, polarity/idle, optional break, and the MOE gate, plus the ADC-trigger compare
+/// channel; per cycle set the three duties and re-arm the trigger compare. MOE arming is NOT here
+/// (it is in [`arming`]).
+pub trait ComplementaryPwm {
+    /// The concrete per-cycle handle this config resolves into (DECISIONS.md #4).
+    type Handle: Copy;
+
+    /// Configure the advanced timer for the complementary bridge from the [`Chip`] (base + selector)
+    /// and the code-level [`PwmConfig`] and return the resolve-once handle. Runs ONCE at bring-up;
+    /// the selectors are resolved into the handle. Leaves MOE OFF (outputs disarmed): arming is a
+    /// separate, deliberate [`arming`] call.
+    fn configure(&self, chip: &Chip, cfg: &PwmConfig) -> Result<Self::Handle, BringUpError>;
+}
+
+/// The advanced-timer complementary-PWM controller (resolve-once config object): a timer that
+/// implements [`ComplementaryPwm`]. Its [`ComplementaryPwm::configure`] runs the timer bring-up
+/// ([`PwmTimer`]) and resolves the four compare offsets + the period once into a
+/// [`PwmHandle`]. MOE arming is NOT here (the [`arming::ArmGate`] is built separately from the same
+/// base).
+///
+/// (Was `PwmConfig`; renamed to `PwmController` in the descriptor-rework so the code-level
+/// [`crate::config::PwmConfig`] application config can take that name. This object carries the
+/// resolved base + selectors via the [`Chip`]; the config it consumes is the behavior.)
+///
+/// The base is resolved at `configure` time from the [`Chip`] for the config's timer label, with the
+/// advanced-timer-window check; a base outside the window (or a non-timer label, or a missing base)
+/// surfaces as a [`crate::error::DescriptorError`] / [`PwmError`]. The arming gate is obtained from
+/// the configured [`PwmTimer`] ([`PwmTimer::arm_gate`]); the base stays internal to the HAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PwmController;
+
+impl PwmController {
+    /// A controller that resolves its timer base from the [`Chip`] at `configure` time.
+    #[inline]
+    pub const fn new() -> Self {
+        PwmController
+    }
+}
+
+impl ComplementaryPwm for PwmController {
+    type Handle = PwmHandle;
+
+    /// Run the advanced-timer bring-up (alignment/ARSE/CREP/CKDIV/per-side idle from `cfg`, three
+    /// complementary pairs, dead-time, break) leaving MOE OFF, then resolve the four compare
+    /// offsets + the period once into a [`PwmHandle`]. No per-call branch in the resulting handle.
+    ///
+    /// The CH3 ADC-trigger compare + the TRGO master-mode are a separate
+    /// [`PwmTimer::configure_trigger`] step (so the channel-config golden stays CH3-untouched); the
+    /// integrated per-cycle-path bring-up runs both.
+    fn configure(&self, chip: &Chip, cfg: &PwmConfig) -> Result<Self::Handle, BringUpError> {
+        let timer = PwmTimer::configure(chip, cfg).map_err(BringUpError::Descriptor)?;
+        Ok(PwmHandle::new(timer.base(), cfg.period))
+    }
+}
+
+/// The resolve-once complementary-PWM per-cycle handle (DECISIONS.md #4).
+///
+/// `Copy`, concrete, no `dyn`: it holds the resolved [`Reg32`] accessors for the four compare
+/// registers (the three channel duties + the trigger compare) and the period for the duty clamp. The
+/// per-cycle methods ([`Self::set_duties`], [`Self::rearm_trigger`]) write straight to those
+/// resolved registers with no descriptor lookup and no branch. It holds NO accessor for CCHP/MOE
+/// (the arming gate is [`arming`]'s, not the handle's, a SAFETY invariant).
+#[derive(Debug, Clone, Copy)]
+pub struct PwmHandle {
+    /// CH0CV / CH1CV / CH2CV accessors (the three channel high-side duties), resolved once.
+    ch_cv: [Reg32; MAX_PWM_CHANNELS],
+    /// CH3CV accessor (the ADC-trigger compare), resolved once.
+    trig_cv: Reg32,
+    /// The PWM period (CAR/ARR), used to clamp/validate duties so a compare never exceeds it.
+    period: u16,
+}
+
+impl PwmHandle {
+    /// Construct the handle from a resolved timer base + period. HAL-internal (used by
+    /// [`PwmTimer::handle`] and host tests); the application gets a handle from a
+    /// configured `PwmTimer`, never by supplying a base. Resolves the compare accessors once; holds no
+    /// MOE accessor.
+    #[inline]
+    pub(crate) fn new(timer_base: u32, period: u16) -> Self {
+        Self {
+            ch_cv: [
+                Reg32::new(timer_base, TIMER_CH0CV),
+                Reg32::new(timer_base, TIMER_CH1CV),
+                Reg32::new(timer_base, TIMER_CH2CV),
+            ],
+            trig_cv: Reg32::new(timer_base, TIMER_CH3CV),
+            period,
+        }
+    }
+
+    /// Per-cycle: write the three channel duties to CH0CV/CH1CV/CH2CV. The ONLY per-cycle PWM write
+    /// surface besides [`Self::rearm_trigger`]. Resolve-once: no descriptor lookup, no branch. A
+    /// duty above the period is [`PwmError::DutyOutOfRange`] (it would never match in a
+    /// center-aligned count). MOE is untouched (this cannot arm the bridge).
+    #[inline]
+    pub fn set_duties(&self, duties: [u16; MAX_PWM_CHANNELS]) -> Result<(), PwmError> {
+        for &d in &duties {
+            if d > self.period {
+                return Err(PwmError::DutyOutOfRange);
+            }
+        }
+        for (i, &d) in duties.iter().enumerate() {
+            self.ch_cv[i].write(u32::from(d));
+        }
+        Ok(())
+    }
+
+    /// Per-cycle: re-arm the ADC-trigger compare (CH3CV). The reference re-writes this every PWM
+    /// period so the injected sample stays at the PWM centre. Wired to the actual trigger channel
+    /// in T7; the write surface is fixed here. MOE is untouched.
+    #[inline]
+    pub fn rearm_trigger(&self, compare: u16) -> Result<(), PwmError> {
+        if compare > self.period {
+            return Err(PwmError::DutyOutOfRange);
+        }
+        self.trig_cv.write(u32::from(compare));
+        Ok(())
+    }
+
+    /// The configured PWM period (CAR/ARR). Exposed so the control crate / arming layer can size
+    /// duties; read-only.
+    #[inline]
+    pub const fn period(&self) -> u16 {
+        self.period
+    }
+}
+
+/// The safety / arming layer (DECISIONS.md #4 + SPEC.md SAFETY). MOE (the main-output-enable arming
+/// gate) is owned HERE, not on the per-cycle [`PwmHandle`], so a control-loop bug cannot energize a
+/// disarmed bridge. The arming primitive is a separate, deliberately distinct call.
+///
+/// This is the boundary scaffold (T1); the body is a thin stub. The reference firmware confirms the
+/// shape: MOE (`timer_primary_output_config`) is owned by the rider-power state machine and is
+/// cleared on every latched fault, while the 16 kHz ISR only writes the compare values. The
+/// disarm-on-fault path and the software safe-disarm-before-halt are finalized in T4/T10 (HP-6).
+pub mod arming {
+    use super::{CCHP_MOE, TIMER_CCHP};
+    use crate::reg::Reg32;
+
+    /// The MOE arming gate for an advanced timer (the only MOE writer). Distinct from the per-cycle
+    /// [`super::PwmHandle`]; holds the CCHP accessor the handle deliberately does not.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ArmGate {
+        cchp: Reg32,
+    }
+
+    impl ArmGate {
+        /// Construct the arming gate from the resolved timer base. HAL-internal: the application gets
+        /// its arm gate from [`crate::timer::PwmTimer::arm_gate`] (base private), not by base.
+        #[inline]
+        pub(crate) fn new(timer_base: u32) -> Self {
+            Self {
+                cchp: Reg32::new(timer_base, TIMER_CCHP),
+            }
+        }
+
+        /// Arm the bridge: set MOE so the complementary outputs reach the pins. A deliberate,
+        /// distinct call (NOT a per-cycle handle method). SAFETY: only call under the rider-power
+        /// state machine with current limiting / a controlled bench setup; see the SAFETY section.
+        #[inline]
+        pub fn arm(&self) {
+            self.cchp.modify(CCHP_MOE, CCHP_MOE);
+        }
+
+        /// Disarm the bridge: clear MOE so the outputs drop to their configured idle state. The
+        /// software safe-disarm used on a latched fault and before any CPU halt with the bus
+        /// energized.
+        #[inline]
+        pub fn disarm(&self) {
+            self.cchp.modify(CCHP_MOE, 0);
+        }
+    }
+}
+
+/// Compile-time guard: the channel count this module loops over matches the descriptor's.
 const _: () = assert!(MAX_PWM_CHANNELS == 3);
 
 #[cfg(test)]

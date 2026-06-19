@@ -222,7 +222,7 @@ fn is_internal_channel_covers_16_and_17() {
 
 /// `configure_injected` programs the injected group end state in SPL order: DAL (left), ISQ IL =
 /// len-1, the per-rank ISQ channel fields (SPL reversed packing), per-channel SAMPT, ETSIC = the
-/// trigger code, ETEIC, EOICIE (CTL0), ADCON. Two phase-current channels (4, 5) at 7.5 cycles.
+/// trigger code, ETEIC, EOICIE (CTL0), ADCON. Two injected channels (4, 5) at 7.5 cycles.
 #[test]
 fn configure_injected_end_state() {
     let _g = seed_reset();
@@ -289,4 +289,202 @@ fn wait_eoic_times_out() {
     let _g = seed_reset();
     let e = Adc::at(ADC0_BASE).wait_eoic().unwrap_err();
     assert_eq!(e, AdcError::Timeout);
+}
+
+/// Host tests for the timer-triggered injected-ADC per-cycle path: the [`TriggeredAdc`] trait, the
+/// resolve-once [`InjectedHandle`], and the trigger-link validation.
+mod injected {
+    use crate::adc::{InjectedAdcController, InjectedHandle, TriggeredAdc};
+    use crate::addr::{AddrTable, PeriphLabel};
+    use crate::chip::Chip;
+    use crate::config::{
+        AdcClockDiv, InjectedAdcConfig, InjectedChannel, TimerTriggerLink,
+    };
+    use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
+    use crate::error::BringUpError;
+    use crate::reg::{mock, Reg32};
+
+    /// An ADC0 base inside the ADC APB2 window.
+    const ADC0_BASE: u32 = 0x4001_2400;
+    /// A TIMER0 base inside the advanced-timer APB2 window (used as a non-ADC base for the
+    /// out-of-window rejection).
+    const TIMER0_BASE: u32 = 0x4001_2C00;
+
+    fn chip_with(addrs: AddrTable) -> Chip {
+        Chip::from_descriptor(McuDescriptor {
+            gpio: GpioPath::AhbCtlAfsel,
+            clock: ClockPath::F1x0Rcu,
+            adc: AdcPath::Single,
+            irq: IrqLayout::F1x0Grouped,
+            addrs,
+            flash_page: PageSize::K1,
+            adv_timers: 1,
+            adc_count: 1,
+        })
+    }
+
+    /// A [`Chip`] whose ADC0 resolves to `ADC0_BASE` (the reference ADC base).
+    fn adc0_chip() -> Chip {
+        let mut a = AddrTable::new();
+        a.set(PeriphLabel::Adc0, ADC0_BASE);
+        chip_with(a)
+    }
+
+    /// The reference injected-ADC wiring on ADC0, triggered by TIMER0 CH3: two channels (4 and 5)
+    /// at 7.5-cycle sample time (code 1), left-aligned.
+    fn reference_injected_config() -> InjectedAdcConfig {
+        let mut channels = heapless::Vec::new();
+        channels
+            .push(InjectedChannel {
+                channel: 4,
+                sample_time: 1,
+            })
+            .unwrap();
+        channels
+            .push(InjectedChannel {
+                channel: 5,
+                sample_time: 1,
+            })
+            .unwrap();
+        InjectedAdcConfig {
+            adc: PeriphLabel::Adc0,
+            channels,
+            left_aligned: true,
+            trigger_timer: PeriphLabel::Timer0,
+            trigger_link: TimerTriggerLink::Ch3,
+            clock_div: AdcClockDiv::Div6,
+        }
+    }
+
+    #[test]
+    fn read_injected_reads_idata_in_order() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        // Seed the four injected data registers (IDATA0..3 at 0x3C/0x40/0x44/0x48).
+        Reg32::new(ADC0_BASE, 0x3C).write(0x0111);
+        Reg32::new(ADC0_BASE, 0x40).write(0x0222);
+        Reg32::new(ADC0_BASE, 0x44).write(0x0333);
+        Reg32::new(ADC0_BASE, 0x48).write(0x0444);
+
+        let h = InjectedHandle::new(ADC0_BASE, 2);
+        let got = h.read_injected();
+        assert_eq!(got[0], 0x0111);
+        assert_eq!(got[1], 0x0222);
+        assert_eq!(got[2], 0x0333);
+        assert_eq!(got[3], 0x0444);
+        assert_eq!(h.len(), 2);
+        assert!(!h.is_empty());
+    }
+
+    /// `TriggeredAdc::configure` runs the T8 injected bring-up INCLUDING the calibration poll. In the
+    /// flat mock register space the calibration self-clearing bit (RSTCLB) never clears, so the
+    /// bounded poll exits as `Timeout`. The point here: the trait does wire the config writes AND
+    /// drive calibration, and the config writes are present in the register space even though
+    /// calibration then times out.
+    #[test]
+    fn configure_injected_via_trait_drives_config_and_calibration() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let chip = adc0_chip();
+        let res = InjectedAdcController::new().configure(&chip, &reference_injected_config());
+        assert!(
+            matches!(res, Err(BringUpError::Adc(crate::error::AdcError::Timeout))),
+            "the trait config drives the calibration poll (Timeout in the flat mock)"
+        );
+
+        // The injected config writes landed before the calibration poll: CTL1 ETSIC = TIMER0 CH3
+        // (1<<12), ETEIC (bit 15), DAL (left, bit 11), ADCON (bit 0); CTL0 EOICIE (bit 7).
+        let ctl1 = Reg32::new(ADC0_BASE, 0x08).read();
+        assert_eq!(ctl1 & (0x7 << 12), 1 << 12, "ETSIC = TIMER0 CH3 (code 1)");
+        assert_ne!(ctl1 & (1 << 15), 0, "ETEIC (injected ext-trigger enable)");
+        assert_ne!(ctl1 & (1 << 11), 0, "DAL (left-aligned)");
+        assert_ne!(ctl1 & 1, 0, "ADCON (ADC enabled)");
+        let ctl0 = Reg32::new(ADC0_BASE, 0x04).read();
+        assert_ne!(ctl0 & (1 << 7), 0, "EOICIE (injected-EOC interrupt enable)");
+        let isq = Reg32::new(ADC0_BASE, 0x38).read();
+        assert_eq!((isq >> 20) & 0x3, 1, "ISQ IL = len-1");
+    }
+
+    /// The resolve-once `InjectedHandle` reads the injected data registers (IDATA0..3) in order.
+    #[test]
+    fn injected_handle_reads_idata_in_order() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        Reg32::new(ADC0_BASE, 0x3C).write(0x0AAA);
+        Reg32::new(ADC0_BASE, 0x40).write(0x0BBB);
+        let h = InjectedHandle::new(ADC0_BASE, 2);
+        let got = h.read_injected();
+        assert_eq!(got[0], 0x0AAA);
+        assert_eq!(got[1], 0x0BBB);
+    }
+
+    /// The TRGO link maps to ETSIC = TIMER0 TRGO (code 0); a non-TIMER0 trigger timer or an empty
+    /// channel list is rejected at config BEFORE any register write or calibration.
+    #[test]
+    fn injected_trigger_link_and_validation() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let chip = adc0_chip();
+
+        // TRGO link -> ETSIC code 0 (the config writes happen before calibration times out).
+        let mut w = reference_injected_config();
+        w.trigger_link = TimerTriggerLink::Trgo;
+        let _ = InjectedAdcController::new().configure(&chip, &w);
+        assert_eq!(
+            Reg32::new(ADC0_BASE, 0x08).read() & (0x7 << 12),
+            0,
+            "ETSIC = TIMER0 TRGO (code 0)"
+        );
+
+        // A non-TIMER0 trigger timer is not expressible on the single-ADC baseline: rejected.
+        let mut bad = reference_injected_config();
+        bad.trigger_timer = PeriphLabel::Timer7;
+        assert!(matches!(
+            InjectedAdcController::new().configure(&chip, &bad),
+            Err(BringUpError::Adc(_))
+        ));
+
+        // An empty channel list is rejected.
+        let mut empty = reference_injected_config();
+        empty.channels.clear();
+        assert!(matches!(
+            InjectedAdcController::new().configure(&chip, &empty),
+            Err(BringUpError::Adc(_))
+        ));
+    }
+
+    /// `InjectedAdcController::configure` resolves + range-checks the ADC base from the chip's
+    /// [`AddrTable`]. A base in the ADC window passes; one outside the ADC window, or missing, is
+    /// rejected as `BringUpError::Descriptor(..)` BEFORE any calibration (so not a Timeout).
+    #[test]
+    fn injected_from_descriptor_resolves_and_range_checks() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let chip = adc0_chip();
+        assert!(matches!(
+            InjectedAdcController::new().configure(&chip, &reference_injected_config()),
+            Err(BringUpError::Adc(crate::error::AdcError::Timeout))
+        ));
+
+        // A base outside the ADC window (a non-ADC base) is rejected at the descriptor layer.
+        let mut bad = AddrTable::new();
+        bad.set(PeriphLabel::Adc0, TIMER0_BASE);
+        let bad_chip = chip_with(bad);
+        assert!(matches!(
+            InjectedAdcController::new().configure(&bad_chip, &reference_injected_config()),
+            Err(BringUpError::Descriptor(_))
+        ));
+
+        // A missing base is rejected at the descriptor layer too.
+        let empty = chip_with(AddrTable::new());
+        assert!(matches!(
+            InjectedAdcController::new().configure(&empty, &reference_injected_config()),
+            Err(BringUpError::Descriptor(_))
+        ));
+    }
 }

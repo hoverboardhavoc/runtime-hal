@@ -364,8 +364,8 @@ extern "C" fn timer0_trg_cmt_isr() {
     grouped_inner::on_commutation();
 }
 
-/// The grouped EXTI vector body (placeholder; the reference reads halls as polled GPIO, not EXTI,
-/// per HP-9, so no EXTI line drives the control loop in M3).
+/// The grouped EXTI vector body (placeholder; the reference reads its rotor-position lines as polled
+/// GPIO, not EXTI, per HP-9, so no EXTI line drives the control loop in M3).
 extern "C" fn exti_isr() {}
 
 /// The F1x0 GROUPED combined advanced-timer demux (the heart of HP-4). One vector

@@ -36,7 +36,7 @@ pub const MAX_ADCS: usize = 2;
 /// Max advanced-timer config records (capacity constant). One per `adv_timers` (1 or 2).
 pub const MAX_TIMERS: usize = 2;
 
-/// Number of complementary phase channel pairs the advanced-timer PWM drives (capacity constant):
+/// Number of complementary channel pairs the advanced-timer PWM drives (capacity constant):
 /// the three half-bridges (CH0/CH0N, CH1/CH1N, CH2/CH2N -> the 6 gate signals). The 4th compare
 /// channel (CH3) is the ADC trigger and is carried separately on the PWM config, not in this count.
 pub const MAX_PWM_CHANNELS: usize = 3;

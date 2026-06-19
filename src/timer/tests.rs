@@ -147,7 +147,7 @@ fn channel_output_end_state_matches_spl() {
     // ISO2/2N (12,13) -> 0x3F00. ISO3 (bit 14, the CH3 trigger idle) untouched.
     assert_eq!(reg(CTL1), 0x3F00, "safe HIGH idle on all three pairs");
 
-    // The three phase compares start at zero (the control loop writes real duties via the handle);
+    // The three channel compares start at zero (the control loop writes real duties via the handle);
     // CH3CV (the trigger compare, T6) is untouched.
     assert_eq!(reg(0x34), 0, "CH0CV initial duty 0");
     assert_eq!(reg(0x38), 0, "CH1CV initial duty 0");
@@ -340,4 +340,327 @@ fn chcv_is_a_32bit_write_not_two_16bit() {
     assert_eq!(mock::peek_byte(TIMER0_BASE + 0x35), 0x08);
     assert_eq!(mock::peek_byte(TIMER0_BASE + 0x36), 0x00);
     assert_eq!(mock::peek_byte(TIMER0_BASE + 0x37), 0x00);
+}
+
+/// Host tests for the per-cycle PWM path: the resolve-once
+/// [`PwmHandle`] + the [`arming::ArmGate`], and the [`ComplementaryPwm`] trait config. These pin the
+/// handle write/read surface, the TIMER0 register-model conformance, and the load-bearing SAFETY
+/// invariant that the per-cycle handle cannot touch MOE (DECISIONS.md #4).
+mod per_cycle_path {
+    use crate::addr::{AddrTable, PeriphLabel};
+    use crate::chip::Chip;
+    use crate::config::{
+        BreakConfig, ClockDiv, OcMode, PwmAlign, PwmChannelConfig, PwmConfig, TrgoSource,
+    };
+    use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
+    use crate::error::{BringUpError, PwmError};
+    use crate::reg::{mock, Reg32};
+    use crate::timer::arming::ArmGate;
+    use crate::timer::{
+        ComplementaryPwm, PwmController, PwmHandle, CCHP_MOE, TIMER_CAR, TIMER_CCHP, TIMER_CH0CV,
+        TIMER_CH1CV, TIMER_CH2CV, TIMER_CH3CV,
+    };
+
+    /// A TIMER0 base inside the advanced-timer APB2 window.
+    const TIMER0_BASE: u32 = 0x4001_2C00;
+
+    /// Build a single-advanced-timer / single-ADC F1x0-style [`Chip`] from a base-address table, so
+    /// the controller can resolve (and range-check) its base at `configure` time.
+    fn chip_with(addrs: AddrTable) -> Chip {
+        Chip::from_descriptor(McuDescriptor {
+            gpio: GpioPath::AhbCtlAfsel,
+            clock: ClockPath::F1x0Rcu,
+            adc: AdcPath::Single,
+            irq: IrqLayout::F1x0Grouped,
+            addrs,
+            flash_page: PageSize::K1,
+            adv_timers: 1,
+            adc_count: 1,
+        })
+    }
+
+    /// A [`Chip`] whose TIMER0 resolves to `TIMER0_BASE` (the reference advanced-timer base).
+    fn timer0_chip() -> Chip {
+        let mut a = AddrTable::new();
+        a.set(PeriphLabel::Timer0, TIMER0_BASE);
+        chip_with(a)
+    }
+
+    /// The reference complementary-PWM config on TIMER0 (mirrors the timer-module test wiring).
+    fn reference_config() -> PwmConfig {
+        let ch = |high: u8, low: u8| PwmChannelConfig {
+            high,
+            low,
+            polarity: true,
+            idle_high: true,
+            idle_high_n: true,
+        };
+        PwmConfig {
+            timer: PeriphLabel::Timer0,
+            channels: [ch(0x08, 0x1D), ch(0x09, 0x1E), ch(0x0A, 0x1F)],
+            period: 2250,
+            prescaler: 0,
+            dead_time: 0x1C,
+            brk: BreakConfig {
+                enabled: false,
+                level: false,
+            },
+            trigger_compare: 2249,
+            align: PwmAlign::Center2,
+            arse: true,
+            trigger_oc_mode: OcMode::Pwm0,
+            trigger_ch_enable: false,
+            crep: 0,
+            ckdiv: ClockDiv::Div2,
+            trgo_src: TrgoSource::Update,
+        }
+    }
+
+    // --- TIMER0 register-model conformance (offsets, against the GD SPL peripheral headers) ------
+
+    /// The advanced-timer register offsets the per-cycle path uses, cross-checked against the GD SPL
+    /// `gd32f10x_timer.h` / `gd32f1x0_timer.h`: CH0CV 0x34, CH1CV 0x38, CH2CV 0x3C, CH3CV 0x40,
+    /// CAR 0x2C, CCHP 0x44. A 32-bit width on all.
+    #[test]
+    fn timer0_register_offsets_match_spl() {
+        assert_eq!(TIMER_CH0CV, 0x34);
+        assert_eq!(TIMER_CH1CV, 0x38);
+        assert_eq!(TIMER_CH2CV, 0x3C);
+        assert_eq!(TIMER_CH3CV, 0x40);
+        assert_eq!(TIMER_CAR, 0x2C);
+        assert_eq!(TIMER_CCHP, 0x44);
+        assert_eq!(TIMER_CH1CV - TIMER_CH0CV, 0x04);
+        assert_eq!(TIMER_CH2CV - TIMER_CH1CV, 0x04);
+        assert_eq!(TIMER_CH3CV - TIMER_CH2CV, 0x04);
+        assert_eq!(CCHP_MOE, 1 << 15);
+    }
+
+    // --- PwmHandle::set_duties writes the three CHxCV at the right offsets ----------------------
+
+    #[test]
+    fn set_duties_writes_three_compare_registers() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let h = PwmHandle::new(TIMER0_BASE, 2250);
+        h.set_duties([100, 200, 300]).unwrap();
+
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH0CV).read(), 100);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH1CV).read(), 200);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH2CV).read(), 300);
+        // The trigger compare (CH3CV) is NOT touched by set_duties.
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH3CV).read(), 0);
+    }
+
+    #[test]
+    fn rearm_trigger_writes_ch3cv_only() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let h = PwmHandle::new(TIMER0_BASE, 2250);
+        h.rearm_trigger(2249).unwrap();
+
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH3CV).read(), 2249);
+        // The channel compares are untouched.
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH0CV).read(), 0);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH1CV).read(), 0);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH2CV).read(), 0);
+    }
+
+    #[test]
+    fn duty_above_period_is_rejected() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let h = PwmHandle::new(TIMER0_BASE, 2250);
+        assert_eq!(h.set_duties([2251, 0, 0]), Err(PwmError::DutyOutOfRange));
+        assert_eq!(h.rearm_trigger(2251), Err(PwmError::DutyOutOfRange));
+        // A duty equal to the period is allowed (full compare).
+        assert_eq!(h.set_duties([2250, 2250, 2250]), Ok(()));
+    }
+
+    // --- The SAFETY invariant: the per-cycle handle cannot touch MOE (DECISIONS.md #4) ----------
+
+    /// The PWM handle's per-cycle methods write only the four compare registers and NEVER the
+    /// CCHP/MOE bit. Arming is a separate, deliberately distinct call ([`ArmGate`]). This is the
+    /// load-bearing SAFETY invariant: a control-loop bug holding only the handle cannot energize a
+    /// disarmed bridge.
+    #[test]
+    fn handle_never_writes_moe() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        // Pre-seed CCHP with MOE clear (disarmed) and a sentinel in the low bits.
+        Reg32::new(TIMER0_BASE, TIMER_CCHP).write(0x0000_00AB);
+
+        let h = PwmHandle::new(TIMER0_BASE, 2250);
+        // Exercise every per-cycle method, including the out-of-range rejections.
+        h.set_duties([10, 20, 30]).unwrap();
+        h.rearm_trigger(2249).unwrap();
+        let _ = h.set_duties([9999, 0, 0]);
+
+        // CCHP is byte-for-byte unchanged: MOE was never set, and no compare write bled into it.
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CCHP).read(),
+            0x0000_00AB,
+            "the per-cycle handle must not touch CCHP/MOE"
+        );
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CCHP).read() & CCHP_MOE,
+            0,
+            "MOE stays clear: the handle cannot arm the bridge"
+        );
+    }
+
+    /// The arming gate is the ONLY MOE writer and is distinct from the handle. arm() sets MOE,
+    /// disarm() clears it, both leaving the compare registers untouched.
+    #[test]
+    fn arm_gate_is_the_only_moe_writer() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let gate = ArmGate::new(TIMER0_BASE);
+        let h = PwmHandle::new(TIMER0_BASE, 2250);
+        h.set_duties([10, 20, 30]).unwrap();
+
+        // Arm: MOE set, duties intact.
+        gate.arm();
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CCHP).read() & CCHP_MOE,
+            CCHP_MOE
+        );
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH0CV).read(), 10);
+
+        // Disarm: MOE clear again.
+        gate.disarm();
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CCHP).read() & CCHP_MOE, 0);
+    }
+
+    // --- M3 T5: the ComplementaryPwm trait -> resolve-once handle -------------------------------
+
+    /// `ComplementaryPwm::configure` runs the T3/T4 bring-up (so the timebase + channel + break
+    /// registers are programmed) and returns a `PwmHandle` whose period matches the wiring, with MOE
+    /// left OFF (the bridge disarmed). The returned handle's per-cycle writes then land at the right
+    /// compare offsets.
+    #[test]
+    fn configure_via_trait_then_set_duties() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let chip = timer0_chip();
+        let cfg = reference_config();
+        let h = PwmController::new()
+            .configure(&chip, &cfg)
+            .expect("configure should succeed");
+
+        // The handle carries the configured period.
+        assert_eq!(h.period(), 2250);
+
+        // The T3/T4 config writes happened: CAR = 2250, CTL0 = center-up | CKDIV/2 | ARSE, CCHP
+        // holds the dead-time + off-state word with MOE OFF.
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CAR).read(), 2250);
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, 0x00).read(),
+            0x40 | 0x100 | 0x80,
+            "CTL0"
+        );
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CCHP).read() & CCHP_MOE,
+            0,
+            "configure leaves MOE OFF (bridge disarmed)"
+        );
+
+        // Then the per-cycle duty writes land at the three channel compares.
+        h.set_duties([100, 200, 300]).unwrap();
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH0CV).read(), 100);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH1CV).read(), 200);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH2CV).read(), 300);
+
+        // The trace's MOE writer is the gate, distinct from the handle (the only MOE writer). The
+        // gate is built from the resolved base (the safety layer resolves it separately).
+        let gate = ArmGate::new(chip.base(cfg.timer).unwrap());
+        gate.arm();
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CCHP).read() & CCHP_MOE,
+            CCHP_MOE
+        );
+    }
+
+    /// `PwmController::configure` resolves the timer base from the chip's [`AddrTable`] (via
+    /// `chip.base(cfg.timer)`). A present base succeeds; a MISSING base is rejected as
+    /// `BringUpError::Descriptor(MissingBase(..))`.
+    #[test]
+    fn from_descriptor_resolves_and_range_checks() {
+        let mut addrs = AddrTable::new();
+        addrs.set(PeriphLabel::Timer0, TIMER0_BASE);
+        let chip = chip_with(addrs);
+        let h = PwmController::new()
+            .configure(&chip, &reference_config())
+            .expect("present base resolves");
+        assert_eq!(h.period(), 2250);
+
+        // A missing base is rejected (MissingBase, mapped to BringUpError::Descriptor).
+        let empty = chip_with(AddrTable::new());
+        assert!(matches!(
+            PwmController::new().configure(&empty, &reference_config()),
+            Err(BringUpError::Descriptor(
+                crate::error::DescriptorError::MissingBase(_)
+            ))
+        ));
+    }
+
+    // --- M3 T7: the per-cycle rearm_trigger targets the SAME CH3 the T6 trigger config programs --
+
+    /// T7: confirm `PwmHandle::rearm_trigger` re-arms the EXACT compare register (CH3CV, offset
+    /// 0x40) that the T6 timer trigger config ([`crate::timer::PwmTimer::configure_trigger`])
+    /// programs as the ADC-trigger channel.
+    #[test]
+    fn rearm_trigger_matches_t6_trigger_channel() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        crate::timer::PwmTimer::at(TIMER0_BASE).configure_trigger(
+            2249,
+            OcMode::Pwm0,
+            false,
+            TrgoSource::Update,
+        );
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CH3CV).read(),
+            2249,
+            "T6 programs the trigger compare at CH3CV (~CAR-1)"
+        );
+
+        let h = PwmHandle::new(TIMER0_BASE, 2250);
+        h.rearm_trigger(2200).unwrap();
+        assert_eq!(
+            Reg32::new(TIMER0_BASE, TIMER_CH3CV).read(),
+            2200,
+            "rearm_trigger writes the T6 trigger channel CH3CV"
+        );
+        // The channel compares are untouched by the re-arm.
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH0CV).read(), 0);
+    }
+
+    /// The handle is `Copy` / concrete (no `dyn`, no descriptor lookup per call): it can be copied
+    /// and each copy writes the same resolved registers. This is the resolve-once invariant.
+    #[test]
+    fn handle_is_copy_and_resolve_once() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        let chip = timer0_chip();
+        let h = PwmController::new()
+            .configure(&chip, &reference_config())
+            .unwrap();
+        let h2 = h; // Copy, not move.
+        h.set_duties([1, 2, 3]).unwrap();
+        h2.set_duties([10, 20, 30]).unwrap();
+        // The second copy wrote the same resolved offsets.
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH0CV).read(), 10);
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH2CV).read(), 30);
+        // Original still usable (Copy semantics, no move).
+        h.rearm_trigger(2249).unwrap();
+        assert_eq!(Reg32::new(TIMER0_BASE, TIMER_CH3CV).read(), 2249);
+    }
 }

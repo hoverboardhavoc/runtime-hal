@@ -75,7 +75,10 @@
 //! compatibility (which `embedded-hal` 1.0 itself no longer expresses). If a future caller needs
 //! `OneShot`, it is a thin wrapper over `read_channel` and can be added then.
 
-use crate::error::AdcError;
+use crate::chip::Chip;
+use crate::config::{InjectedAdcConfig, TimerTriggerLink};
+use crate::descriptor::MAX_INJECTED_CHANNELS;
+use crate::error::{AdcError, BringUpError};
 use crate::reg::Reg32;
 
 // --- register offsets (identical on both families) --------------------------------------------
@@ -508,7 +511,7 @@ impl Adc {
 ///
 /// - [`AdcCapability::Single`]: one ADC (the F1x0 baseline). Sample channels in sequence.
 /// - [`AdcCapability::Dual`]: two ADCs (the F10x dual-ADC parts), handed back as `primary` +
-///   `secondary`. The pair can be driven for at-the-same-instant phase-current sampling; this fruit
+///   `secondary`. The pair can be driven for at-the-same-instant simultaneous sampling; this fruit
 ///   hands back BOTH handles so each is usable today. (The hardware regular-simultaneous trigger
 ///   coupling is a future bring-up; the two handles are independently usable now.)
 ///
@@ -525,6 +528,168 @@ pub enum AdcCapability {
         /// The secondary ADC (ADC1).
         secondary: Adc,
     },
+}
+
+// --- timer-triggered injected ADC (the per-cycle path) ----------------------------------------
+//
+// The one genuine cross-peripheral coupling (the timer compare event triggers the ADC's injected
+// conversion) is silicon (a trigger link), expressed here on the ADC side. The timer side (CH3
+// compare + TRGO master mode) is [`crate::timer::PwmTimer::configure_trigger`]; the injected group
+// selects either via its ETSIC field below.
+
+/// The timer-triggered injected-ADC capability (M3 T9 fills the bodies). SPEC.md: an injected
+/// conversion group triggered by the timer's trigger channel (sampled near the PWM centre), a small
+/// channel list with per-channel sample time, left-aligned data, and an end-of-injected-conversion
+/// interrupt that runs the control loop; read the injected results.
+pub trait TriggeredAdc {
+    /// The concrete per-cycle handle this config resolves into (DECISIONS.md #4).
+    type Handle: Copy;
+
+    /// Configure the injected conversion group from the [`Chip`] (base + selector) and the
+    /// code-level [`InjectedAdcConfig`] (trigger source = the timer, channel sequence + sample
+    /// times, left-aligned, EOIC enable) and return the resolve-once handle. Runs ONCE at bring-up.
+    fn configure(&self, chip: &Chip, cfg: &InjectedAdcConfig)
+        -> Result<Self::Handle, BringUpError>;
+}
+
+/// The timer-triggered injected-ADC config object (M3 T8/T9): a resolved single-ADC base that
+/// implements [`TriggeredAdc`]. Its [`TriggeredAdc::configure`] runs the T8 injected bring-up
+/// ([`Adc::configure_injected`] + calibration) and resolves the injected-data offsets +
+/// the channel count once into an [`InjectedHandle`].
+///
+/// The base is resolved at `configure` time from the [`Chip`] for the config's ADC label, with the
+/// ADC-window check. The wiring it consumes carries only the logical config (channel list, sample
+/// times, alignment, the timer-trigger link).
+///
+/// (Was `InjectedAdcConfig`; renamed to `InjectedAdcController` so the code-level
+/// [`crate::config::InjectedAdcConfig`] application config can take that name.)
+///
+/// DECISIONS.md #9: single ADC first (the F1x0 baseline). The F10x dual / simultaneous arm is later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InjectedAdcController;
+
+impl InjectedAdcController {
+    /// A controller that resolves its ADC base from the [`Chip`] at `configure` time.
+    #[inline]
+    pub const fn new() -> Self {
+        InjectedAdcController
+    }
+}
+
+/// Map the logical timer-trigger link (HP-5) to the raw ADC injected external-trigger source
+/// (ETSIC) field value. The reference triggers off TIMER0 (the only advanced timer the board uses);
+/// on both families TIMER0 CH3 = 1 and TIMER0 TRGO = 0. A non-TIMER0 trigger timer is not
+/// expressible on the single-ADC F1x0 baseline (the ETSIC matrix has no slot for it), so it is
+/// rejected at config (`None`).
+#[inline]
+fn etsic_for_link(cfg: &InjectedAdcConfig) -> Option<u32> {
+    use crate::addr::PeriphLabel;
+    if cfg.trigger_timer != PeriphLabel::Timer0 {
+        return None;
+    }
+    Some(match cfg.trigger_link {
+        TimerTriggerLink::Ch3 => ETSIC_T0_CH3,
+        TimerTriggerLink::Trgo => ETSIC_T0_TRGO,
+    })
+}
+
+impl TriggeredAdc for InjectedAdcController {
+    type Handle = InjectedHandle;
+
+    /// Run the T8 injected bring-up (data alignment, injected sequence length + channel list with
+    /// per-channel sample time, the timer external-trigger source derived from the HP-5 link, the
+    /// EOIC interrupt enable, ADC enable, then the calibration poll) and resolve the injected-data
+    /// offsets + the channel count once into an [`InjectedHandle`]. No per-call branch in the handle.
+    ///
+    /// The injected-EOC ISR routing is already in place on the T2 substrate (the ADC vector calls
+    /// the registered control handler); enabling EOICIE here is what makes that ISR fire at the PWM
+    /// rate. The firmware registers its control handler via
+    /// [`crate::irq::register_control_handler`] at boot.
+    fn configure(
+        &self,
+        chip: &Chip,
+        cfg: &InjectedAdcConfig,
+    ) -> Result<Self::Handle, BringUpError> {
+        // Resolve + range-check the ADC base from the chip (the config carries only behavior).
+        chip.descriptor()
+            .addrs
+            .check_adc_base(cfg.adc)
+            .map_err(BringUpError::Descriptor)?;
+        let base = chip.base(cfg.adc).map_err(BringUpError::Descriptor)?;
+        let len = cfg.channels.len();
+        if len == 0 || len > MAX_INJECTED_CHANNELS {
+            return Err(BringUpError::Adc(AdcError::Other));
+        }
+        let etsic = etsic_for_link(cfg).ok_or(BringUpError::Adc(AdcError::Other))?;
+        // The injected channel list as (channel, sample_time) pairs in injected-rank order.
+        let mut chans = [(0u8, 0u8); MAX_INJECTED_CHANNELS];
+        for (i, c) in cfg.channels.iter().enumerate() {
+            chans[i] = (c.channel, c.sample_time);
+        }
+        let dev = Adc::bring_up_injected(base, &chans[..len], cfg.left_aligned, etsic)?;
+        Ok(InjectedHandle::new(dev.base(), len as u8))
+    }
+}
+
+/// The resolve-once injected-ADC per-cycle handle (DECISIONS.md #4).
+///
+/// `Copy`, concrete, no `dyn`: it holds the resolved [`Reg32`] accessors for the injected data
+/// registers and the channel count, so [`Self::read_injected`] reads the conversion results with no
+/// descriptor lookup and no branch. The raw injected values are returned as-is (offset correction /
+/// calibration is the `control` crate, out of M3).
+#[derive(Debug, Clone, Copy)]
+pub struct InjectedHandle {
+    /// IDATA0..IDATA3 accessors (the injected data registers), resolved once.
+    idata: [Reg32; MAX_INJECTED_CHANNELS],
+    /// Number of valid injected channels (<= [`MAX_INJECTED_CHANNELS`]).
+    len: u8,
+}
+
+/// ADC injected data registers (IDATA0..IDATA3) offsets, identical on both families (gd32*_adc.h:
+/// `ADC_IDATA0..3` at 0x3C/0x40/0x44/0x48). T8/T9 fill the body; the offsets are pinned here.
+const ADC_IDATA: [u32; MAX_INJECTED_CHANNELS] = [0x3C, 0x40, 0x44, 0x48];
+
+impl InjectedHandle {
+    /// Construct the handle from a resolved ADC base + injected channel count. HAL-internal (the
+    /// `TriggeredAdc::configure` body + host tests); the application gets it from configure, not by
+    /// supplying a base. Resolves the injected-data accessors once.
+    #[inline]
+    pub(crate) fn new(adc_base: u32, len: u8) -> Self {
+        Self {
+            idata: [
+                Reg32::new(adc_base, ADC_IDATA[0]),
+                Reg32::new(adc_base, ADC_IDATA[1]),
+                Reg32::new(adc_base, ADC_IDATA[2]),
+                Reg32::new(adc_base, ADC_IDATA[3]),
+            ],
+            len,
+        }
+    }
+
+    /// Per-cycle: read the injected conversion results in injected-rank order (left-aligned, raw).
+    /// Resolve-once: no descriptor lookup, no branch. Returns a fixed-size array; entries beyond
+    /// [`Self::len`] are read but the caller uses only `len` of them (the control crate knows the
+    /// channel list). The body is filled in T9; the shape is fixed here.
+    #[inline]
+    pub fn read_injected(&self) -> [u16; MAX_INJECTED_CHANNELS] {
+        let mut out = [0u16; MAX_INJECTED_CHANNELS];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.idata[i].read() as u16;
+        }
+        out
+    }
+
+    /// The number of valid injected channels.
+    #[inline]
+    pub const fn len(&self) -> u8 {
+        self.len
+    }
+
+    /// True if no injected channels are configured.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 #[cfg(test)]

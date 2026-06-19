@@ -26,7 +26,6 @@ pub mod descriptor;
 pub mod detect;
 pub mod error;
 pub mod gpio;
-pub mod hotpath;
 pub mod i2c;
 pub mod irq;
 /// General single-channel PWM on a GENERAL-purpose timer (G3): the cold-path duty setter
@@ -34,6 +33,10 @@ pub mod irq;
 /// touches the MOE/POEN gate; implements the embedded-hal 1.0 `pwm::SetDutyCycle` trait.
 pub mod pwm;
 pub mod reg;
+/// Read-only register-snapshot helper (G8): [`regdump::RegDumpConfig`] / [`regdump::TimerRegs`] /
+/// [`regdump::AdcInjectedRegs`] capture the advanced-timer + injected-ADC blocks for the
+/// conformance / verification-gate diff. Pure reads, never an MOE writer.
+pub mod regdump;
 pub mod serial;
 pub mod spi;
 /// Configurable-rate periodic SysTick tick (G-TICK): the cold-path outer-loop / cadence timebase
@@ -46,7 +49,9 @@ pub mod usart;
 /// one model parameterised by base, no per-family register branch.
 pub mod watchdog;
 
-pub use adc::{is_internal_channel, Adc, AdcCapability};
+pub use adc::{
+    is_internal_channel, Adc, AdcCapability, InjectedAdcController, InjectedHandle, TriggeredAdc,
+};
 pub use addr::{AddrTable, PeriphLabel};
 pub use chip::Chip;
 pub use clock::{
@@ -70,18 +75,12 @@ pub use detect::{
     FLASH_DENSITY_ADDR,
 };
 pub use error::{
-    AdcError, ClockError, DescriptorError, DetectError, HotPathError, I2cError, PwmError, SpiError,
+    AdcError, ClockError, DescriptorError, DetectError, BringUpError, I2cError, PwmError, SpiError,
     UsartError, WatchdogError,
 };
 pub use gpio::{
-    Floating, GpioOutput, GpioPort, Input, Output, Pin, PinRole, PortAPins, PortBPins, PortCPins,
-    PortDPins, PortFPins, PortPins, PullDown, PullUp, PushPull,
-};
-pub use hotpath::arming::ArmGate;
-pub use hotpath::dump::{AdcInjectedRegs, HotpathConfig, TimerRegs};
-pub use hotpath::hall::HallReader;
-pub use hotpath::{
-    ComplementaryPwm, InjectedAdcController, InjectedHandle, PwmController, PwmHandle, TriggeredAdc,
+    Floating, GpioOutput, GpioPort, Input, InputGroup, Output, Pin, PinRole, PortAPins, PortBPins,
+    PortCPins, PortDPins, PortFPins, PortPins, PullDown, PullUp, PushPull,
 };
 pub use i2c::{i2c_input_clock, timing_for, FastDuty, I2c, I2cMode, I2cTiming};
 pub use irq::{
@@ -90,10 +89,12 @@ pub use irq::{
 };
 pub use pwm::PwmOut;
 pub use reg::{Reg16, Reg32};
+pub use regdump::{AdcInjectedRegs, RegDumpConfig, TimerRegs};
 pub use serial::{Serial, UsartSerial};
 pub use spi::{mode_bits, prescaler_for, spi_input_clock, DataSize, Spi};
 pub use timebase::{reload_for, Timebase, TimebaseError};
-pub use timer::PwmTimer;
+pub use timer::arming::ArmGate;
+pub use timer::{ComplementaryPwm, PwmController, PwmHandle, PwmTimer};
 pub use usart::{compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel};
 pub use watchdog::{
     clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,

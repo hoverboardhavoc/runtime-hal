@@ -1,13 +1,14 @@
-//! Host tests for the read-only hot-path register dump (G8). Run with `cargo test --features mock`.
+//! Host tests for the read-only register dump (G8). Run with `cargo test --features mock`.
 //!
 //! These configure the real bring-up (the advanced-timer complementary-PWM + the timer-triggered
-//! injected ADC) against the mock register space, then [`HotpathConfig::dump`] it and assert the
+//! injected ADC) against the mock register space, then [`RegDumpConfig::dump`] it and assert the
 //! snapshot reflects the configured state, that the dump itself writes nothing, and that the captured
 //! MOE bit is CLEAR after a config-only bring-up (the SAFETY invariant the verification gate checks).
 
 #![cfg(feature = "mock")]
 
-use super::HotpathConfig;
+use super::RegDumpConfig;
+use crate::adc::{InjectedAdcController, TriggeredAdc};
 use crate::addr::{AddrTable, PeriphLabel};
 use crate::chip::Chip;
 use crate::config::{
@@ -15,9 +16,9 @@ use crate::config::{
     PwmChannelConfig, PwmConfig, TimerTriggerLink, TrgoSource,
 };
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
-use crate::hotpath::arming::ArmGate;
-use crate::hotpath::{ComplementaryPwm, InjectedAdcController, PwmController, TriggeredAdc};
 use crate::reg::{mock, Reg32};
+use crate::timer::arming::ArmGate;
+use crate::timer::{ComplementaryPwm, PwmController};
 use heapless::Vec;
 
 /// A TIMER0 base inside the advanced-timer APB2 window.
@@ -46,7 +47,7 @@ fn chip() -> Chip {
     })
 }
 
-/// The reference complementary-PWM config (mirrors the hot-path test wiring).
+/// The reference complementary-PWM config (mirrors the per-cycle-path test wiring).
 fn pwm_config() -> PwmConfig {
     let ch = |high: u8, low: u8| PwmChannelConfig {
         high,
@@ -76,7 +77,7 @@ fn pwm_config() -> PwmConfig {
     }
 }
 
-/// The reference injected-ADC config (two phase-current channels, CH3-triggered, left-aligned).
+/// The reference injected-ADC config (two channels, CH3-triggered, left-aligned).
 fn injected_config() -> InjectedAdcConfig {
     let mut channels: Vec<InjectedChannel, { crate::descriptor::MAX_INJECTED_CHANNELS }> = Vec::new();
     channels
@@ -111,7 +112,7 @@ fn dump_reflects_the_configured_timer_period_and_prescaler() {
         .configure(&chip, &pwm_config())
         .unwrap();
 
-    let snap = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
+    let snap = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
     // CAR is the configured period; PSC the configured prescaler; CREP the rep counter.
     assert_eq!(snap.timer.car, 2250);
     assert_eq!(snap.timer.psc, 0);
@@ -131,7 +132,7 @@ fn dump_shows_moe_clear_after_config_only_bring_up() {
         .configure(&chip, &pwm_config())
         .unwrap();
 
-    let snap = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
+    let snap = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
     // The SAFETY invariant the verification gate asserts: a configured-but-disarmed bridge reads MOE
     // clear. `moe()` is the typed accessor; the raw CCHP bit agrees.
     assert!(!snap.timer.moe(), "config-only must leave the bridge disarmed");
@@ -152,7 +153,7 @@ fn dump_sees_moe_when_armed() {
     let base = chip.base(PeriphLabel::Timer0).unwrap();
     ArmGate::new(base).arm();
 
-    let snap = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
+    let snap = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
     assert!(snap.timer.moe(), "the dump must observe the armed MOE bit");
 }
 
@@ -164,11 +165,11 @@ fn dump_reflects_injected_adc_alignment_and_trigger() {
 
     // The injected bring-up writes the config registers BEFORE the calibration poll; in the flat
     // mock the calibration self-clearing bit never clears, so `configure` exits `Adc(Timeout)`
-    // (the same flat-mock limitation `hotpath::tests` documents). The config writes are present, so
+    // (the same flat-mock limitation the adc tests document). The config writes are present, so
     // the dump still reflects them; ignore the calibration timeout here.
     let _ = InjectedAdcController::new().configure(&chip, &injected_config());
 
-    let snap = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
+    let snap = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
     // Left-aligned data: CTL1 DAL (bit 11) set.
     assert_eq!(snap.adc_injected.ctl1 & (1 << 11), 1 << 11);
     // The injected end-of-conversion interrupt enable (EOICIE, CTL0 bit 7) is on (it is what makes
@@ -193,8 +194,8 @@ fn dump_writes_nothing() {
 
     // Capture the live CCHP, then dump twice; a read-only dump must not perturb any register.
     let cchp_before = Reg32::new(TIMER0_BASE, TIMER_CCHP).read();
-    let first = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
-    let second = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
+    let first = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
+    let second = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
     let cchp_after = Reg32::new(TIMER0_BASE, TIMER_CCHP).read();
 
     assert_eq!(first, second, "two dumps of the same state are identical");

@@ -1,9 +1,9 @@
-//! Read-only hot-path register-dump surface (G8): the verification gate's capture.
+//! Read-only register-dump surface (G8): the verification gate's capture.
 //!
-//! The per-cycle [`crate::hotpath::PwmHandle`] deliberately exposes ONLY the compare writes (no
+//! The per-cycle [`crate::timer::PwmHandle`] deliberately exposes ONLY the compare writes (no
 //! CCHP/MOE), which is correct for the control path but leaves the verification gate with no
 //! first-class way to read back the full configured register set for the section-3 register-
-//! equivalence diff. This module is that read-only capture: [`HotpathConfig::dump`] reads the TIMER0
+//! equivalence diff. This module is that read-only capture: [`RegDumpConfig::dump`] reads the TIMER0
 //! advanced-timer block and the timer-triggered injected-ADC block into a plain `Copy` value type so
 //! a host golden diff or an on-target SWD read compares against the SAME fields.
 //!
@@ -11,7 +11,7 @@
 //!
 //! Every field here is a [`Reg32::read`] result. CCHP is READ (so the diff can confirm MOE is CLEAR,
 //! [`TimerRegs::moe`]), but this type has NO method that writes CCHP or any other register.
-//! [`crate::hotpath::arming::ArmGate`] remains the sole MOE writer (DECISIONS.md #4 + the M3 SAFETY
+//! [`crate::timer::arming::ArmGate`] remains the sole MOE writer (DECISIONS.md #4 + the M3 SAFETY
 //! section). Reading registers with MOE off and no drain supply is electrically harmless, so the
 //! dump is trivially safe under the M3 SAFETY rules.
 //!
@@ -19,7 +19,7 @@
 //!
 //! The advanced-timer and ADC register blocks are identical on the F10x and F1x0 (one model
 //! parameterised by base, exactly as [`crate::timer`] and [`crate::adc`] already rely on), so there
-//! is no family branch on the timer/ADC capture. The GPIO gate/hall pin fields DO differ by family
+//! is no family branch on the timer/ADC capture. The GPIO input/gate pin fields DO differ by family
 //! (the CRL/CRH nibble vs CTL/AFSEL/OMODE/OSPD/PUD split); normalising those into a family-neutral
 //! struct is a separate follow-up tied to the verification-gate example, not part of this capture.
 //!
@@ -29,8 +29,8 @@ use crate::reg::Reg32;
 
 // --- TIMER0 register offsets (the bring-up + per-cycle set, identical on both families) ---------
 //
-// These mirror the offsets `crate::timer` and `crate::hotpath` already document and write; the dump
-// reads the same locations so the captured value diffs field-for-field against the bring-up golden.
+// These mirror the offsets `crate::timer` already documents and writes; the dump reads the same
+// locations so the captured value diffs field-for-field against the bring-up golden.
 
 const TIMER_CTL0: u32 = 0x00;
 const TIMER_CTL1: u32 = 0x04;
@@ -85,7 +85,7 @@ pub struct TimerRegs {
     pub car: u32,
     /// CREP: repetition counter.
     pub crep: u32,
-    /// CH0CV..CH3CV: the three phase duties (0..2) and the ADC-trigger compare (3).
+    /// CH0CV..CH3CV: the three channel duties (0..2) and the ADC-trigger compare (3).
     pub chxcv: [u32; 4],
     /// CCHP: dead-time / break / off-state / protect word, INCLUDING the MOE arm bit (see
     /// [`Self::moe`]).
@@ -94,9 +94,9 @@ pub struct TimerRegs {
 
 impl TimerRegs {
     /// True if MOE (the main-output-enable arm bit) is SET in the captured CCHP. The verification
-    /// gate asserts this is `false` on a configured-but-disarmed bridge (MOE is the [`crate::hotpath`]
-    /// arming layer's sole responsibility; a dump showing it set after config-only is a SAFETY
-    /// violation the gate must catch).
+    /// gate asserts this is `false` on a configured-but-disarmed bridge (MOE is the
+    /// [`crate::timer::arming`] layer's sole responsibility; a dump showing it set after config-only
+    /// is a SAFETY violation the gate must catch).
     #[inline]
     pub const fn moe(&self) -> bool {
         self.cchp & CCHP_MOE != 0
@@ -123,32 +123,32 @@ pub struct AdcInjectedRegs {
     pub isq: u32,
 }
 
-/// A read-only capture of the hot-path configuration: the TIMER0 advanced-timer block and the
+/// A read-only capture of the per-cycle-path configuration: the TIMER0 advanced-timer block and the
 /// timer-triggered injected-ADC block, read into a plain `Copy` value type.
 ///
-/// Built with [`HotpathConfig::dump`] from the resolved timer + ADC bases (the same bases the
-/// [`crate::hotpath::PwmHandle`] / [`crate::hotpath::InjectedHandle`] hold). It holds ONLY register
+/// Built with [`RegDumpConfig::dump`] from the resolved timer + ADC bases (the same bases the
+/// [`crate::timer::PwmHandle`] / [`crate::adc::InjectedHandle`] hold). It holds ONLY register
 /// reads; it can never arm the bridge or write any register. The verification gate diffs this against
 /// the expected configured state (and asserts [`TimerRegs::moe`] is clear); a bench SWD read produces
 /// the same fields for an on-target diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HotpathConfig {
+pub struct RegDumpConfig {
     /// The advanced-timer (TIMER0) register snapshot.
     pub timer: TimerRegs,
     /// The injected-ADC register snapshot.
     pub adc_injected: AdcInjectedRegs,
 }
 
-impl HotpathConfig {
-    /// Read the hot-path configuration registers from the resolved `timer_base` (the advanced timer)
-    /// and `adc_base` (the injected ADC) into a snapshot. Pure reads, no writes, no MOE: safe to call
-    /// at any time (the M3 SAFETY rules: reading with MOE off and no drain supply is harmless).
+impl RegDumpConfig {
+    /// Read the per-cycle-path configuration registers from the resolved `timer_base` (the advanced
+    /// timer) and `adc_base` (the injected ADC) into a snapshot. Pure reads, no writes, no MOE: safe
+    /// to call at any time (the M3 SAFETY rules: reading with MOE off and no drain supply is harmless).
     ///
     /// The bases are the ones the application already resolved once (e.g. `chip.base(cfg.timer)?` /
     /// `chip.base(cfg.adc)?`), matching the resolve-once handle pattern (DECISIONS.md #4).
     #[must_use]
-    pub fn dump(timer_base: u32, adc_base: u32) -> HotpathConfig {
-        HotpathConfig {
+    pub fn dump(timer_base: u32, adc_base: u32) -> RegDumpConfig {
+        RegDumpConfig {
             timer: TimerRegs::dump(timer_base),
             adc_injected: AdcInjectedRegs::dump(adc_base),
         }

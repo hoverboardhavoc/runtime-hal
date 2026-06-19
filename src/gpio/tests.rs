@@ -625,7 +625,7 @@ fn make_pin(base: u32, path: GpioPath, pin: u8) -> Pin<Input<Floating>> {
 use crate::gpio::{configure_input, read_pin, InputPull, PullDown, PullUp};
 use embedded_hal::digital::InputPin;
 
-// F1x0 ISTAT at 0x10, F10x ISTAT at 0x08 (the offsets the hall reader uses).
+// F1x0 ISTAT at 0x10, F10x ISTAT at 0x08 (the offsets the input-group reader uses).
 const F10X_ISTAT: u32 = 0x08;
 const F1X0_ISTAT: u32 = 0x10;
 
@@ -790,4 +790,59 @@ fn f10x_is_set_high_reads_odr_at_0x0c() {
         out.is_set_high().unwrap(),
         "F10x is_set_high must read ODR at 0x0C"
     );
+}
+
+/// Host tests for the resolve-once multi-pin input reader ([`InputGroup`]).
+/// A neutral N-pin GPIO read: it samples the pins and packs them into a code,
+/// reading the family's `GPIO_ISTAT` offset (0x10 on F1x0 AHB, 0x08 on F10x APB).
+mod input_group {
+    use crate::descriptor::GpioPath;
+    use crate::gpio::InputGroup;
+    use crate::reg::{mock, Reg32};
+
+    /// The reader samples three input pins (e.g. PC13 / PA1 / PC14) and packs them into a 3-bit code
+    /// `(p2<<2)|(p1<<1)|p0`, reading the family's GPIO_ISTAT offset (0x10 on F1x0 AHB).
+    #[test]
+    fn input_group_reads_three_lines_into_code() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        const GPIOA: u32 = 0x4800_0000;
+        const GPIOC: u32 = 0x4800_0800;
+        // Lines in code order: PC13, PA1, PC14.
+        let reader = InputGroup::resolve(
+            GpioPath::AhbCtlAfsel,
+            [(GPIOC, 13), (GPIOA, 1), (GPIOC, 14)],
+        );
+
+        // F1x0 ISTAT is at 0x10. Set PC13 (bit 13) and PA1 (bit 1) high, PC14 (bit 14) low.
+        Reg32::new(GPIOC, 0x10).write(1 << 13);
+        Reg32::new(GPIOA, 0x10).write(1 << 1); // PA1 = 1
+                                               // code = (PC14<<2)|(PA1<<1)|PC13 = (0<<2)|(1<<1)|1 = 0b011 = 3.
+        assert_eq!(reader.read(), 0b011);
+
+        // Now drive PC14 high too -> code = (1<<2)|(1<<1)|1 = 0b111 = 7.
+        Reg32::new(GPIOC, 0x10).write((1 << 13) | (1 << 14));
+        assert_eq!(reader.read(), 0b111);
+
+        // All low.
+        Reg32::new(GPIOC, 0x10).write(0);
+        Reg32::new(GPIOA, 0x10).write(0);
+        assert_eq!(reader.read(), 0);
+    }
+
+    /// The F10x GPIO_ISTAT is at 0x08 (APB), not 0x10: the reader picks the offset from the GpioPath.
+    #[test]
+    fn input_group_uses_apb_istat_offset_on_f10x() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        const GPIOC: u32 = 0x4001_1000;
+        const GPIOA: u32 = 0x4001_0800;
+        let reader =
+            InputGroup::resolve(GpioPath::ApbCrlCrh, [(GPIOC, 13), (GPIOA, 1), (GPIOC, 14)]);
+        // APB ISTAT at 0x08: set PC13 high.
+        Reg32::new(GPIOC, 0x08).write(1 << 13);
+        assert_eq!(reader.read(), 0b001);
+    }
 }

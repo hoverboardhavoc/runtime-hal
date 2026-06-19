@@ -252,7 +252,7 @@ impl From<ClockError> for WatchdogError {
 pub enum PwmError {
     /// A requested duty / compare value exceeds the configured PWM period (CAR/ARR). Writing a
     /// compare above the auto-reload would never match in a center-aligned count, leaving that
-    /// phase stuck; the handle's `set_duties` clamps or rejects it (filled in T5).
+    /// channel stuck; the handle's `set_duties` clamps or rejects it (filled in T5).
     DutyOutOfRange,
     /// The advanced-timer base did not resolve / sits outside the advanced-timer window (a wiring
     /// mistake the config path catches). Mirrors the [`DescriptorError::SelectorAddrMismatch`]
@@ -266,13 +266,14 @@ pub enum PwmError {
     Other,
 }
 
-/// Shared hot-path error (M3 T1, DECISIONS.md #5). The hot-path config/arming surface can fail in
-/// either the PWM/timer half or the injected-ADC half; this is the unified error the
-/// [`crate::hotpath`] config methods return so a caller `?`-propagates one type across the
-/// cross-peripheral bring-up. Each arm wraps the corresponding per-peripheral runtime error.
+/// Shared per-cycle-path error (M3 T1, DECISIONS.md #5). The complementary-PWM + injected-ADC config
+/// / arming surface can fail in either the PWM/timer half or the injected-ADC half; this is the
+/// unified error the [`crate::timer::ComplementaryPwm`] / [`crate::adc::TriggeredAdc`] config methods
+/// return so a caller `?`-propagates one type across the cross-peripheral bring-up. Each arm wraps
+/// the corresponding per-peripheral runtime error.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HotPathError {
+pub enum BringUpError {
     /// A failure in the advanced-timer / complementary-PWM half.
     Pwm(PwmError),
     /// A failure in the timer-triggered injected-ADC half.
@@ -281,21 +282,21 @@ pub enum HotPathError {
     Descriptor(DescriptorError),
 }
 
-impl From<PwmError> for HotPathError {
+impl From<PwmError> for BringUpError {
     fn from(e: PwmError) -> Self {
-        HotPathError::Pwm(e)
+        BringUpError::Pwm(e)
     }
 }
 
-impl From<AdcError> for HotPathError {
+impl From<AdcError> for BringUpError {
     fn from(e: AdcError) -> Self {
-        HotPathError::Adc(e)
+        BringUpError::Adc(e)
     }
 }
 
-impl From<DescriptorError> for HotPathError {
+impl From<DescriptorError> for BringUpError {
     fn from(e: DescriptorError) -> Self {
-        HotPathError::Descriptor(e)
+        BringUpError::Descriptor(e)
     }
 }
 

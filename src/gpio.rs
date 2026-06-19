@@ -84,8 +84,8 @@ const F1X0_BOP: u32 = 0x18;
 
 // --- GPIO input-status register (read-back of the live pin level) -----------------------------
 // `GPIO_ISTAT` is at a family-dependent offset: 0x08 on the F10x (APB) GPIO and 0x10 on the F1x0
-// (AHB) GPIO (verified against `gd32f10x_gpio.h` / `gd32f1x0_gpio.h`, the same offsets the hot-path
-// hall reader uses in `crate::hotpath::hall`). Bit `n` is the live level of pin `n`.
+// (AHB) GPIO (verified against `gd32f10x_gpio.h` / `gd32f1x0_gpio.h`, the same offsets the
+// resolve-once [`InputGroup`] reader uses). Bit `n` is the live level of pin `n`.
 const F10X_ISTAT: u32 = 0x08;
 const F1X0_ISTAT: u32 = 0x10;
 
@@ -470,7 +470,7 @@ fn configure_input_f1x0(port_base: u32, n: u32, pull: InputPull) {
 /// Read the live level of a logical input pin from the family's `GPIO_ISTAT` register.
 ///
 /// Owns the family offset branch internally (F10x `GPIO_ISTAT` at `0x08`, F1x0 at `0x10`, the same
-/// offsets the hot-path hall reader uses), so callers never see the [`GpioPath`] split. Returns
+/// offsets the [`InputGroup`] reader uses), so callers never see the [`GpioPath`] split. Returns
 /// `true` if the pin reads high. `port_base` is the resolved port base; only `pin`'s low nibble is
 /// used.
 pub(crate) fn read_pin(port_base: u32, path: GpioPath, pin: u8) -> bool {
@@ -967,6 +967,87 @@ gpio_pin_struct! { PortDPins, "D", 3,
 gpio_pin_struct! { PortFPins, "F", 5,
 [0 => pf0, 1 => pf1, 2 => pf2, 3 => pf3, 4 => pf4, 5 => pf5, 6 => pf6, 7 => pf7,
  8 => pf8, 9 => pf9, 10 => pf10, 11 => pf11, 12 => pf12, 13 => pf13, 14 => pf14, 15 => pf15] }
+
+// --- multi-pin input group read (resolve-once) ------------------------------------------------
+
+/// Resolve-once multi-pin GPIO input reader (DECISIONS.md #4 shape).
+///
+/// A neutral N-pin input read: it samples a fixed set of input pins (each `(port_base, pin)`) and
+/// packs them into a code `(p[k] << k) | ... | p[0]`. The pins may live on different ports. The
+/// per-cycle [`InputGroup::read`] is a branch-free sample.
+///
+/// The GPIO input-status register (`GPIO_ISTAT`) is at a **family-dependent offset**: 0x10 on the
+/// F1x0 (AHB) GPIO and 0x08 on the F10x (APB) GPIO (verified against `gd32f1x0_gpio.h` /
+/// `gd32f10x_gpio.h`). That offset is the only family divergence, so [`InputGroup::resolve`] takes the
+/// [`crate::GpioPath`] and picks it once; the per-cycle read is then offset-free.
+///
+/// This is silicon: a plain GPIO read, no timer input mode and no EXTI. A motor layer uses this for
+/// its rotor-position lines (read each cycle, then decoded outside the HAL), but the type itself is
+/// a neutral input-pin sampler.
+pub mod gpio_in {
+    use crate::descriptor::GpioPath;
+    use crate::reg::Reg32;
+
+    /// Number of input pins this group samples.
+    pub const INPUT_GROUP_LINES: usize = 3;
+
+    /// `GPIO_ISTAT` offset on the F1x0 (AHB) GPIO block.
+    const ISTAT_AHB: u32 = 0x10;
+    /// `GPIO_ISTAT` offset on the F10x (APB) GPIO block.
+    const ISTAT_APB: u32 = 0x08;
+
+    /// One input line: the resolved GPIO-port base ISTAT accessor and the pin number within it.
+    #[derive(Debug, Clone, Copy)]
+    struct InputLine {
+        istat: Reg32,
+        pin: u8,
+    }
+
+    /// The resolve-once multi-pin input reader: holds each line's resolved ISTAT accessor + pin
+    /// number, so [`Self::read`] is a branch-free sample. `Copy`, concrete, no `dyn`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct InputGroup {
+        lines: [InputLine; INPUT_GROUP_LINES],
+    }
+
+    impl InputGroup {
+        /// Resolve the input lines from their `(port_base, pin)` pairs and the [`GpioPath`] (which
+        /// picks the family's `GPIO_ISTAT` offset). The pairs are in code order (line 0 -> code bit
+        /// 0, etc.).
+        #[inline]
+        pub fn resolve(path: GpioPath, lines: [(u32, u8); INPUT_GROUP_LINES]) -> Self {
+            let istat_off = match path {
+                GpioPath::AhbCtlAfsel => ISTAT_AHB,
+                GpioPath::ApbCrlCrh => ISTAT_APB,
+            };
+            let mut out = [InputLine {
+                istat: Reg32::new(0, istat_off),
+                pin: 0,
+            }; INPUT_GROUP_LINES];
+            for (i, &(base, pin)) in lines.iter().enumerate() {
+                out[i] = InputLine {
+                    istat: Reg32::new(base, istat_off),
+                    pin,
+                };
+            }
+            Self { lines: out }
+        }
+
+        /// Per-cycle: sample the input pins and pack them into a code
+        /// `(p2 << 2) | (p1 << 1) | p0`. Raw levels only (any debounce/decode is the caller's).
+        #[inline]
+        pub fn read(&self) -> u8 {
+            let mut code = 0u8;
+            for (i, line) in self.lines.iter().enumerate() {
+                let bit = (line.istat.read() >> u32::from(line.pin)) & 1;
+                code |= (bit as u8) << i;
+            }
+            code
+        }
+    }
+}
+
+pub use gpio_in::InputGroup;
 
 #[cfg(test)]
 mod tests;

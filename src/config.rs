@@ -419,7 +419,7 @@ pub struct PwmChannelConfig {
 pub struct PwmConfig {
     /// Which advanced-timer instance label.
     pub timer: PeriphLabel,
-    /// The three complementary phase channel pairs (CH0/0N, CH1/1N, CH2/2N) in channel order.
+    /// The three complementary channel pairs (CH0/0N, CH1/1N, CH2/2N) in channel order.
     pub channels: [PwmChannelConfig; MAX_PWM_CHANNELS],
     /// PWM period (the TIMER CAR/ARR auto-reload value).
     pub period: u16,
@@ -452,7 +452,7 @@ pub struct PwmConfig {
 /// One injected-conversion ADC channel (was `InjectedChannel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InjectedChannel {
-    /// ADC input channel number (0..=15 external phase-current channels; 16/17 internal).
+    /// ADC input channel number (0..=15 external channels; 16/17 internal).
     pub channel: u8,
     /// Sample-time field code (`ADC_SAMPLETIME_*`, 0..=7).
     pub sample_time: u8,
