@@ -20,6 +20,8 @@ embedded-hal = "1.0"
 # for every bin but only linked into `imu_tilt`.
 imu = { path = "crates/imu" }
 attitude = { path = "crates/attitude" }
+# 6-step hall commutation decode (examples/crates/control); linked into the commutation examples.
+control = { path = "crates/control" }
 
 # Size-optimised, debuggable release image for flashing to either board.
 [profile.release]

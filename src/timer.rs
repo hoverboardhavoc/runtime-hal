@@ -551,6 +551,9 @@ pub struct PwmHandle {
     ch_cv: [Reg32; MAX_PWM_CHANNELS],
     /// CH3CV accessor (the ADC-trigger compare), resolved once.
     trig_cv: Reg32,
+    /// CHCTL2 accessor (per-channel output enable), resolved once. NOT CCHP/MOE: this gates which
+    /// channel outputs are driven, it cannot arm the bridge.
+    chctl2: Reg32,
     /// The PWM period (CAR/ARR), used to clamp/validate duties so a compare never exceeds it.
     period: u16,
 }
@@ -558,8 +561,8 @@ pub struct PwmHandle {
 impl PwmHandle {
     /// Construct the handle from a resolved timer base + period. HAL-internal (used by
     /// [`PwmTimer::handle`] and host tests); the application gets a handle from a
-    /// configured `PwmTimer`, never by supplying a base. Resolves the compare accessors once; holds no
-    /// MOE accessor.
+    /// configured `PwmTimer`, never by supplying a base. Resolves the compare + CHCTL2 accessors once;
+    /// holds no MOE accessor.
     #[inline]
     pub(crate) fn new(timer_base: u32, period: u16) -> Self {
         Self {
@@ -569,6 +572,7 @@ impl PwmHandle {
                 Reg32::new(timer_base, TIMER_CH2CV),
             ],
             trig_cv: Reg32::new(timer_base, TIMER_CH3CV),
+            chctl2: Reg32::new(timer_base, CHCTL2),
             period,
         }
     }
@@ -607,6 +611,34 @@ impl PwmHandle {
     #[inline]
     pub const fn period(&self) -> u16 {
         self.period
+    }
+
+    /// Per-channel OUTPUT ENABLE: enable or disable each channel pair's outputs (CHxEN + CHxNEN).
+    ///
+    /// This is the raw silicon capability, NOT a motor concept: the advanced timer can gate each
+    /// channel's output on or off independently. Disabling a channel takes both its transistors off
+    /// (the channel floats); enabling drives it per its compare value and the dead-time. A higher
+    /// layer (the `control` crate) uses this to float a channel for block commutation, but the HAL
+    /// neither names nor knows "commutation".
+    ///
+    /// Written as ONE read-modify-write touching only the enable bits (CHxEN bit 0 / CHxNEN bit 2 of
+    /// each channel's CHCTL2 field), so the per-channel polarity set at bring-up is preserved. MOE is
+    /// never touched: this gates outputs, it cannot ARM the bridge (arming is [`arming::ArmGate`]'s
+    /// alone, the SAFETY invariant). The bring-up enables all three; call this only to change which
+    /// channels are driven.
+    #[inline]
+    pub fn set_channel_outputs(&self, enabled: [bool; MAX_PWM_CHANNELS]) {
+        let chan_en = CCX_EN | CCXN_EN;
+        let mut value = 0u32;
+        let mut mask = 0u32;
+        for (n, &on) in enabled.iter().enumerate() {
+            let shift = 4 * n as u32;
+            mask |= chan_en << shift;
+            if on {
+                value |= chan_en << shift;
+            }
+        }
+        self.chctl2.modify(mask, value);
     }
 }
 

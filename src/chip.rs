@@ -292,6 +292,21 @@ impl Chip {
         }
         Ok(())
     }
+
+    /// Route `pin` to an ADVANCED-timer (TIMER0 / TIMER7) complementary-output alternate function,
+    /// family-internal. The advanced-timer gate pins are the DEFAULT alternate function on the F10x
+    /// (no AFIO remap needed, unlike the general-timer LED pin), so this is the per-family AF write
+    /// (F1x0: per-pin AFSEL = AF2; F10x: CRL/CRH nibble) plus the pin's port-clock enable. The caller
+    /// (a motor application) passes its board gate pins as DATA; the family difference is absorbed.
+    /// Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU) is not in the descriptor.
+    pub fn route_advanced_pwm_pin(&self, pin: u8) -> Result<(), DescriptorError> {
+        let port = gpio_port_label(pin)?;
+        let port_base = self.base(port)?;
+        let rcu = self.rcu_base()?;
+        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
+        gpio::configure_af(port_base, self.desc.gpio, pin, gpio::PinRole::TimerAfPushPull);
+        Ok(())
+    }
 }
 
 /// Map a logical pin byte (`port << 4 | pin`) to its GPIO port label. The high nibble is the port

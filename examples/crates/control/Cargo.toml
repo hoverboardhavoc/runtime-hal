@@ -1,0 +1,15 @@
+# 6-step (block) hall commutation decode for runtime-hal: the motor-control layer above the HAL.
+# Owns the hall-code -> per-phase drive decode (PhaseDrive / SixStep / Commutator) and the
+# MotorContract type; the per-board contract constants live in the commutation examples.
+# no_std, host-testable (the decode is pure; no register access in this crate).
+[package]
+name = "control"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "6-step (block) hall commutation decode for runtime-hal: hall code -> per-phase drive pattern (PhaseDrive / SixStep / Commutator) driving a PwmHandle, plus the MotorContract type. no_std."
+
+[dependencies]
+# Drives runtime-hal's PwmHandle (set_channel_outputs + set_duties). default-features off = the
+# real-MMIO no_std build (this crate calls no register code, so it builds for the host too).
+runtime-hal = { path = "../../..", default-features = false }

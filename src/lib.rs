@@ -62,7 +62,7 @@ pub use clock::{
 pub use config::{
     decode_pin, AdcChannel, AdcClockDiv, AdcConfig, BreakConfig, ClockDiv, InjectedAdcConfig,
     InjectedChannel, NssMode, OcMode, Oversampling, Parity, PwmAlign, PwmChannelConfig, PwmConfig,
-    SpiConfig, StopBits, TimerTriggerLink, UsartConfig, UsartFrame, WordLen,
+    SpiConfig, StopBits, TimerTriggerLink, TrgoSource, UsartConfig, UsartFrame, WordLen,
 };
 pub use delay::Delay;
 pub use descriptor::{
