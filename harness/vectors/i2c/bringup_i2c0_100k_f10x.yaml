@@ -1,0 +1,49 @@
+name: bringup_i2c0_100k_f10x
+description: |
+  I2C0 bring-up at 100 kHz standard mode on the F10x family, no transfer. The F10x
+  arm of M2 T6's config golden; see bringup_i2c0_100k_f1x0 for the full rationale.
+  The classic event-based I2C block is IDENTICAL on both families, so the runtime-
+  hal body and the expected end state are the same; only the GD SPL include set and
+  the family the snippet builds for differ. The F10x RCU_CFG0 seed gives the same
+  CK_APB1 = 36 MHz, so the SPL's i2c_clock_config computes the same CKCFG.
+
+  runtime-hal: I2c::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &I2cConfig{I2c0, 100_000, Two, 0x24}).
+  GD SPL: i2c_clock_config(I2C0, 100000, I2C_DTCY_2); i2c_mode_addr_config(...);
+          i2c_enable(I2C0); i2c_ack_config(I2C0, I2C_ACK_ENABLE).
+
+# Mode rationale: final_state (see bringup_i2c0_100k_f1x0). End state per register:
+#   CTL1 +0x04 = 0x00000024  RT +0x20 = 0x00000025  CKCFG +0x1C = 0x000000B4
+#   SADDR0 +0x08 = 0x00000024  CTL0 +0x00 = 0x00000401 (I2CEN | ACKEN)
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_i2c.h, gd32f10x_rcu.h]
+    body: |
+      i2c_clock_config(I2C0, 100000U, I2C_DTCY_2);
+      i2c_mode_addr_config(I2C0, I2C_I2CMODE_ENABLE, I2C_ADDFORMAT_7BITS, 0x24U);
+      i2c_enable(I2C0);
+      i2c_ack_config(I2C0, I2C_ACK_ENABLE);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::i2c::{FastDuty, I2c};
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::I2cConfig;
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::I2c0, 0x4000_5400);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = I2cConfig { i2c: PeriphLabel::I2c0, scl: 0x16, sda: 0x17, speed_hz: 100_000,
+              duty: FastDuty::Two, own_addr: 0x24 };
+          let _ = I2c::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+      }

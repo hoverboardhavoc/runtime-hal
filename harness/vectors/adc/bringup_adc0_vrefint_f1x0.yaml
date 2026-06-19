@@ -1,0 +1,83 @@
+name: bringup_adc0_vrefint_f1x0
+description: |
+  ADC0 regular-conversion bring-up for a single software-triggered read of the
+  internal VREFINT channel (channel 17) at the slowest sample time (239.5 cycles)
+  on the F1x0 family, no conversion. This is M2 T10's config golden: runtime-hal's
+  ADC single-conversion configuration writes reach the same END STATE as the GD SPL
+  adc_* recipe. The ADC register core is identical on both families (STAT/CTL0/CTL1/
+  SAMPT0/SAMPT1/RSQ0/RSQ1/RSQ2/RDATA, same bit positions), so the same vector runs
+  on F10x too (bringup_adc0_vrefint_f10x); the only family difference is the SPL
+  adc_* signatures (F10x passes the ADCx periph as the first argument).
+
+  M2 uses software-triggered SINGLE regular conversion, single ADC (ADC0), the
+  Single arm of the adc selector, on both families (F10x dual/simultaneous is M3,
+  open item ADC-2). Right-aligned, 12-bit (the only width these parts have).
+
+  runtime-hal: Adc::bring_up(ADC0_BASE, 17, 7) -- channel 17 (VREFINT), sample-time
+    code 7 (239.5 cycles). configure() programs scan OFF (CTL0 SM clear), continuous
+    OFF (CTL1 CTN clear), right alignment (CTL1 DAL clear), regular length 1 (RSQ0
+    RL=0), rank 0 = channel 17 (RSQ2), channel 17 sample time (SAMPT0), TSVREN (CTL1,
+    internal channel), software-trigger source (CTL1 ETSRC=7), ETERC (CTL1), ADCON
+    (CTL1). The calibration step (RSTCLB/CLB poll) is split into the with_polling
+    self-test transfer_vrefint vector (it polls; final_state cannot model it).
+  GD SPL: adc_special_function_config(SCAN_MODE, DISABLE);
+          adc_special_function_config(CONTINUOUS_MODE, DISABLE);
+          adc_data_alignment_config(ADC_DATAALIGN_RIGHT);
+          adc_channel_length_config(ADC_REGULAR_CHANNEL, 1);
+          adc_regular_channel_config(0, ADC_CHANNEL_17, ADC_SAMPLETIME_239POINT5);
+          adc_tempsensor_vrefint_enable();
+          adc_external_trigger_source_config(ADC_REGULAR_CHANNEL, ADC_EXTTRIG_REGULAR_NONE);
+          adc_external_trigger_config(ADC_REGULAR_CHANNEL, ENABLE);
+          adc_enable();
+  (adc_calibration_enable() polls, so it is exercised in the with_polling vector, not
+  here.)
+
+  Silicon anchor (T13, NOT this task): the internal VREFINT (~1.2 V) and temperature
+  channels, known values, no external wiring. The tolerances + the stub re-seed are
+  pending (open item ADC-3, T13); this golden proves agreement-with-SPL config, not
+  silicon.
+
+# Mode rationale: final_state (per-register final written value; reads ignored). The
+# SPL builds CTL1 with several |= / &= RMW pairs (special_function, data_alignment,
+# tempsensor, ext-trigger-source, ext-trigger, enable) in a different write
+# count/order than runtime-hal's field-scoped Reg32 modify; the correctness criterion
+# is the END STATE of each register, which final_state checks directly:
+#   CTL0   +0x04 : SM cleared (single)                            0x00000000
+#   CTL1   +0x08 : ADCON(0)|ETSRC(7<<17)|ETERC(20)|TSVREN(23)     0x009E0001
+#   SAMPT0 +0x0C : channel 17 field (shift 3*7=21) = 7 (239.5)    0x00E00000
+#   RSQ0   +0x2C : RL = 0 (length-1 sequence)                     0x00000000
+#   RSQ2   +0x34 : rank 0 = channel 17                            0x00000011
+#
+# The calibration step is excluded here (it polls). RSQ1 / SAMPT1 are untouched
+# (no channel lands there for a single VREFINT read), so they do not appear.
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_adc.h, gd32f1x0_rcu.h]
+    body: |
+      adc_special_function_config(ADC_SCAN_MODE, DISABLE);
+      adc_special_function_config(ADC_CONTINUOUS_MODE, DISABLE);
+      adc_data_alignment_config(ADC_DATAALIGN_RIGHT);
+      adc_channel_length_config(ADC_REGULAR_CHANNEL, 1U);
+      adc_regular_channel_config(0U, ADC_CHANNEL_17, ADC_SAMPLETIME_239POINT5);
+      adc_tempsensor_vrefint_enable();
+      adc_external_trigger_source_config(ADC_REGULAR_CHANNEL, ADC_EXTTRIG_REGULAR_NONE);
+      adc_external_trigger_config(ADC_REGULAR_CHANNEL, ENABLE);
+      adc_enable();
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::adc::Adc;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          // VREFINT = internal channel 17; sample-time code 7 = 239.5 cycles (the slowest, what the
+          // internal channels need to settle, open item ADC-3). configure_single programs the single
+          // software-triggered conversion config WITHOUT the calibration poll, exactly as this
+          // config golden's SPL body excludes adc_calibration_enable (which polls). The calibration
+          // poll is exercised in the with_polling transfer_vrefint vector. bring_up() = this +
+          // calibrate().
+          let _ = Adc::configure_single(ADC0_BASE, 17, 7);
+      }

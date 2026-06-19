@@ -1,0 +1,44 @@
+name: inject_read_adc0_f10x
+description: |
+  ADC0 injected "trigger then read" transfer-sequencing golden (M3 T9, with_polling) on the F10x
+  family: wait for the injected end-of-conversion (EOIC) flag busy -> done, THEN read the injected
+  data registers (IDATA0 / IDATA1), traced with read_responses stubbing the EOIC flag and the IDATA
+  values. Proves runtime-hal reads the injected results AFTER the conversion completes, not before; a
+  dropped EOIC poll is caught by the planted-bug self-test. The injected register block is identical
+  on both families, so this carries the same body + stub as inject_read_adc0_f1x0.
+
+  runtime-hal: a bare Adc::at(ADC0_BASE) waits STAT EOIC, then the resolve-once InjectedHandle reads
+    IDATA0..IDATA1 via read_injected().
+
+  SEED PROVENANCE / re-seed flag: the STAT EOIC stub (busy -> done) and the IDATA values are
+  SPL-DERIVED placeholders, to be RE-SEEDED from a real read-back over SWD during the on-silicon
+  injected bring-up (the silicon EOC-at-PWM-centre check is T10). Until then this proves
+  agreement-with-the-SPL-sequence, not silicon values.
+
+mode: with_polling
+
+# STAT (0x00) EOIC poll: busy (clear) then done (bit2 = 0x04). IDATA0 (0x3C) / IDATA1 (0x40).
+read_responses:
+  "<ADC0_BASE>+0x00": [0x00000000, 0x00000004]
+  "<ADC0_BASE>+0x3C": [0x0000A000]
+  "<ADC0_BASE>+0x40": [0x0000B000]
+
+reset_overrides:
+  "<ADC0_BASE>+0x00": 0x00000000
+  "<ADC0_BASE>+0x3C": 0x00000000
+  "<ADC0_BASE>+0x40": 0x00000000
+
+implementations:
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::adc::Adc;
+      use runtime_hal::hotpath::InjectedHandle;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          let dev = Adc::at(ADC0_BASE);
+          let _ = dev.wait_eoic();
+          let h = InjectedHandle::new(ADC0_BASE, 2);
+          let _ = h.read_injected();
+      }

@@ -1,0 +1,37 @@
+name: enable_adc0_f10x
+description: |
+  Enable the ADC0 clock and set its prescaler on the F10x (f10x_rcc) clock path.
+  ADC0 = APB2EN bit 9. The F10x ADC clock comes from APB2 through a prescaler in
+  RCU_CFG0 ADCPSC (bits[15:14], plus a high bit ADCPSC_2 = BIT(28) for /12 and /16,
+  not used here); at 72 MHz APB2 the default is CK_APB2 / 6 = 12 MHz. Unlike F1x0,
+  F10x has no separate ADC clock-source select (no RCU_CFG2 ADCSEL), so the path
+  touches only RCU_CFG0.
+
+  runtime-hal: clock::enable_adc(RCU, F10xRcc, Adc0).
+  GD SPL: rcu_periph_clock_enable(RCU_ADC0) then rcu_adc_clock_config(RCU_CKADC_CKAPB2_DIV6).
+
+# Mode rationale: final_state (same as the F1x0 ADC vector, for symmetry and to be
+# robust to the SPL's read-modify-write style). End state:
+#   APB2EN <RCU_BASE>+0x18 = 0x00000200  (bit 9, ADC0)
+#   CFG0   <RCU_BASE>+0x04 : ADCPSC bits[15:14] = 2 (CK_APB2/6) ORed onto the seed,
+#                            ADCPSC_2 (BIT 28) cleared.
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_rcu.h]
+    body: |
+      rcu_periph_clock_enable(RCU_ADC0);
+      rcu_adc_clock_config(RCU_CKADC_CKAPB2_DIV6);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::addr::PeriphLabel;
+      use runtime_hal::clock::enable_adc;
+      use runtime_hal::descriptor::ClockPath;
+
+      const RCU_BASE: u32 = 0x4002_1000;
+
+      pub fn body() {
+          enable_adc(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::Adc0).unwrap();
+      }

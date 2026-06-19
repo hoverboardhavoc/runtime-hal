@@ -1,0 +1,30 @@
+# regcmp v0.1.0 captured 2026-06-17T18:08:51Z
+# vector:        clock_tree_polling_72m_f10x
+# library:       runtime-hal
+# target:        gd32f10x
+# compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
+# compile_flags: cargo build --release --target thumbv7m-none-eabi
+# emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+# emulation:     clean-exit (sentinel reached at instr 126)
+# mode:          with_polling
+R4 <FMC_BASE>+0x00 0x00000000   # WS
+W4 <FMC_BASE>+0x00 0x00000002   # WS
+R4 <RCU_BASE>+0x00 0x00000001   # CTL
+W4 <RCU_BASE>+0x00 0x00000001   # CTL
+R4 <RCU_BASE>+0x00 0x00000003   # CTL
+R4 <RCU_BASE>+0x04 0x00000002   # CFG0
+W4 <RCU_BASE>+0x04 0x00000002   # CFG0
+R4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+W4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+R4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+W4 <RCU_BASE>+0x04 0x0000040A   # CFG0
+R4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+W4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+R4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+W4 <RCU_BASE>+0x04 0x0804000A   # CFG0
+R4 <RCU_BASE>+0x00 0x01000003   # CTL
+W4 <RCU_BASE>+0x00 0x01000003   # CTL
+R4 <RCU_BASE>+0x00 0x03000003   # CTL
+R4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+W4 <RCU_BASE>+0x04 0x0000000A   # CFG0
+R4 <RCU_BASE>+0x04 0x0000000A   # CFG0

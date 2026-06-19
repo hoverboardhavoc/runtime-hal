@@ -1,0 +1,41 @@
+name: af_spi0_pins_f10x
+description: |
+  GPIO alternate-function config for the representative SPI0 pins SCK = PA5, MISO =
+  PA6, MOSI = PA7 on the F10x (apb_crl_crh) GPIO model. F10x has no AF-mux: AF is
+  implied by the CTL0/CTL1 nibble. SCK/MOSI are AF push-pull 50 MHz = nibble 0xB;
+  MISO is a floating input = nibble 0x4. The pinout is representative descriptor
+  data; the point is the AF-push-pull config path.
+
+  runtime-hal: configure_af(PA5, SpiAfPushPull), configure_af(PA6, SpiInput),
+  configure_af(PA7, SpiAfPushPull).
+  GD SPL: gpio_init(GPIO_MODE_AF_PP) for SCK | MOSI; gpio_init(GPIO_MODE_IN_FLOATING)
+  for MISO.
+
+# Mode rationale: final_state. Pins 5,6,7 all live in CTL0; both oracles RMW the
+# nibbles over the 0x44444444 reset. End state:
+#   CTL0 +0x00 = 0x44444444 with nibble5 -> 0xB (SCK), nibble7 -> 0xB (MOSI),
+#                nibble6 -> 0x4 (MISO floating input = the reset nibble)
+#              = 0xB4B44444.
+# (The AF-PP nibble 0xB vs the I2C AF-OD nibble 0xF is the push-pull-vs-open-drain
+# slip the width-strict golden catches.)
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_gpio.h]
+    body: |
+      gpio_init(GPIOA, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_5 | GPIO_PIN_7);
+      gpio_init(GPIOA, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, GPIO_PIN_6);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOA_BASE: u32 = 0x4001_0800;
+
+      pub fn body() {
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 5, PinRole::SpiAfPushPull); // SCK
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 6, PinRole::SpiInput);      // MISO
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 7, PinRole::SpiAfPushPull); // MOSI
+      }

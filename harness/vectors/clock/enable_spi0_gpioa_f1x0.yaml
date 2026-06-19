@@ -1,0 +1,35 @@
+name: enable_spi0_gpioa_f1x0
+description: |
+  Enable the peripheral clocks for SPI0 + GPIOA (the representative SPI0 pins
+  PA5/PA6/PA7 live on port A) on the F1x0 (f1x0_rcu) clock path. F1x0 puts GPIO
+  port enables on AHBEN (GPIOA = AHBEN bit 17) and SPI0 on APB2EN (bit 12). Pure
+  RMW writes, no polling.
+
+  runtime-hal: clock::enable_gpio_port(RCU, F1x0Rcu, Gpioa) then
+  clock::enable_spi(RCU, F1x0Rcu, Spi0).
+  GD SPL: rcu_periph_clock_enable(RCU_GPIOA) then rcu_periph_clock_enable(RCU_SPI0).
+
+# Mode rationale: register_writes. Two writes, in order, to different registers:
+#   W4 AHBEN  = 0x00020000  (bit 17, GPIOA)  <RCU_BASE>+0x14
+#   W4 APB2EN = 0x00001000  (bit 12, SPI0)   <RCU_BASE>+0x18
+mode: register_writes
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_rcu.h]
+    body: |
+      rcu_periph_clock_enable(RCU_GPIOA);
+      rcu_periph_clock_enable(RCU_SPI0);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::addr::PeriphLabel;
+      use runtime_hal::clock::{enable_gpio_port, enable_spi};
+      use runtime_hal::descriptor::ClockPath;
+
+      const RCU_BASE: u32 = 0x4002_1000;
+
+      pub fn body() {
+          enable_gpio_port(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Gpioa).unwrap();
+          enable_spi(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Spi0).unwrap();
+      }

@@ -1,0 +1,5 @@
+# Default the snippet crate to the bare-metal Cortex-M3 target so a plain
+# `cargo build --release` produces a thumbv7m staticlib. The harness passes
+# --target explicitly too; this keeps a manual build honest.
+[build]
+target = "thumbv7m-none-eabi"

@@ -1,0 +1,32 @@
+name: af_usart1_rx_pa3_f10x
+description: |
+  GPIO config for PA3 = USART1 RX on the F10x (apb_crl_crh) GPIO model. RX is a
+  floating input = nibble 0x4 (GPIO_MODE_IN_FLOATING; not an output, so no speed
+  ORed in). Pin 3 lives in CTL0 at nibble 3 (shift 12).
+
+  runtime-hal: configure_af(GPIOA_BASE, ApbCrlCrh, 3, Rx).
+  GD SPL: gpio_init(GPIOA, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, GPIO_PIN_3).
+
+# Mode rationale: register_writes. Both oracles emit a single CTL0 RMW:
+#   W4 CTL0 = 0x44444444  (reset 0x44444444, nibble 3 -> 0x4, unchanged)  +0x00
+# Nibble 3's reset value is already 0x4 (floating input is the GPIO reset mode),
+# so the written value equals the reset value; the RMW still occurs and both
+# oracles emit the identical write.
+mode: register_writes
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_gpio.h]
+    body: |
+      gpio_init(GPIOA, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, GPIO_PIN_3);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOA_BASE: u32 = 0x4001_0800;
+
+      pub fn body() {
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 3, PinRole::Rx);
+      }

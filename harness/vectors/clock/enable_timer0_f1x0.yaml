@@ -1,0 +1,32 @@
+name: enable_timer0_f1x0
+description: |
+  Enable the peripheral clock for the advanced timer TIMER0 on the F1x0 (f1x0_rcu)
+  clock path (DR-T4). TIMER0 lives on APB2EN bit 11 (RCU_APB2EN_TIMER0EN = BIT(11),
+  gd32f1x0_rcu.h:198) on both families. This closes the M3 bench-firmware raw-Reg32
+  bypass: the firmware had to set this bit by hand because the HAL had no
+  clock::enable_timer. Pure RMW write, no polling.
+
+  runtime-hal: clock::enable_timer(RCU, F1x0Rcu, Timer0).
+  GD SPL: rcu_periph_clock_enable(RCU_TIMER0).
+
+# Mode rationale: register_writes. One write:
+#   W4 APB2EN = 0x00000800  (bit 11, TIMER0)  <RCU_BASE>+0x18
+mode: register_writes
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_rcu.h]
+    body: |
+      rcu_periph_clock_enable(RCU_TIMER0);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::addr::PeriphLabel;
+      use runtime_hal::clock::enable_timer;
+      use runtime_hal::descriptor::ClockPath;
+
+      const RCU_BASE: u32 = 0x4002_1000;
+
+      pub fn body() {
+          enable_timer(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Timer0).unwrap();
+      }

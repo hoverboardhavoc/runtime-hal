@@ -1,0 +1,113 @@
+name: tree_72m_irc8m_f1x0
+description: |
+  Full clock-tree bring-up to 72 MHz from IRC8M -> PLL on the F1x0 (f1x0_rcu)
+  path: flash wait states, source-stable poll, AHB/APB prescalers, PLL mul + src,
+  PLL-enable + lock poll, SCS switch + confirm. This is M2 T2's config golden: it
+  proves runtime-hal's RCU/FMC bring-up writes reach the same END STATE as the GD
+  SPL programming the same tree.
+
+  runtime-hal: clock::configure_tree(&chip, &ClockConfig::REFERENCE_72M_IRC8M).
+    REFERENCE_72M_IRC8M = sysclk 72 MHz, wait 2, IRC8M, pll_mul 18, AHB /1, APB1 /2, APB2 /1.
+  GD SPL: the equivalent of system_gd32f1x0.c system_clock_72m_irc8m, written with
+    the same target tree (fmc_wscnt_set first; RCU_CTL0 IRC8MEN + stable; RCU_CFG0
+    AHB/APB prescalers; PLLSRC_IRC8M_DIV2 + PLL_MUL18; PLLEN + PLLSTB; SCS = PLL +
+    SCSS confirm).
+
+  Reconciliation note: the vendor system_clock_72m_irc8m sets APB1 = AHB/1 (F1x0
+  permits APB1 up to 72 MHz). runtime-hal's portable DEFAULT profile uses
+  APB1 = AHB/2 (36 MHz), the standard "APB1 max 36 MHz" arrangement that usart.rs
+  already assumes for the BAUD divisor and that both families share. So this
+  vector's SPL snippet programs APB1 = AHB/2 to compare the SAME tree runtime-hal
+  configures from its default profile; it is not a verbatim copy of the vendor
+  function (which targets a different, F1x0-only APB1 ratio). A descriptor that
+  wanted APB1 = /1 on F1x0 would carry apb1_psc = 1 and the SPL snippet would
+  mirror that.
+
+  CLOCK-1 / silicon anchor: the on-silicon read-back of RCU CTL0/CFG0 after this
+  bring-up (confirm source + PLL-lock + SCS + 72 MHz / APB1-36 MHz over SWD) is a
+  deferred human bench pass; this golden proves agreement-with-SPL, not silicon.
+
+# Mode rationale: final_state (per-register final written value; reads ignored).
+# Both oracles POLL during bring-up (source-stable, PLL-lock, SCS-confirm), so the
+# read_responses below script the RCU CTL0 status bits (IRC8MSTB | PLLSTB) and the
+# CFG0 SCSS = PLL bits so every poll loop exits; the writes are then compared. The
+# SPL programs the prescalers / PLL with bare `|=` ORs (no clear-then-set) and in a
+# different order from runtime-hal's field-scoped Reg32::modify clear-then-set, so
+# the write COUNT and ORDER differ (a coding-style difference, not a register
+# difference). The correctness criterion is the END STATE of each register, which
+# final_state checks directly:
+#   FMC_WS  = 0x00000002  (WSCNT = 2 wait states)                      <FMC_BASE>+0x00
+#   RCU_CTL0 final carries IRC8MEN(0)|PLLEN(24) set over the scripted status bits.
+#   RCU_CFG0 = APB1PSC /2 (0x400) | PLLMF mul18 (0x08040000) | SCS PLL (0x2)
+#             over the scripted SCSS bits.
+mode: final_state
+
+# Status polls use the OR-MASK read form ({"or": mask}): the read returns the
+# accumulated register value with the status bit OR'd in, WITHOUT clobbering the
+# config bits the RMW writes accumulate (a plain scripted scalar would overwrite
+# CFG0's prescaler/PLLMF/SCS bits and corrupt the final state). CTL0 (0x00) ORs
+# IRC8MSTB (bit1) | PLLSTB (bit25) so the source-stable and PLL-lock polls exit;
+# CFG0 (0x04) ORs SCSS = PLL (bits 2:3 = 0b10 = 0x8) so the SCS read-back confirm
+# exits. CLOCK-1: the masks are SPL-derived (the exact flags the SPL polls, in
+# order); re-seed from a silicon RCU capture when the bench pass runs.
+read_responses:
+  "<RCU_BASE>+0x00": { or: 0x02000002 }
+  "<RCU_BASE>+0x04": { or: 0x00000008 }
+
+# This vector configures the tree FROM RESET, so override the target's shared
+# RCU_CFG0 seed (the usart vectors seed a pre-configured 72 MHz tree there) back
+# to 0, and start RCU_CTL0 / FMC_WS at reset 0 too.
+reset_overrides:
+  "<RCU_BASE>+0x00": 0x00000000
+  "<RCU_BASE>+0x04": 0x00000000
+  "<FMC_BASE>+0x00": 0x00000000
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_rcu.h, gd32f1x0_fmc.h]
+    body: |
+      /* flash wait states first (before raising the clock) */
+      fmc_wscnt_set(WS_WSCNT_2);
+      /* enable IRC8M, wait until stable */
+      RCU_CTL0 |= RCU_CTL0_IRC8MEN;
+      while(0U == (RCU_CTL0 & RCU_CTL0_IRC8MSTB)){}
+      /* AHB = SYSCLK, APB2 = AHB/1, APB1 = AHB/2 (runtime-hal default tree) */
+      RCU_CFG0 &= ~RCU_CFG0_AHBPSC;
+      RCU_CFG0 |= RCU_AHB_CKSYS_DIV1;
+      RCU_CFG0 &= ~RCU_CFG0_APB2PSC;
+      RCU_CFG0 |= RCU_APB2_CKAHB_DIV1;
+      RCU_CFG0 &= ~RCU_CFG0_APB1PSC;
+      RCU_CFG0 |= RCU_APB1_CKAHB_DIV2;
+      /* PLL = (IRC8M/2) * 18 = 72 MHz */
+      RCU_CFG0 &= ~RCU_CFG0_PLLSEL;
+      RCU_CFG0 |= RCU_PLLSRC_IRC8M_DIV2;
+      RCU_CFG0 &= ~RCU_CFG0_PLLMF;
+      RCU_CFG0 |= RCU_PLL_MUL18;
+      /* enable PLL, wait for lock */
+      RCU_CTL0 |= RCU_CTL0_PLLEN;
+      while(0U == (RCU_CTL0 & RCU_CTL0_PLLSTB)){}
+      /* switch system clock to PLL, confirm */
+      RCU_CFG0 &= ~RCU_CFG0_SCS;
+      RCU_CFG0 |= RCU_CKSYSSRC_PLL;
+      while(RCU_SCSS_PLL != (RCU_CFG0 & RCU_CFG0_SCSS)){}
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::clock::{configure_tree, ClockConfig};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          // The default 72 MHz tree: IRC8M -> PLL x18, AHB /1, APB2 /1, APB1 /2,
+          // 2 flash wait states.
+          let _ = configure_tree(&chip(), &ClockConfig::REFERENCE_72M_IRC8M);
+      }

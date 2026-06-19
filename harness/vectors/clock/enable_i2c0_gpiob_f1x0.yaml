@@ -1,0 +1,39 @@
+name: enable_i2c0_gpiob_f1x0
+description: |
+  Enable the peripheral clocks for the IMU I2C link (I2C0 + GPIOB, the SCL = PB6 /
+  SDA = PB7 port) on the F1x0 (f1x0_rcu) clock path. F1x0 puts GPIO port enables on
+  AHBEN (GPIOB = AHBEN bit 18) and I2C0 on APB1EN (bit 21). Pure RMW writes that
+  set one enable bit each, no polling.
+
+  runtime-hal: clock::enable_gpio_port(RCU, F1x0Rcu, Gpiob) then
+  clock::enable_i2c(RCU, F1x0Rcu, I2c0).
+  GD SPL: rcu_periph_clock_enable(RCU_GPIOB) then rcu_periph_clock_enable(RCU_I2C0).
+
+  Order: GPIOB clock then I2C0 clock (enable the port the pins live on, then the bus).
+
+# Mode rationale: register_writes (ordered writes, reads ignored). Each enable is a
+# single RMW. Both oracles emit exactly two writes in the same order, to different
+# registers (AHBEN vs APB1EN), so the diff is fully ordered and width-strict:
+#   W4 AHBEN  = 0x00040000  (bit 18, GPIOB)  <RCU_BASE>+0x14
+#   W4 APB1EN = 0x00200000  (bit 21, I2C0)   <RCU_BASE>+0x1C
+mode: register_writes
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_rcu.h]
+    body: |
+      rcu_periph_clock_enable(RCU_GPIOB);
+      rcu_periph_clock_enable(RCU_I2C0);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::addr::PeriphLabel;
+      use runtime_hal::clock::{enable_gpio_port, enable_i2c};
+      use runtime_hal::descriptor::ClockPath;
+
+      const RCU_BASE: u32 = 0x4002_1000;
+
+      pub fn body() {
+          enable_gpio_port(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Gpiob).unwrap();
+          enable_i2c(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::I2c0).unwrap();
+      }

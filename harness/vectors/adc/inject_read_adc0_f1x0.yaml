@@ -1,0 +1,58 @@
+name: inject_read_adc0_f1x0
+description: |
+  ADC0 injected "trigger then read" transfer-sequencing golden (M3 T9, with_polling) on the F1x0
+  family: wait for the injected end-of-conversion (EOIC) flag busy -> done, THEN read the injected
+  data registers (IDATA0 / IDATA1, the two phase currents), traced with read_responses stubbing the
+  EOIC flag and the IDATA values so the polled loop terminates and the ordered reads trace. This
+  proves runtime-hal reads the injected results AFTER the conversion completes, not before (reading
+  IDATA before EOIC is the stale-sample / hang-if-done-wrong class). A dropped EOIC poll changes the
+  ordered read trace and the planted-bug self-test catches it (test_selftest.py dropped-poll
+  mutation on this vector).
+
+  Like the M2 transfer vectors, this is a HARNESS self-test of runtime-hal's poll behaviour (pytest,
+  stub vs no-stub), not a two-oracle compare. The injected register block is identical on both
+  families, so inject_read_adc0_f10x carries the same body + stub.
+
+  runtime-hal: a bare Adc::at(ADC0_BASE) waits STAT EOIC, then the resolve-once InjectedHandle reads
+    IDATA0..IDATA1 (the two configured injected channels) via read_injected().
+
+  SEED PROVENANCE / re-seed flag (the ADC analogue of the I2C / SPI / CLOCK-1 / regular-EOC seeds):
+  the STAT EOIC stub (busy -> done) and the IDATA values below are SPL-DERIVED placeholders -- the
+  EOIC progression runtime-hal polls and two left-aligned 12-bit phase-current counts, NOT a silicon
+  capture. They MUST be RE-SEEDED from a real STAT/IDATA read-back captured over SWD during the
+  on-silicon injected bring-up in T10/T13 (the silicon EOC-at-PWM-centre check is T10). Until then
+  this proves agreement-with-the-SPL-sequence, not silicon values.
+
+# with_polling: ordered reads + writes; a dropped poll is a failure (not just a wrong value).
+mode: with_polling
+
+# STAT (0x00) read at the EOIC poll: busy (EOIC clear) then done (EOIC = bit2 = 0x04).
+# IDATA0 (0x3C) / IDATA1 (0x40): left-aligned 12-bit phase-current counts (REPLACE form, last sticks).
+read_responses:
+  "<ADC0_BASE>+0x00": [0x00000000, 0x00000004]
+  "<ADC0_BASE>+0x3C": [0x0000A000]
+  "<ADC0_BASE>+0x40": [0x0000B000]
+
+reset_overrides:
+  "<ADC0_BASE>+0x00": 0x00000000
+  "<ADC0_BASE>+0x3C": 0x00000000
+  "<ADC0_BASE>+0x40": 0x00000000
+
+implementations:
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::adc::Adc;
+      use runtime_hal::hotpath::InjectedHandle;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          // Wait for the injected conversion to complete (STAT EOIC busy -> done), THEN read the
+          // injected data via the resolve-once handle. The wait_eoic poll is bounded; the stub
+          // scripts EOIC busy -> done so the loop exits. read_injected reads IDATA0..3 in order
+          // (the two configured phase currents are slots 0/1).
+          let dev = Adc::at(ADC0_BASE);
+          let _ = dev.wait_eoic();
+          let h = InjectedHandle::new(ADC0_BASE, 2);
+          let _ = h.read_injected();
+      }

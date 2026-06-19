@@ -1,0 +1,31 @@
+name: af_usart1_tx_pa2_f10x
+description: |
+  GPIO alternate-function config for PA2 = USART1 TX on the F10x (apb_crl_crh)
+  GPIO model. F10x has no separate AF-mux register: AF is implied by the CTL0/CTL1
+  4-bit mode/cnf nibble. TX = AF push-pull 50 MHz = nibble 0xB (0x8 AF-PP | 0x3
+  speed). Pin 2 lives in CTL0 at nibble 2 (shift 8).
+
+  runtime-hal: configure_af(GPIOA_BASE, ApbCrlCrh, 2, Tx).
+  GD SPL: gpio_init(GPIOA, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2).
+
+# Mode rationale: register_writes. Both oracles emit a single CTL0 RMW:
+#   W4 CTL0 = 0x44444B44  (reset 0x44444444, nibble 2 -> 0xB)   +0x00
+# (Reset value of CTL0 is 0x44444444; only nibble 2 changes to 0xB.)
+mode: register_writes
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_gpio.h]
+    body: |
+      gpio_init(GPIOA, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOA_BASE: u32 = 0x4001_0800;
+
+      pub fn body() {
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 2, PinRole::Tx);
+      }

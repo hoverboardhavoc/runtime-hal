@@ -1,0 +1,15 @@
+# regcmp v0.1.0 captured 2026-06-17T21:20:05Z
+# vector:        adc_inject_read_adc0_f1x0
+# library:       runtime-hal
+# target:        gd32f1x0
+# compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
+# compile_flags: cargo build --release --target thumbv7m-none-eabi
+# emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+# emulation:     clean-exit (sentinel reached at instr 57)
+# mode:          with_polling
+R4 <ADC0_BASE>+0x00 0x00000000   # STAT
+R4 <ADC0_BASE>+0x00 0x00000004   # STAT
+R4 <ADC0_BASE>+0x3C 0x0000A000   # IDATA0
+R4 <ADC0_BASE>+0x40 0x0000B000   # IDATA1
+R4 <ADC0_BASE>+0x44 0x00000000   # IDATA2
+R4 <ADC0_BASE>+0x48 0x00000000   # IDATA3

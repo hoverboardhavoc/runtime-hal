@@ -1,0 +1,46 @@
+name: transfer_whoami_f10x
+description: |
+  I2C transfer-sequencing golden (M2 T7, with_polling) on the F10x family: the IMU
+  WHO_AM_I shape -- write register pointer 0x75 to 0x68, repeated START, read 1
+  byte. The F10x arm of the with_polling transfer self-test; see transfer_whoami_f1x0
+  for the full rationale and the SPL-derived seed provenance / T13 re-seed flag. The
+  classic event-based I2C block is IDENTICAL on both families, so the body and the
+  stub sequence are the same; only the family the snippet builds for differs.
+
+  SEED PROVENANCE / re-seed flag: the STAT0/STAT1 stub is SPL-derived (the flags
+  i2c_probe.c polls, in order), NOT a silicon capture; re-seed from the on-silicon
+  IMU read in T13.
+
+mode: with_polling
+
+read_responses:
+  "<I2C0_BASE>+0x14": [0x01, 0x02, 0x02, 0x80, 0x04, 0x01, 0x02, 0x02, 0x40]
+  "<I2C0_BASE>+0x18": [0x00, 0x00]
+
+implementations:
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::i2c::{FastDuty, I2c};
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::I2cConfig;
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::I2c0, 0x4000_5400);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = I2cConfig { i2c: PeriphLabel::I2c0, scl: 0x16, sda: 0x17, speed_hz: 100_000,
+              duty: FastDuty::Two, own_addr: 0x24 };
+          let dev = I2c::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+          let mut who = [0u8; 1];
+          // The embedded-hal write_read sequence via the inherent calls (see transfer_whoami_f1x0).
+          let _ = dev.write_bytes(0x68, &[0x75], false);
+          let _ = dev.read_bytes(0x68, &mut who, true);
+      }

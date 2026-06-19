@@ -1,0 +1,39 @@
+name: af_usart1_rx_pa3_f1x0
+description: |
+  GPIO alternate-function config for PA3 = USART1 RX at AF1 on the F1x0
+  (ahb_ctl_afsel) GPIO model. RX is AF input: CTL = AF mode, PUD = none,
+  AFSEL0 = AF1; no output options (OMODE/OSPD) since RX does not drive the line.
+
+  runtime-hal: configure_af(GPIOA_BASE, AhbCtlAfsel, 3, Rx).
+  GD SPL: gpio_mode_set(GPIO_MODE_AF, GPIO_PUPD_NONE, PIN_3); gpio_af_set(AF_1, PIN_3).
+
+# Mode rationale: register_writes. The meaningful writes (ordered) are:
+#   W4 CTL    = 0x00000080  (pin 3, 2 bits @ shift 6, AF mode = 2)   +0x00
+#   W4 PUD    = 0x00000000  (no pull)                                +0x0C
+#   W4 AFSEL0 = 0x00001000  (pin 3, 4 bits @ shift 12, AF1)          +0x20
+# As in the PA2 TX vector, the SPL's gpio_af_set unconditionally rewrites BOTH
+# AFSEL halves, emitting an extra no-op `W4 AFSEL1 0x00`; runtime-hal writes only
+# AFSEL0. Both leave AFSEL1 = 0, so it is a redundant SPL write, not a bug. We
+# ignore AFSEL1 so register_writes compares the meaningful ordered writes.
+mode: register_writes
+
+ignore:
+  - "<GPIOA_BASE>+0x24"   # AFSEL1: SPL no-op rewrite; runtime-hal skips it (both leave it 0)
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_gpio.h]
+    body: |
+      gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_3);
+      gpio_af_set(GPIOA, GPIO_AF_1, GPIO_PIN_3);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOA_BASE: u32 = 0x4800_0000;
+
+      pub fn body() {
+          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 3, PinRole::Rx);
+      }

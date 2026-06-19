@@ -1,0 +1,39 @@
+name: af_i2c0_scl_sda_f10x
+description: |
+  GPIO alternate-function config for the I2C0 link SCL = PB6 / SDA = PB7 as AF
+  open-drain on the F10x (apb_crl_crh) GPIO model. F10x has no separate AF-mux or
+  pull register: AF open-drain is the CTL0/CTL1 4-bit nibble GPIO_MODE_AF_OD =
+  0x1C -> low nibble 0xC, output so OR the 50 MHz speed 0x3 -> nibble 0xF. The I2C
+  pull-up is the board's external bus resistor (the SPL gpio_init(AF_OD) writes no
+  pull/BOP), so the F10x write is the open-drain nibble only.
+
+  runtime-hal: configure_af(GPIOB_BASE, ApbCrlCrh, PB6/PB7, I2cAfOpenDrain).
+  GD SPL: gpio_init(GPIOB, GPIO_MODE_AF_OD, GPIO_OSPEED_50MHZ, GPIO_PIN_6 | GPIO_PIN_7).
+
+# Mode rationale: final_state. Pins 6 and 7 both live in CTL0; both oracles RMW the
+# open-drain nibble 0xF into nibble 6 (bits[27:24]) and nibble 7 (bits[31:28]),
+# over the 0x44444444 reset. End state:
+#   CTL0 +0x00 = 0x44444444 with nibbles 6,7 -> 0xF = 0xFF444444.
+# (The contrast with the SPI AF-PP vector, nibble 0xB, is exactly the
+# open-drain-vs-push-pull slip the width-strict golden catches.)
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_gpio.h]
+    body: |
+      gpio_init(GPIOB, GPIO_MODE_AF_OD, GPIO_OSPEED_50MHZ, GPIO_PIN_6 | GPIO_PIN_7);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOB_BASE: u32 = 0x4001_0C00;
+      const PB6: u8 = (1 << 4) | 6;
+      const PB7: u8 = (1 << 4) | 7;
+
+      pub fn body() {
+          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, PB6, PinRole::I2cAfOpenDrain);
+          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, PB7, PinRole::I2cAfOpenDrain);
+      }

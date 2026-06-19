@@ -1,0 +1,53 @@
+name: af_i2c0_scl_sda_f1x0
+description: |
+  GPIO alternate-function config for the IMU I2C0 link SCL = PB6 / SDA = PB7 as
+  AF, open-drain, with pull-up, on the F1x0 (ahb_ctl_afsel) GPIO model. This is
+  the M1-to-M2 growth: M1's USART pins were AF push-pull / no-pull; I2C needs
+  open-drain (OMODE = 1) AND pull-up (PUD = 1), at AF1 (I2C0 is on AF1 for port B
+  per the gd32f1x0 AF table).
+
+  runtime-hal: configure_af(GPIOB_BASE, AhbCtlAfsel, PB6, I2cAfOpenDrain) and
+  configure_af(GPIOB_BASE, AhbCtlAfsel, PB7, I2cAfOpenDrain).
+  GD SPL: gpio_mode_set(AF, PULLUP) + gpio_af_set(AF_1) +
+  gpio_output_options_set(OTYPE_OD, 50MHZ) for PB6 | PB7.
+
+# Mode rationale: final_state. runtime-hal configures pin 6 fully then pin 7 fully;
+# the SPL configures one register at a time across both pins. The ordered write
+# lists therefore interleave differently, but the END STATE per register is what a
+# config golden asserts, so final_state (per-address final value) is the right mode
+# and catches the open-drain-vs-push-pull and pull-up-vs-no-pull slips and the
+# 16-vs-32-bit AFSEL slip. End state (PB6 = pin 6, PB7 = pin 7):
+#   CTL    +0x00 : AF (2) at [13:12] and [15:14]            -> (2<<12)|(2<<14)
+#   PUD    +0x0C : pull-up (1) at [13:12] and [15:14]       -> (1<<12)|(1<<14)
+#   AFSEL0 +0x20 : AF1 (1) at [27:24] and [31:28]           -> (1<<24)|(1<<28)
+#   OMODE  +0x04 : open-drain bits 6,7 set                  -> (1<<6)|(1<<7)
+#   OSPD   +0x08 : 50MHz (3) at [13:12] and [15:14]         -> (3<<12)|(3<<14)
+# The SPL's gpio_af_set rewrites BOTH AFSEL halves (its loop touches AFSEL1), a
+# no-op rewrite of AFSEL1's reset value 0 that runtime-hal skips; both leave
+# AFSEL1 = 0, so we ignore AFSEL1 (the same redundant-write the M1 af vectors note).
+mode: final_state
+
+ignore:
+  - "<GPIOB_BASE>+0x24"   # AFSEL1: SPL no-op rewrite; runtime-hal skips it (both leave it 0)
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_gpio.h]
+    body: |
+      gpio_mode_set(GPIOB, GPIO_MODE_AF, GPIO_PUPD_PULLUP, GPIO_PIN_6 | GPIO_PIN_7);
+      gpio_af_set(GPIOB, GPIO_AF_1, GPIO_PIN_6 | GPIO_PIN_7);
+      gpio_output_options_set(GPIOB, GPIO_OTYPE_OD, GPIO_OSPEED_50MHZ, GPIO_PIN_6 | GPIO_PIN_7);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOB_BASE: u32 = 0x4800_0400;
+      const PB6: u8 = (1 << 4) | 6;
+      const PB7: u8 = (1 << 4) | 7;
+
+      pub fn body() {
+          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, PB6, PinRole::I2cAfOpenDrain);
+          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, PB7, PinRole::I2cAfOpenDrain);
+      }

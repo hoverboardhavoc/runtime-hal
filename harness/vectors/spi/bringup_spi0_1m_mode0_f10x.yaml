@@ -1,0 +1,56 @@
+name: bringup_spi0_1m_mode0_f10x
+description: |
+  SPI0 bring-up at a 1 MHz target SCK, MODE_0, 8-bit, master, software NSS on the
+  F10x family, no transfer. The F10x arm of M2 T8's config golden; see
+  bringup_spi0_1m_mode0_f1x0 for the full rationale and the NSS / SPI-2 default. The
+  SPI block is IDENTICAL on both families (CTL0/CTL1/STAT/DATA/I2SCTL, same bits), so
+  the runtime-hal body and the expected end state are the same; only the GD SPL
+  include set and the family the snippet builds for differ. SPI0 is on APB2 = 72 MHz
+  on both families, so prescaler_for picks /128 (PSC code 6) the same way.
+
+  runtime-hal: Spi::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &SpiConfig{Spi0, MODE_0, Eight, 1_000_000, MSB, Software}).
+  GD SPL: spi_init(SPI0, &{MASTER, FULLDUPLEX, 8BIT, NSS_SOFT, MSB, MODE_0, PSC_128});
+          spi_enable(SPI0).
+
+# Mode rationale: final_state (see bringup_spi0_1m_mode0_f1x0). End state per register:
+#   CTL0   +0x00 = 0x00000374  (MSTMOD|SWNSS|SWNSSEN|PSC(6<<3)|SPIEN)
+#   I2SCTL +0x1C = 0x00000000  (I2SSEL cleared, SPI mode)
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_spi.h, gd32f10x_rcu.h]
+    body: |
+      spi_parameter_struct sp;
+      sp.device_mode = SPI_MASTER;
+      sp.trans_mode = SPI_TRANSMODE_FULLDUPLEX;
+      sp.frame_size = SPI_FRAMESIZE_8BIT;
+      sp.nss = SPI_NSS_SOFT;
+      sp.endian = SPI_ENDIAN_MSB;
+      sp.clock_polarity_phase = SPI_CK_PL_LOW_PH_1EDGE;
+      sp.prescale = SPI_PSC_128;
+      spi_init(SPI0, &sp);
+      spi_enable(SPI0);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::spi::Spi;
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::{SpiConfig, NssMode};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Spi0, 0x4001_3000);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = SpiConfig { spi: PeriphLabel::Spi0, sck: 0x05, miso: 0x06, mosi: 0x07, nss: 0x04,
+              mode: 0, data16: false, target_hz: 1_000_000, lsb_first: false, nss_mode: NssMode::Software };
+          let _ = Spi::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+      }

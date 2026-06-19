@@ -1,0 +1,31 @@
+name: calibrate_adc0_f10x
+description: |
+  ADC calibration transfer-sequencing golden (M2 T10, with_polling) on the F10x
+  family: the calibration POLL LOOPS of Adc::calibrate. The F10x arm of the
+  calibration with_polling self-test; see calibrate_adc0_f1x0 for the full rationale
+  and the SPL-derived seed provenance / T13 re-seed flag. The ADC block is IDENTICAL
+  on both families, so the body and the CTL1 stub sequence are the same; only the
+  family the snippet builds for differs.
+
+  SEED PROVENANCE / re-seed flag: the CTL1 stub is SPL-derived (RSTCLB busy -> done,
+  then CLB busy -> done), NOT a silicon capture; re-seed from the on-silicon VREFINT/
+  temperature bring-up in T13.
+
+mode: with_polling
+
+read_responses:
+  "<ADC0_BASE>+0x08": [0x00000000, 0x00000008, 0x00000000, 0x00000000, 0x00000004, 0x00000000]
+
+reset_overrides:
+  "<ADC0_BASE>+0x08": 0x00000000
+
+implementations:
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::adc::Adc;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          let _ = Adc::at(ADC0_BASE).calibrate();
+      }

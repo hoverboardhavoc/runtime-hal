@@ -1,0 +1,52 @@
+name: inject_bringup_adc0_f10x
+description: |
+  ADC0 timer-triggered INJECTED (inserted) conversion-group bring-up (M3 T8) on the F10x family:
+  two phase-current channels (4, 5) at 7.5-cycle sample time, LEFT-aligned, injected external trigger
+  source = TIMER0 CH3, the injected end-of-conversion (EOIC) interrupt enabled, ADC enabled. No
+  conversion (calibration is inject_calibrate; trigger-then-read is inject_read). The injected
+  register block is identical on both families; only the SPL adc_* signatures differ (F10x passes
+  ADC0 + the ADC0_1_EXTTRIG_INSERTED_T0_CH3 macro).
+
+  runtime-hal: Adc::configure_injected(ADC0_BASE, &[(4,1),(5,1)], true, ETSIC_T0_CH3). Same shared
+    body as F1x0 (the injected register model is family-independent).
+  GD SPL (F10x): adc_data_alignment_config(ADC0, ADC_DATAALIGN_LEFT);
+          adc_channel_length_config(ADC0, ADC_INSERTED_CHANNEL, 2);
+          adc_inserted_channel_config(ADC0, 0, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
+          adc_inserted_channel_config(ADC0, 1, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
+          adc_external_trigger_source_config(ADC0, ADC_INSERTED_CHANNEL, ADC0_1_EXTTRIG_INSERTED_T0_CH3);
+          adc_external_trigger_config(ADC0, ADC_INSERTED_CHANNEL, ENABLE);
+          adc_interrupt_enable(ADC0, ADC_INT_EOIC);
+          adc_enable(ADC0);
+
+  TRIGGER-MATRIX INVARIANT (test_timer.py): the timer CH3 compare at ~CAR-1 (2249) AND the ADC
+  injected ETSIC = TIMER0 CH3 (code 1): the single cross-peripheral check for the timer->ADC coupling.
+
+# Mode rationale: final_state. End state per register:
+#   CTL0   +0x04 : EOICIE (bit 7)                                          0x00000080
+#   CTL1   +0x08 : ADCON(0)|DAL(11)|ETSIC(1<<12)|ETEIC(15)                 0x00009801
+#   SAMPT1 +0x10 : ch4 (3*4=12) + ch5 (3*5=15) sample-time = 1 each        0x00009000
+#   ISQ    +0x38 : IL=1 (len-1, 1<<20); rank0 ch4 @10; rank1 ch5 @15       0x00129000
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_adc.h]
+    body: |
+      adc_data_alignment_config(ADC0, ADC_DATAALIGN_LEFT);
+      adc_channel_length_config(ADC0, ADC_INSERTED_CHANNEL, 2U);
+      adc_inserted_channel_config(ADC0, 0U, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
+      adc_inserted_channel_config(ADC0, 1U, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
+      adc_external_trigger_source_config(ADC0, ADC_INSERTED_CHANNEL, ADC0_1_EXTTRIG_INSERTED_T0_CH3);
+      adc_external_trigger_config(ADC0, ADC_INSERTED_CHANNEL, ENABLE);
+      adc_interrupt_enable(ADC0, ADC_INT_EOIC);
+      adc_enable(ADC0);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::adc::{Adc, ETSIC_T0_CH3};
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          let _ = Adc::configure_injected(ADC0_BASE, &[(4, 1), (5, 1)], true, ETSIC_T0_CH3);
+      }

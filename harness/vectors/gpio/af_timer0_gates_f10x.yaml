@@ -1,0 +1,47 @@
+name: af_timer0_gates_f10x
+description: |
+  GPIO alternate-function config for the advanced-timer TIMER0 complementary-PWM
+  gate pins on the F10x (apb_crl_crh) GPIO model (DR-T4). High side CH0/1/2 on
+  PA8/PA9/PA10, low side CH0N/1N/2N on PB13/PB14/PB15. F10x has no AF mux: AF is
+  implied by the CTL nibble, so AF push-pull 50 MHz = nibble 0xB for all six gate
+  pins (identical drive to any AF-PP output; the F1x0 AF2 number has no F10x
+  analogue). This closes the M3 bench-firmware raw-Reg32 bypass on the F10x board.
+
+  runtime-hal: configure_af(PA8/9/10 + PB13/14/15, TimerAfPushPull).
+  GD SPL: gpio_init(GPIO_MODE_AF_PP, 50MHZ) per port for those pins.
+
+# Mode rationale: final_state. Pins 8..15 all live in CTL1; both oracles RMW the
+# nibbles over the 0x44444444 reset. End state per port:
+#   GPIOA CTL1 +0x04 : pins 8,9,10 -> 0xB at nibbles [3:0],[7:4],[11:8]
+#                      = 0x44444BBB
+#   GPIOB CTL1 +0x04 : pins 13,14,15 -> 0xB at nibbles [23:20],[27:24],[31:28]
+#                      = 0xBBB44444
+# (AF-PP nibble 0xB vs an AF-OD 0xF or floating 0x4 is the slip the width-strict
+# golden catches.)
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_gpio.h]
+    body: |
+      gpio_init(GPIOA, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10);
+      gpio_init(GPIOB, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOA_BASE: u32 = 0x4001_0800;
+      const GPIOB_BASE: u32 = 0x4001_0C00;
+
+      pub fn body() {
+          // High side CH0/1/2 on PA8/9/10.
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 8,  PinRole::TimerAfPushPull);
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 9,  PinRole::TimerAfPushPull);
+          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 10, PinRole::TimerAfPushPull);
+          // Low side CH0N/1N/2N on PB13/14/15.
+          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, 13, PinRole::TimerAfPushPull);
+          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, 14, PinRole::TimerAfPushPull);
+          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, 15, PinRole::TimerAfPushPull);
+      }

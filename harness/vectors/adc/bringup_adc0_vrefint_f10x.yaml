@@ -1,0 +1,46 @@
+name: bringup_adc0_vrefint_f10x
+description: |
+  ADC0 regular-conversion bring-up for a single software-triggered read of the
+  internal VREFINT channel (channel 17) at 239.5 cycles on the F10x family, no
+  conversion. The F10x arm of M2 T10's config golden; see bringup_adc0_vrefint_f1x0
+  for the full rationale and the calibration / silicon-anchor notes. The ADC register
+  core is IDENTICAL on both families (STAT/CTL0/CTL1/SAMPT/RSQ/RDATA, same bits), so
+  the runtime-hal body and the expected end state are the same; the only difference
+  is the GD SPL adc_* signatures, which on F10x take the ADCx periph as the first
+  argument (ADC0 here).
+
+  M2 uses software-triggered SINGLE regular conversion on ADC0 on both families
+  (Single arm; F10x dual is M3, open item ADC-2).
+
+# Mode rationale: final_state (see bringup_adc0_vrefint_f1x0). End state per register:
+#   CTL0   +0x04 = 0x00000000  (SM cleared, single)
+#   CTL1   +0x08 = 0x009E0001  (ADCON | ETSRC(7<<17) | ETERC(20) | TSVREN(23))
+#   SAMPT0 +0x0C = 0x00E00000  (channel 17 sample time = 239.5, shift 21)
+#   RSQ0   +0x2C = 0x00000000  (RL = 0, length-1)
+#   RSQ2   +0x34 = 0x00000011  (rank 0 = channel 17)
+# Calibration excluded (it polls; covered by the with_polling transfer_vrefint vector).
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_adc.h, gd32f10x_rcu.h]
+    body: |
+      adc_special_function_config(ADC0, ADC_SCAN_MODE, DISABLE);
+      adc_special_function_config(ADC0, ADC_CONTINUOUS_MODE, DISABLE);
+      adc_data_alignment_config(ADC0, ADC_DATAALIGN_RIGHT);
+      adc_channel_length_config(ADC0, ADC_REGULAR_CHANNEL, 1U);
+      adc_regular_channel_config(ADC0, 0U, ADC_CHANNEL_17, ADC_SAMPLETIME_239POINT5);
+      adc_tempsensor_vrefint_enable();
+      adc_external_trigger_source_config(ADC0, ADC_REGULAR_CHANNEL, ADC0_1_2_EXTTRIG_REGULAR_NONE);
+      adc_external_trigger_config(ADC0, ADC_REGULAR_CHANNEL, ENABLE);
+      adc_enable(ADC0);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::adc::Adc;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          let _ = Adc::configure_single(ADC0_BASE, 17, 7);
+      }

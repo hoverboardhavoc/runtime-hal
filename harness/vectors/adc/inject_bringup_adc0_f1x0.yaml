@@ -1,0 +1,67 @@
+name: inject_bringup_adc0_f1x0
+description: |
+  ADC0 timer-triggered INJECTED (inserted) conversion-group bring-up (M3 T8) on the F1x0 family:
+  two phase-current channels (4, 5) at 7.5-cycle sample time, LEFT-aligned, the injected external
+  trigger source = TIMER0 CH3, the injected end-of-conversion (EOIC) interrupt enabled, ADC enabled.
+  No conversion (the calibration poll is the separate inject_calibrate vector; the trigger-then-read
+  sequence is inject_read). This is M3 T8's config golden: runtime-hal's injected-group config writes
+  reach the same END STATE as the GD SPL adc_* injected recipe.
+
+  The injected register block is identical on both families (gd32f1x0_adc.h / gd32f10x_adc.h: ISQ
+  0x38, IDATA0..3 0x3C..0x48, STAT EOIC bit 2, CTL0 EOICIE bit 7, CTL1 ETSIC[14:12] / ETEIC bit 15,
+  DAL bit 11), so the same vector runs on F10x (inject_bringup_adc0_f10x); the family difference is
+  the SPL adc_* signatures (F10x passes ADCx + the ADC0_1_EXTTRIG_INSERTED_* macro).
+
+  runtime-hal: Adc::configure_injected(ADC0_BASE, &[(4,1),(5,1)], true, ETSIC_T0_CH3). Programs DAL
+    (left), ISQ IL = len-1, the per-rank ISQ channel fields (SPL reversed packing) + per-channel
+    SAMPT, ETSIC = TIMER0 CH3 (code 1), ETEIC, CTL0 EOICIE, ADCON. (The calibration RSTCLB/CLB poll
+    is split into inject_calibrate, exactly as the M2 regular bring-up split it.)
+  GD SPL: adc_data_alignment_config(ADC_DATAALIGN_LEFT);
+          adc_channel_length_config(ADC_INSERTED_CHANNEL, 2);
+          adc_inserted_channel_config(0, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
+          adc_inserted_channel_config(1, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
+          adc_external_trigger_source_config(ADC_INSERTED_CHANNEL, ADC_EXTTRIG_INSERTED_T0_CH3);
+          adc_external_trigger_config(ADC_INSERTED_CHANNEL, ENABLE);
+          adc_interrupt_enable(ADC_INT_EOIC);
+          adc_enable();
+
+  TRIGGER-MATRIX INVARIANT (test_timer.py, now complete with the T6 trgo_trigger vector): the timer
+  CH3 compare sits at ~CAR-1 (2249) AND the ADC injected ETSIC field selects exactly TIMER0 CH3
+  (code 1). This is the single cross-peripheral check that proves the timer->ADC coupling.
+
+  Silicon (T13/T10, NOT this task): the injected EOC firing at the PWM centre at the PWM rate. This
+  golden proves agreement-with-SPL config, not silicon timing.
+
+# Mode rationale: final_state (per-register final written value; reads ignored). The SPL builds CTL1
+# with several |= / &= RMW pairs; the correctness criterion is the END STATE of each register:
+#   CTL0   +0x04 : EOICIE (bit 7)                                          0x00000080
+#   CTL1   +0x08 : ADCON(0)|DAL(11)|ETSIC(1<<12)|ETEIC(15)                 0x00009801
+#   SAMPT1 +0x10 : ch4 (3*4=12) + ch5 (3*5=15) sample-time = 1 each        0x00009000
+#   ISQ    +0x38 : IL=1 (len-1, 1<<20); rank0 ch4 @10; rank1 ch5 @15       0x00129000
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_adc.h]
+    body: |
+      adc_data_alignment_config(ADC_DATAALIGN_LEFT);
+      adc_channel_length_config(ADC_INSERTED_CHANNEL, 2U);
+      adc_inserted_channel_config(0U, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
+      adc_inserted_channel_config(1U, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
+      adc_external_trigger_source_config(ADC_INSERTED_CHANNEL, ADC_EXTTRIG_INSERTED_T0_CH3);
+      adc_external_trigger_config(ADC_INSERTED_CHANNEL, ENABLE);
+      adc_interrupt_enable(ADC_INT_EOIC);
+      adc_enable();
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::adc::{Adc, ETSIC_T0_CH3};
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          // Two phase-current channels (4, 5) at 7.5-cycle sample time (code 1), left-aligned,
+          // triggered by TIMER0 CH3. configure_injected programs the injected group WITHOUT the
+          // calibration poll (split into inject_calibrate, like the M2 regular bring-up split).
+          let _ = Adc::configure_injected(ADC0_BASE, &[(4, 1), (5, 1)], true, ETSIC_T0_CH3);
+      }

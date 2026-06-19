@@ -1,0 +1,88 @@
+name: transfer_whoami_f1x0
+description: |
+  I2C transfer-sequencing golden (M2 T7, with_polling) on the F1x0 family: the IMU
+  WHO_AM_I shape -- write register pointer 0x75 to 0x68, repeated START, read 1
+  byte -- traced with read_responses stubbing the STAT0/STAT1 flag progression so
+  the polled loops terminate and the ordered reads + writes trace. This proves
+  runtime-hal sequences the classic event-based I2C handshake the way the bench
+  probe (i2c_probe.c, polled, same peripheral) does, and that it does NOT DROP a
+  poll (proceed before a flag is set, the F130 hang-if-done-wrong class). A dropped
+  poll changes the ordered read trace and the planted-bug self-test catches it
+  (test_selftest.py dropped-poll mutation on this vector).
+
+  Like the M1 usart write_byte with_polling vector and the clock-tree polling
+  vector, this is a HARNESS self-test of runtime-hal's poll behaviour (driven from
+  pytest with and without the stub), not a two-oracle compare: the SPL's `|=`/`&=`
+  RMW pairs interleave reads and writes differently from runtime-hal's
+  field-scoped modify, so an ordered read+write diff against the SPL would diverge
+  on coding style, not on whether the polls happen. The block layout is identical
+  on both families, so transfer_whoami_f10x carries the same body.
+
+  runtime-hal: I2c::bring_up(...); I2c::write_read(0x68, &[0x75], &mut [0u8; 1]).
+  Sequence (the classic event-based handshake, mirroring i2c_probe.c):
+    phase 1 (write reg ptr, no STOP): START -> SBSEND -> addr+W -> ADDSEND ->
+      clear ADDSEND (read STAT0 then STAT1) -> TBE -> write 0x75 -> BTC;
+    phase 2 (repeated START, read 1): START -> SBSEND -> addr+R -> ACK off ->
+      ADDSEND -> clear ADDSEND -> STOP -> RBNE -> read byte -> ACK on.
+
+  SEED PROVENANCE / re-seed flag (T7 caveat, the I2C analogue of CLOCK-1): the
+  STAT0/STAT1 stub sequence below is SPL-DERIVED -- it is the exact set of flags
+  the SPL / i2c_probe.c polls, in the order it polls them (SBSEND, ADDSEND, TBE,
+  BTC, then SBSEND, ADDSEND, RBNE), NOT a silicon capture. It must be RE-SEEDED
+  from a real STAT0/STAT1 read-back captured over SWD during the on-silicon IMU
+  read in T13 (0x68 -> 0x75 = 0x2E, 0x06/0x07 = 0x19/0xf4), the same way the clock
+  poll stub and the documented I2C handshake capture are to be re-seeded. Until
+  then this proves agreement-with-the-SPL-sequence, not silicon flag values.
+
+# with_polling: ordered reads + writes; a dropped poll is a failure (not just a
+# wrong value). The pytest drives extraction directly (stub vs no-stub), so the
+# mode documents intent.
+mode: with_polling
+
+# STAT0 (0x14) is read once at each poll point; with the satisfying flag present on
+# the first read, each wait_flag does exactly one read. The list is the ordered
+# STAT0 values across the whole transfer (REPLACE form, last sticks):
+#   0x01 SBSEND   (phase-1 START)
+#   0x02 ADDSEND  (phase-1 address ACK)
+#   0x02 clear-ADDSEND STAT0 read (value consumed; STAT1 read follows)
+#   0x80 TBE      (data register empty, ready for the reg pointer)
+#   0x04 BTC      (reg pointer byte transferred)
+#   0x01 SBSEND   (phase-2 repeated START)
+#   0x02 ADDSEND  (phase-2 address ACK)
+#   0x02 clear-ADDSEND STAT0 read
+#   0x40 RBNE     (received byte available)
+# STAT1 (0x18) is read once per clear-ADDSEND (twice total); value irrelevant.
+read_responses:
+  "<I2C0_BASE>+0x14": [0x01, 0x02, 0x02, 0x80, 0x04, 0x01, 0x02, 0x02, 0x40]
+  "<I2C0_BASE>+0x18": [0x00, 0x00]
+
+implementations:
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::i2c::{FastDuty, I2c};
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::I2cConfig;
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::I2c0, 0x4000_5400);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = I2cConfig { i2c: PeriphLabel::I2c0, scl: 0x16, sda: 0x17, speed_hz: 100_000,
+              duty: FastDuty::Two, own_addr: 0x24 };
+          let dev = I2c::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+          let mut who = [0u8; 1];
+          // IMU WHO_AM_I: write reg pointer 0x75 to 0x68 (no STOP), repeated START, read 1 byte.
+          // This is exactly what the embedded-hal i2c::I2c::write_read impl does (write_bytes(.., false)
+          // then read_bytes(.., true)); the inherent calls avoid pulling embedded-hal into the snippet
+          // crate while tracing the identical sequence. The trait surface is covered by host tests.
+          let _ = dev.write_bytes(0x68, &[0x75], false);
+          let _ = dev.read_bytes(0x68, &mut who, true);
+      }

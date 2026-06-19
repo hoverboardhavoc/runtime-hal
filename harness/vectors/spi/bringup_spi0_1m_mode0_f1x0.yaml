@@ -1,0 +1,81 @@
+name: bringup_spi0_1m_mode0_f1x0
+description: |
+  SPI0 bring-up at a 1 MHz target SCK, MODE_0, 8-bit, master, software NSS on the
+  F1x0 family, no transfer. This is M2 T8's config golden: runtime-hal's SPI mode +
+  prescaler + enable writes reach the same END STATE as the GD SPL spi_init /
+  spi_enable. The SPI block is identical on both families (CTL0/CTL1/STAT/DATA/
+  I2SCTL, same bit positions), so the same vector runs on F10x too
+  (bringup_spi0_1m_mode0_f10x).
+
+  runtime-hal: Spi::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &SpiConfig{Spi0, MODE_0, Eight, 1_000_000, MSB, Software}).
+    SPI0 is on APB2 = 72 MHz at the proven tree. prescaler_for(72e6, 1e6) walks the
+    power-of-two divisors and picks /128 (PSC code 6): 72e6/128 = 562.5 kHz <= 1 MHz,
+    while /64 = 1.125 MHz > 1 MHz.
+  GD SPL: spi_parameter_struct{device_mode=SPI_MASTER, trans_mode=FULLDUPLEX,
+    frame_size=8BIT, nss=SPI_NSS_SOFT, endian=MSB, clock_polarity_phase=
+    SPI_CK_PL_LOW_PH_1EDGE (MODE_0), prescale=SPI_PSC_128}; spi_init(SPI0, &p);
+    spi_enable(SPI0).
+
+  CTL0 end state: SPI_MASTER = MSTMOD(2) | SWNSS(8); SPI_NSS_SOFT = SWNSSEN(9);
+  PSC field = 6 << 3 = 0x30; MODE_0 adds no CKPL/CKPH; FF16 clear (8-bit); LF clear
+  (MSB). After spi_enable, SPIEN(6) is set:
+    0x0004 | 0x0100 | 0x0200 | 0x0030 | 0x0040 = 0x0374.
+  I2SCTL: spi_init clears I2SSEL (already 0 at reset) -> 0x00000000.
+
+  NSS DEFAULT (open item SPI-2): software-managed NSS (SWNSSEN set + SWNSS internally
+  high via SPI_MASTER). The embedded-hal SpiBus trait does NOT own CS, so the caller
+  owns chip-select; software NSS keeps the master out of a spurious mode fault when no
+  hardware NSS line is wired, the embedded-hal-correct default a loopback (T13) needs.
+
+  Silicon anchor (T13, NOT this task): MOSI -> MISO loopback exercises shift/baud/
+  data-size/full-duplex; CPOL/CPHA is pinned separately (open item SPI-1). This golden
+  proves agreement-with-SPL config, not silicon.
+
+# Mode rationale: final_state (per-register final written value; reads ignored).
+# spi_init reads CTL0, masks with SPI_INIT_MASK (0x3040), then ORs the parameter
+# fields and writes CTL0 once; runtime-hal does the same read-mask-or-write. From a
+# reset-0 CTL0 both reach 0x0334, then spi_enable RMWs SPIEN to 0x0374. spi_init's
+# tail clears I2SCTL I2SSEL (a &= ~bit RMW from reset 0 -> 0). The correctness
+# criterion is the END STATE of CTL0 and I2SCTL, which final_state checks directly:
+#   CTL0   +0x00 : MSTMOD|SWNSS|SWNSSEN|PSC(6<<3)|SPIEN  0x00000374
+#   I2SCTL +0x1C : I2SSEL cleared (SPI mode)             0x00000000
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_spi.h, gd32f1x0_rcu.h]
+    body: |
+      spi_parameter_struct sp;
+      sp.device_mode = SPI_MASTER;
+      sp.trans_mode = SPI_TRANSMODE_FULLDUPLEX;
+      sp.frame_size = SPI_FRAMESIZE_8BIT;
+      sp.nss = SPI_NSS_SOFT;
+      sp.endian = SPI_ENDIAN_MSB;
+      sp.clock_polarity_phase = SPI_CK_PL_LOW_PH_1EDGE;
+      sp.prescale = SPI_PSC_128;
+      spi_init(SPI0, &sp);
+      spi_enable(SPI0);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::spi::Spi;
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::{SpiConfig, NssMode};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Spi0, 0x4001_3000);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          // The default 72 MHz tree: SPI0 on APB2 = 72 MHz; target 1 MHz -> PSC /128.
+          let cfg = SpiConfig { spi: PeriphLabel::Spi0, sck: 0x05, miso: 0x06, mosi: 0x07, nss: 0x04,
+              mode: 0, data16: false, target_hz: 1_000_000, lsb_first: false, nss_mode: NssMode::Software };
+          let _ = Spi::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+      }

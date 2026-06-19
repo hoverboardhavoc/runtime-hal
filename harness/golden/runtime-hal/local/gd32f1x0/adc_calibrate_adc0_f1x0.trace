@@ -1,0 +1,17 @@
+# regcmp v0.1.0 captured 2026-06-17T19:31:35Z
+# vector:        adc_calibrate_adc0_f1x0
+# library:       runtime-hal
+# target:        gd32f1x0
+# compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
+# compile_flags: cargo build --release --target thumbv7m-none-eabi
+# emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+# emulation:     clean-exit (sentinel reached at instr 40)
+# mode:          with_polling
+R4 <ADC0_BASE>+0x08 0x00000000   # CTL1
+W4 <ADC0_BASE>+0x08 0x00000008   # CTL1
+R4 <ADC0_BASE>+0x08 0x00000008   # CTL1
+R4 <ADC0_BASE>+0x08 0x00000000   # CTL1
+R4 <ADC0_BASE>+0x08 0x00000000   # CTL1
+W4 <ADC0_BASE>+0x08 0x00000004   # CTL1
+R4 <ADC0_BASE>+0x08 0x00000004   # CTL1
+R4 <ADC0_BASE>+0x08 0x00000000   # CTL1

@@ -1,0 +1,67 @@
+name: bringup_usart1_115200_8n1_f1x0
+description: |
+  Bring up USART1 @ 115200 8N1 on the F1x0 (f1x0_rcu) register model, no byte
+  transfer. The 72 MHz clock tree is seeded into RCU_CFG0 (see reset_values in
+  target/gd32f1x0.toml) so the SPL's usart_baudrate_set -> rcu_clock_freq_get
+  computes CK_APB1 = 36 MHz WITHOUT running SystemInit, giving BAUD = 0x139.
+  runtime-hal's compute_brr is driven by a ClockProfile of the SAME 72 MHz tree
+  (sysclk 72 MHz, APB1 = 36 MHz via apb1_div_for), so both land on BAUD = 0x139.
+
+  runtime-hal: Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &UsartConfig{Usart1,8N1,By16,115200}).
+  GD SPL: usart_disable; usart_baudrate_set(115200); usart_word_length_set(8BIT);
+          usart_stop_bit_set(1BIT); usart_parity_config(NONE);
+          usart_transmit_config(ENABLE); usart_receive_config(ENABLE); usart_enable.
+  (usart_disable, not usart_deinit: deinit pokes the RCU peripheral-reset
+  registers, which is a different scope; runtime-hal bring_up clears CTL0.UEN,
+  matching usart_disable.)
+
+# Mode rationale: final_state (per-register final written value, reads ignored).
+# The SPL config helpers do a clear-then-set (`&= ~mask` then `|= val`) for the
+# WL / STB / parity / TEN / REN fields, so the SPL emits TWO writes per field;
+# runtime-hal's Reg32::modify is a single read-modify-write per field. The write
+# COUNTS therefore differ (a coding-style difference, not a register difference),
+# so register_writes would diverge on count/order. The correctness criterion for
+# bring-up is the END STATE of each register, which final_state checks directly:
+#   BAUD = 0x00000139   (USART1 @ 115200 on the 36 MHz APB1 clock)   +0x0C
+#   CTL0 = 0x0000200D   (UEN bit0 | REN bit2 | TEN bit3 | ... ) -- see asserted trace
+#   CTL1 = 0x00000000   (STB = 1 stop, the reset frame)
+# The headline assertion is BAUD = 0x139 on the 72 MHz tree.
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_usart.h]
+    body: |
+      usart_disable(USART1);
+      usart_baudrate_set(USART1, 115200U);
+      usart_word_length_set(USART1, USART_WL_8BIT);
+      usart_stop_bit_set(USART1, USART_STB_1BIT);
+      usart_parity_config(USART1, USART_PM_NONE);
+      usart_transmit_config(USART1, USART_TRANSMIT_ENABLE);
+      usart_receive_config(USART1, USART_RECEIVE_ENABLE);
+      usart_enable(USART1);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::usart::Usart;
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::{UsartConfig, UsartFrame, Oversampling};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Usart1, 0x4000_4400);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          // 72 MHz tree: sysclk 72 MHz, APB1 = 36 MHz. 2 flash wait states. The 8N1 / By16 frame
+          // has all-zero frame fields, so the register writes are identical to the old bring-up.
+          let cfg = UsartConfig { usart: PeriphLabel::Usart1, tx: 0x02, rx: 0x03, baud: 115200,
+              frame: UsartFrame::EIGHT_N_ONE, oversampling: Oversampling::By16 };
+          let _ = Usart::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+      }

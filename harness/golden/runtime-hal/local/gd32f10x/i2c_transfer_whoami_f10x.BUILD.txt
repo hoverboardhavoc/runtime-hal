@@ -1,0 +1,10 @@
+vector:        i2c_transfer_whoami_f10x
+library:       runtime-hal
+target:        gd32f10x
+spl_pin:       local
+compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
+chip_define:   
+compile_flags: cargo build --release --target thumbv7m-none-eabi
+emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+emulation:     clean-exit (sentinel reached at instr 335)
+mode:          with_polling

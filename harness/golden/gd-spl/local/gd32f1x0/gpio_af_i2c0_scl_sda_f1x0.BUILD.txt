@@ -1,0 +1,10 @@
+vector:        gpio_af_i2c0_scl_sda_f1x0
+library:       gd-spl
+target:        gd32f1x0
+spl_pin:       local
+compiler:      arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1 (Build arm-15.86)) 15.2.1 20251203
+chip_define:   GD32F130_150
+compile_flags: -Os -mcpu=cortex-m3 -mthumb -fno-common -ffreestanding -fno-builtin -std=gnu11 -Wall -ffunction-sections -fdata-sections -Wno-unused-but-set-variable -Wno-unused-variable -Wno-comment
+emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+emulation:     clean-exit (sentinel reached at instr 525)
+mode:          final_state

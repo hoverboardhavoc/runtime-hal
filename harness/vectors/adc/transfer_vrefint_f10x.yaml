@@ -1,0 +1,34 @@
+name: transfer_vrefint_f10x
+description: |
+  ADC single-conversion transfer-sequencing golden (M2 T11, with_polling) on the
+  F10x family: a software-triggered single conversion + result read of the internal
+  VREFINT channel. The F10x arm of the read with_polling self-test; see
+  transfer_vrefint_f1x0 for the full rationale and the SPL-derived seed provenance /
+  T13 re-seed + tolerance (ADC-3) flag. The ADC block is IDENTICAL on both families,
+  so the body and the STAT/RDATA stubs are the same; only the family the snippet
+  builds for differs.
+
+  SEED PROVENANCE / re-seed flag: the STAT EOC stub (busy -> done) and the RDATA value
+  are SPL-derived placeholders, NOT a silicon capture; re-seed from the on-silicon
+  VREFINT (~1.2 V) + temperature read in T13, pinning the tolerance band (ADC-3).
+
+mode: with_polling
+
+read_responses:
+  "<ADC0_BASE>+0x00": [0x00000000, 0x00000002]
+  "<ADC0_BASE>+0x4C": [0x000005D2]
+
+reset_overrides:
+  "<ADC0_BASE>+0x00": 0x00000000
+  "<ADC0_BASE>+0x4C": 0x00000000
+
+implementations:
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::adc::Adc;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          let _ = Adc::at(ADC0_BASE).read_channel(17);
+      }

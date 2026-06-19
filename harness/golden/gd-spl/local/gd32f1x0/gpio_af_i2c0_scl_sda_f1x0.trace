@@ -1,0 +1,21 @@
+# regcmp v0.1.0 captured 2026-06-17T18:31:57Z
+# vector:        gpio_af_i2c0_scl_sda_f1x0
+# library:       gd-spl
+# target:        gd32f1x0
+# compiler:      arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1 (Build arm-15.86)) 15.2.1 20251203
+# compile_flags: -Os -mcpu=cortex-m3 -mthumb -fno-common -ffreestanding -fno-builtin -std=gnu11 -Wall -ffunction-sections -fdata-sections -Wno-unused-but-set-variable -Wno-unused-variable -Wno-comment
+# emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+# emulation:     clean-exit (sentinel reached at instr 525)
+# mode:          final_state
+R4 <GPIOB_BASE>+0x00 0x00000000   # CTL
+R4 <GPIOB_BASE>+0x0C 0x00000000   # PUD
+W4 <GPIOB_BASE>+0x00 0x0000A000   # CTL
+W4 <GPIOB_BASE>+0x0C 0x00005000   # PUD
+R4 <GPIOB_BASE>+0x20 0x00000000   # AFSEL0
+R4 <GPIOB_BASE>+0x24 0x00000000   # AFSEL1
+W4 <GPIOB_BASE>+0x20 0x11000000   # AFSEL0
+W4 <GPIOB_BASE>+0x24 0x00000000   # AFSEL1
+R4 <GPIOB_BASE>+0x04 0x00000000   # OMODE
+W4 <GPIOB_BASE>+0x04 0x000000C0   # OMODE
+R4 <GPIOB_BASE>+0x08 0x00000000   # OSPD
+W4 <GPIOB_BASE>+0x08 0x0000F000   # OSPD

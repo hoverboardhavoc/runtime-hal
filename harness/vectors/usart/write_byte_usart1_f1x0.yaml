@@ -1,0 +1,50 @@
+name: write_byte_usart1_f1x0
+description: |
+  USART1 single-byte polled transmit on the F1x0 register model: the path that
+  REQUIRES read-response stubbing. Usart::write_byte polls STAT.TBE (bit 7)
+  before writing TDATA, then polls STAT.TC (bit 6) after. With STAT seeded to its
+  reset value (0), both polls spin forever, so the extractor must hit the
+  step-cap and report "likely polling target". With read_responses scripting STAT
+  to return TBE-set then TC-set, the loops terminate and the transfer traces
+  cleanly (Task 9: with_polling + read-response stubbing).
+
+  This vector is a HARNESS self-test (it validates the extractor's poll handling,
+  not runtime-hal vs the SPL), so it carries only a runtime-hal implementation and
+  is driven directly from the Task 9 pytest with and without the STAT stub. The
+  bring-up reuses the same 72 MHz seeding as the bring-up vector.
+
+# with_polling: ordered reads + writes. A dropped poll is a failure. The Task 9
+# pytest drives this vector's extraction directly (stub vs no-stub) rather than a
+# two-oracle compare, so the mode here documents intent.
+mode: with_polling
+
+# STAT (F1x0 offset 0x1C): first read returns TBE set (0x80) so the pre-write
+# poll exits; second read returns TBE|TC set (0xC0) so the post-write TC poll
+# exits. The sequence's last value sticks for any further reads.
+read_responses:
+  "<USART1_BASE>+0x1C": [0x80, 0xC0]
+
+implementations:
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::usart::Usart;
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::{UsartConfig, UsartFrame, Oversampling};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Usart1, 0x4000_4400);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = UsartConfig { usart: PeriphLabel::Usart1, tx: 0x02, rx: 0x03, baud: 115200,
+              frame: UsartFrame::EIGHT_N_ONE, oversampling: Oversampling::By16 };
+          let u = Usart::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+          u.write_byte(0x41);
+      }

@@ -1,0 +1,29 @@
+[package]
+name = "regcmp-snippet"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A tiny no_std thumbv7m staticlib that calls one runtime-hal path function. The
+# generated src/snippet.rs body is swapped per vector by build_rusthal.py. Built
+# with the REAL MMIO backend (runtime-hal default features, NOT `mock`), so the
+# Reg writes hit Unicorn-backed memory and the extractor's hooks see them.
+
+[lib]
+# A staticlib so the harness links it with the vendored startup + link script
+# the same way the SPL snippet links. The exported regcmp_test is the entry.
+crate-type = ["staticlib"]
+
+[dependencies]
+# Path dep on the runtime-hal crate at the repo root. Default features = real
+# volatile MMIO. The `mock` feature is deliberately NOT enabled.
+runtime-hal = { path = "../.." }
+
+[profile.release]
+# LTO must not inline the path-fn call away to nothing observable, and panic =
+# abort keeps the unwinder out of a no_std staticlib. opt-level "s" keeps the
+# body real (the volatile Reg writes survive) without aggressive cross-fn LTO.
+lto = false
+opt-level = "s"
+panic = "abort"
+overflow-checks = false

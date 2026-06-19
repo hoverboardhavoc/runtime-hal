@@ -1,0 +1,41 @@
+name: transfer_loopback_f10x
+description: |
+  SPI transfer-sequencing golden (M2 T9, with_polling) on the F10x family: a 2-byte
+  full-duplex transfer. The F10x arm of the with_polling transfer self-test; see
+  transfer_loopback_f1x0 for the full rationale and the SPL-derived seed provenance /
+  T13 re-seed flag. The SPI block is IDENTICAL on both families, so the body and the
+  stub sequence are the same; only the family the snippet builds for differs.
+
+  SEED PROVENANCE / re-seed flag: the STAT stub is SPL-derived (TBE then RBNE, per
+  byte), NOT a silicon capture; re-seed from the on-silicon MOSI/MISO loopback in T13.
+
+mode: with_polling
+
+read_responses:
+  "<SPI0_BASE>+0x08": [0x02, 0x01, 0x02, 0x01]
+
+implementations:
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::spi::Spi;
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::{SpiConfig, NssMode};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Spi0, 0x4001_3000);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = SpiConfig { spi: PeriphLabel::Spi0, sck: 0x05, miso: 0x06, mosi: 0x07, nss: 0x04,
+              mode: 0, data16: false, target_hz: 1_000_000, lsb_first: false, nss_mode: NssMode::Software };
+          let dev = Spi::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+          let _ = dev.transfer_byte(0xA5);
+          let _ = dev.transfer_byte(0x5A);
+      }

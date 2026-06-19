@@ -1,0 +1,65 @@
+name: af_timer0_gates_f1x0
+description: |
+  GPIO alternate-function config for the advanced-timer TIMER0 complementary-PWM
+  gate pins on the F1x0 (ahb_ctl_afsel) GPIO model (DR-T4). The reference bridge
+  drives the high side CH0/1/2 on PA8/PA9/PA10 and the low side CH0N/1N/2N on
+  PB13/PB14/PB15, all AF push-pull 50 MHz on AF2 (TIMER0 is on AF2 for F1x0,
+  gd32f1x0_gpio.c:322 AF table: "GPIO_AF_2: TIMER0, TIMER1, TIMER15, TIMER16").
+  This closes the M3 bench-firmware raw-Reg32 bypass: the firmware set the six gate
+  pins' AF mux by hand because the role set had no timer AF. Unlike the SPI vector
+  (AF0 -> AFSEL nibbles 0), the AF2 nibbles are NON-zero, so this width-strictly
+  pins the AF-mux number.
+
+  runtime-hal: configure_af(PA8/9/10 + PB13/14/15, TimerAfPushPull).
+  GD SPL: gpio_mode_set(AF, NONE) + gpio_af_set(AF_2) + gpio_output_options_set(PP,
+  50MHZ) per port.
+
+# Mode rationale: final_state (multi-pin, register-at-a-time SPL vs pin-at-a-time
+# runtime-hal). End state per port:
+#   GPIOA (high side, pins 8,9,10):
+#     CTL    +0x00 : AF (2) at pins 8,9,10  -> (2<<16)|(2<<18)|(2<<20)
+#     AFSEL1 +0x24 : AF2 at pins 8,9,10     -> (2<<0)|(2<<4)|(2<<8)
+#     OMODE  +0x04 : push-pull              -> 0
+#     OSPD   +0x08 : 50MHz at 8,9,10        -> (3<<16)|(3<<18)|(3<<20)
+#     PUD    +0x0C : no pull                -> 0
+#   GPIOB (low side, pins 13,14,15):
+#     CTL    +0x00 : AF (2) at 13,14,15     -> (2<<26)|(2<<28)|(2<<30)
+#     AFSEL1 +0x24 : AF2 at 13,14,15        -> (2<<20)|(2<<24)|(2<<28)
+#     OSPD   +0x08 : 50MHz at 13,14,15      -> (3<<26)|(3<<28)|(3<<30)
+# AFSEL0 is the SPL's no-op rewrite (both leave it 0); ignored on each port.
+mode: final_state
+
+ignore:
+  - "<GPIOA_BASE>+0x20"   # AFSEL0: SPL no-op rewrite (pins 8..15 use AFSEL1)
+  - "<GPIOB_BASE>+0x20"   # AFSEL0: SPL no-op rewrite
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_gpio.h]
+    body: |
+      gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10);
+      gpio_af_set(GPIOA, GPIO_AF_2, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10);
+      gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_8 | GPIO_PIN_9 | GPIO_PIN_10);
+
+      gpio_mode_set(GPIOB, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);
+      gpio_af_set(GPIOB, GPIO_AF_2, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);
+      gpio_output_options_set(GPIOB, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      const GPIOA_BASE: u32 = 0x4800_0000;
+      const GPIOB_BASE: u32 = 0x4800_0400;
+
+      pub fn body() {
+          // High side CH0/1/2 on PA8/9/10.
+          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 8,  PinRole::TimerAfPushPull);
+          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 9,  PinRole::TimerAfPushPull);
+          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 10, PinRole::TimerAfPushPull);
+          // Low side CH0N/1N/2N on PB13/14/15.
+          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, 13, PinRole::TimerAfPushPull);
+          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, 14, PinRole::TimerAfPushPull);
+          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, 15, PinRole::TimerAfPushPull);
+      }

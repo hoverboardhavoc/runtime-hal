@@ -1,0 +1,68 @@
+name: tree_polling_72m_f10x
+description: |
+  Transfer-sequencing golden for the F10x clock-tree bring-up: the POLL LOOPS of
+  configure_tree traced with read_responses stubbing the source-stable, PLL-lock,
+  and SCS-confirm flags busy -> busy -> done, so the loops terminate and the
+  ordered reads + writes trace. This is M2 T2's with_polling layer: it proves
+  runtime-hal does not DROP a poll (proceed before the flag is set). A dropped
+  poll changes the ordered read trace and the planted-bug self-test catches it
+  (test_selftest.py dropped-poll mutation on this vector).
+
+  Like the M1 usart write_byte with_polling vector, this is a HARNESS self-test of
+  runtime-hal's poll behaviour (driven from pytest with and without the stub),
+  not a two-oracle compare: the SPL's `|=`/`&=` RMW pairs interleave reads and
+  writes differently from runtime-hal's field-scoped modify, so an ordered
+  read+write diff against the SPL would diverge on coding style, not on whether
+  the polls happen. The two-oracle END-STATE agreement is proven by the config
+  golden (clock_tree_72m_irc8m_f10x); this vector proves the polls are present
+  and ordered.
+
+  CLOCK-1: the busy -> done flag sequences are SPL-DERIVED (the exact flags the
+  SPL polls, in the order it polls them: IRC8MSTB, then PLLSTB, then SCSS = PLL).
+  They are NOT a silicon capture; re-seed them from a real RCU read-back over SWD
+  when the bench pass runs (the same way the I2C handshake stub is to be seeded
+  from the IMU capture).
+
+# with_polling: ordered reads + writes; a dropped poll is a failure (not just a
+# wrong value). The pytest drives extraction directly (stub vs no-stub), so the
+# mode documents intent.
+mode: with_polling
+
+# RCU CTL (0x00): the source-stable poll reads IRC8MSTB, the PLL-lock poll reads
+# PLLSTB; the scripted sequence returns "not yet" (only the OTHER bits an RMW set)
+# then "stable/locked". RCU CFG0 (0x04): the SCS-confirm poll reads SCSS; returns
+# "not yet" then SCSS = PLL. Sequence values (REPLACE form, last sticks):
+#   CTL0:  0x00000001 (IRC8MEN set, IRC8MSTB clear)      -> source poll spins once
+#          0x00000003 (IRC8MSTB set)                     -> source poll exits
+#          0x01000003 (PLLEN set, PLLSTB clear)          -> PLL poll spins once
+#          0x03000003 (PLLSTB set)                       -> PLL poll exits
+#   CFG0:  0x00000002 (SCS = PLL written, SCSS clear)    -> SCS confirm spins once
+#          0x0000000A (SCSS = PLL set)                   -> SCS confirm exits
+read_responses:
+  "<RCU_BASE>+0x00": [0x00000001, 0x00000003, 0x01000003, 0x03000003]
+  "<RCU_BASE>+0x04": [0x00000002, 0x0000000A]
+
+reset_overrides:
+  "<RCU_BASE>+0x00": 0x00000000
+  "<RCU_BASE>+0x04": 0x00000000
+  "<FMC_BASE>+0x00": 0x00000000
+
+implementations:
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::clock::{configure_tree, ClockConfig};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let _ = configure_tree(&chip(), &ClockConfig::REFERENCE_72M_IRC8M);
+      }

@@ -1,0 +1,61 @@
+name: transfer_vrefint_f1x0
+description: |
+  ADC single-conversion transfer-sequencing golden (M2 T11, with_polling) on the
+  F1x0 family: a software-triggered single conversion + result read of the internal
+  VREFINT channel (the unit the on-silicon anchor reads), traced with read_responses
+  stubbing the end-of-conversion (EOC) flag busy -> done and the regular-data
+  register so the polled loop terminates and the ordered reads + writes trace. This
+  proves runtime-hal sequences the polled single conversion the way the GD SPL polled
+  example does (software-trigger SWRCST, poll STAT EOC, read RDATA), and that it does
+  NOT DROP the EOC poll (read RDATA before EOC is set, the F130 hang-if-done-wrong
+  class -> a stale/garbage sample). A dropped poll changes the ordered read trace and
+  the planted-bug self-test catches it (test_selftest.py dropped-poll mutation on this
+  vector).
+
+  Like the I2C/SPI transfer vectors and the clock-tree polling vector, this is a
+  HARNESS self-test of runtime-hal's poll behaviour (driven from pytest with and
+  without the stub), not a two-oracle compare. The ADC block is identical on both
+  families, so transfer_vrefint_f10x carries the same body + stub.
+
+  runtime-hal: Adc::at(ADC0_BASE).read_channel(17). Sequence:
+    re-point regular rank 0 to channel 17 (RSQ2) -> software trigger (CTL1 SWRCST) ->
+    poll STAT EOC -> read RDATA (the conversion value).
+
+  SEED PROVENANCE / re-seed flag (T11 caveat, the ADC analogue of the I2C / SPI /
+  CLOCK-1 seeds): the STAT EOC stub (busy -> done) and the RDATA value below are
+  SPL-DERIVED placeholders -- the EOC progression the SPL polled example / runtime-hal
+  poll, and a VREFINT-region 12-bit count, NOT a silicon capture. They MUST be
+  RE-SEEDED from a real STAT/RDATA read-back captured over SWD during the on-silicon
+  VREFINT (~1.2 V) + temperature read in T13, with the tolerance band (open item
+  ADC-3) pinned then. Until then this proves agreement-with-the-SPL-sequence, not
+  silicon values.
+
+# with_polling: ordered reads + writes; a dropped poll is a failure (not just a wrong
+# value). The pytest drives extraction directly (stub vs no-stub).
+mode: with_polling
+
+# STAT (0x00) read at the EOC poll: busy (EOC clear) then done (EOC = bit1 = 0x02).
+# RDATA (0x4C): the 12-bit right-aligned conversion value (REPLACE form, last sticks).
+# 0x05D2 = 1490 counts ~ 1.2 V VREFINT at a 3.3 V reference (a placeholder; re-seed in T13).
+read_responses:
+  "<ADC0_BASE>+0x00": [0x00000000, 0x00000002]
+  "<ADC0_BASE>+0x4C": [0x000005D2]
+
+reset_overrides:
+  "<ADC0_BASE>+0x00": 0x00000000
+  "<ADC0_BASE>+0x4C": 0x00000000
+
+implementations:
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::adc::Adc;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          // read_channel re-points regular rank 0 to channel 17 (VREFINT), sets the SWRCST software
+          // trigger, polls STAT EOC, and reads RDATA. This is the runtime-hal read surface (ADC-1;
+          // embedded-hal 1.0 has no ADC trait). The handle is bare (Adc::at): the bring-up + calibrate
+          // are exercised by bringup_adc0_vrefint / calibrate_adc0; this vector isolates the read poll.
+          let _ = Adc::at(ADC0_BASE).read_channel(17);
+      }

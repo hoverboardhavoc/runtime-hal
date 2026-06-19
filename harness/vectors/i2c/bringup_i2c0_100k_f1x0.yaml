@@ -1,0 +1,73 @@
+name: bringup_i2c0_100k_f1x0
+description: |
+  I2C0 bring-up at 100 kHz standard mode on the F1x0 family, no transfer. This is
+  M2 T6's config golden: runtime-hal's I2C timing + mode + enable writes reach the
+  same END STATE as the GD SPL i2c_clock_config / i2c_mode_addr_config / i2c_enable
+  / i2c_ack_config. The I2C block is classic event-based and IDENTICAL on both
+  families (CTL0/CTL1/SADDR0/STAT0/STAT1/CKCFG/RT), so the same vector runs on F10x
+  too (bringup_i2c0_100k_f10x); the only family difference is which RCU_CFG0 seed
+  the SPL's rcu_clock_freq_get(CK_APB1) reads, and both tomls seed the same 36 MHz
+  APB1 tree.
+
+  runtime-hal: I2c::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &I2cConfig{I2c0, 100_000, Two, 0x24}).
+    REFERENCE_72M_IRC8M = sysclk 72 MHz, AHB /1, APB1 /2 -> i2c_input_clock = 36 MHz.
+  GD SPL: i2c_clock_config(I2C0, 100000, I2C_DTCY_2);
+          i2c_mode_addr_config(I2C0, I2C_I2CMODE_ENABLE, I2C_ADDFORMAT_7BITS, 0x24);
+          i2c_enable(I2C0);
+          i2c_ack_config(I2C0, I2C_ACK_ENABLE).
+
+  The CKCFG value depends on the APB1 clock (the seeded 72 MHz tree -> 36 MHz), so a
+  clock-tree mistake surfaces here as a wrong timing value, the way M1's BAUD caught
+  a wrong USART clock. At 36 MHz / 100 kHz: I2CCLK = 36 (0x24), RT = 37 (0x25),
+  CKCFG = 180 (0xB4).
+
+  Silicon anchor (T13, NOT this task): the on-board IMU at 0x68 over hardware I2C0,
+  WHO_AM_I 0x75 -> 0x2E and 0x06/0x07 -> 0x19/0xf4, is a deferred bench pass; this
+  golden proves agreement-with-SPL config, not silicon.
+
+# Mode rationale: final_state (per-register final written value; reads ignored).
+# i2c_clock_config writes CKCFG with bare ORs from reset 0 (I2C_CKCFG |= CLKC, etc.)
+# and i2c_mode_addr_config / i2c_ack_config do clear-then-set RMWs on CTL0, so the
+# SPL emits a different write count/order than runtime-hal's field-scoped Reg32
+# modify/write. The correctness criterion is the END STATE of each register, which
+# final_state checks directly:
+#   CTL1   +0x04 : I2CCLK = 36                       0x00000024
+#   RT     +0x20 : RISETIME = 37                     0x00000025
+#   CKCFG  +0x1C : CLKC = 180 (standard, FAST/DTCY 0) 0x000000B4
+#   SADDR0 +0x08 : own-address register value (raw)  0x00000024
+#   CTL0   +0x00 : I2CEN(0) | ACKEN(10)              0x00000401
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_i2c.h, gd32f1x0_rcu.h]
+    body: |
+      i2c_clock_config(I2C0, 100000U, I2C_DTCY_2);
+      i2c_mode_addr_config(I2C0, I2C_I2CMODE_ENABLE, I2C_ADDFORMAT_7BITS, 0x24U);
+      i2c_enable(I2C0);
+      i2c_ack_config(I2C0, I2C_ACK_ENABLE);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::i2c::{FastDuty, I2c};
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::I2cConfig;
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::I2c0, 0x4000_5400);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          // The default 72 MHz tree: APB1 = 36 MHz, so i2c_input_clock = 36 MHz and
+          // the SPL formula yields I2CCLK = 0x24, RT = 0x25, CKCFG = 0xB4.
+          let cfg = I2cConfig { i2c: PeriphLabel::I2c0, scl: 0x16, sda: 0x17, speed_hz: 100_000,
+              duty: FastDuty::Two, own_addr: 0x24 };
+          let _ = I2c::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+      }

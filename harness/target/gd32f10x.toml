@@ -1,0 +1,233 @@
+# target/gd32f10x.toml — GD32F10x family (Cortex-M3: F103 etc.).
+#
+# GD-native vocabulary (matches runtime-hal's 0-indexed labels). Cross-checked
+# against runtime-hal src/{addr,clock,gpio,usart}.rs:
+#   addr.rs:  GPIO F10x = APB2 0x40010800 (0x400 stride, GPIOA..GPIOG); RCU =
+#             0x40021000; USART APB1 = 0x40004400 (USART1/+0x400 USART2/+0x800);
+#             USART APB2 (USART0) = 0x40013800. (APB bus bases identical to F1x0.)
+#   clock.rs: APB2EN 0x18, APB1EN 0x1C. (F10x GPIO ports + USART0 on APB2EN;
+#             USART1/2 on APB1EN. No AHBEN GPIO enables on F10x.)
+#   gpio.rs:  F10x CTL0 0x00, CTL1 0x04 (4-bit mode/cnf nibble per pin).
+#   usart.rs: F10x STAT 0x00, DATA 0x04, BAUD 0x08, CTL0 0x0C, CTL1 0x10, CTL2 0x14.
+
+arch         = "cortex-m3"
+unicorn_arch = "arm"
+unicorn_mode = "thumb"
+
+[[peripheral_ranges]]
+start = 0x40000000
+end   = 0x5FFFFFFF
+
+[[peripheral_ranges]]
+start = 0xE0000000
+end   = 0xE00FFFFF
+
+[peripheral_bases]
+RCU_BASE    = 0x40021000
+# FMC wait-state register block (AHB1 + 0xA000 on F10x = 0x40022000; same absolute base as F1x0).
+FMC_BASE    = 0x40022000
+USART0_BASE = 0x40013800
+USART1_BASE = 0x40004400
+USART2_BASE = 0x40004800
+# F10x GPIO ports on APB2 at 0x40010800, 0x400 stride.
+GPIOA_BASE  = 0x40010800
+GPIOB_BASE  = 0x40010C00
+GPIOC_BASE  = 0x40011000
+GPIOD_BASE  = 0x40011400
+GPIOE_BASE  = 0x40011800
+GPIOF_BASE  = 0x40011C00
+# M2 (T4/T5) cold-path peripheral bases. I2C on APB1; SPI0 on APB2; ADC0 on APB2.
+I2C0_BASE   = 0x40005400
+SPI0_BASE   = 0x40013000
+ADC0_BASE   = 0x40012400
+# M3 (T3) advanced timer: TIMER0 on APB2 (ST TIM1), the complementary-PWM bridge timer.
+TIMER0_BASE = 0x40012C00
+
+[register_names.RCU_BASE]
+"0x00" = "CTL"
+"0x04" = "CFG0"
+"0x18" = "APB2EN"
+"0x1C" = "APB1EN"
+
+# FMC wait-state register: FMC_WS at offset 0x00 (WSCNT in bits 0..2).
+[register_names.FMC_BASE]
+"0x00" = "WS"
+
+[register_names.GPIOA_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+
+[register_names.GPIOB_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+
+[register_names.GPIOC_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+
+[register_names.GPIOD_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+
+[register_names.GPIOE_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+
+[register_names.GPIOF_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+
+[register_names.USART0_BASE]
+"0x00" = "STAT"
+"0x04" = "DATA"
+"0x08" = "BAUD"
+"0x0C" = "CTL0"
+"0x10" = "CTL1"
+"0x14" = "CTL2"
+
+[register_names.USART1_BASE]
+"0x00" = "STAT"
+"0x04" = "DATA"
+"0x08" = "BAUD"
+"0x0C" = "CTL0"
+"0x10" = "CTL1"
+"0x14" = "CTL2"
+
+[register_names.USART2_BASE]
+"0x00" = "STAT"
+"0x04" = "DATA"
+"0x08" = "BAUD"
+"0x0C" = "CTL0"
+"0x10" = "CTL1"
+"0x14" = "CTL2"
+
+# I2C0 register block (M2 T6/T7). The classic event-based block is identical on both families:
+# CTL0 0x00, CTL1 0x04 (I2CCLK), SADDR0 0x08, DATA 0x10, STAT0 0x14, STAT1 0x18, CKCFG 0x1C, RT 0x20.
+[register_names.I2C0_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+"0x08" = "SADDR0"
+"0x10" = "DATA"
+"0x14" = "STAT0"
+"0x18" = "STAT1"
+"0x1C" = "CKCFG"
+"0x20" = "RT"
+
+# SPI0 register block (M2 T8/T9). The SPI block is identical on both families:
+# CTL0 0x00 (CKPH/CKPL/MSTMOD/PSC/SPIEN/LF/SWNSS/SWNSSEN/FF16), CTL1 0x04, STAT 0x08
+# (RBNE/TBE/CONFERR/RXORERR/TRANS), DATA 0x0C, I2SCTL 0x1C (I2SSEL).
+[register_names.SPI0_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+"0x08" = "STAT"
+"0x0C" = "DATA"
+"0x1C" = "I2SCTL"
+
+# ADC0 register block (M2 T10/T11; M3 T8 injected). Identical on both families (gd32f10x_adc.h /
+# gd32f1x0_adc.h): STAT 0x00 (EOC bit 1, EOIC bit 2), CTL0 0x04 (SM bit 8, EOICIE bit 7), CTL1 0x08
+# (ADCON/CTN/CLB/RSTCLB/DAL/ETSRC/ETERC/SWRCST/TSVREN + injected ETSIC[14:12]/ETEIC bit 15),
+# SAMPT0 0x0C (ch10..17), SAMPT1 0x10 (ch0..9), RSQ0 0x2C (RL + ranks 12..15), RSQ1 0x30 (ranks
+# 6..11), RSQ2 0x34 (ranks 0..5), ISQ 0x38 (injected sequence IL[21:20] + channel fields),
+# IDATA0..3 0x3C/0x40/0x44/0x48 (injected data), RDATA 0x4C (regular data).
+[register_names.ADC0_BASE]
+"0x00" = "STAT"
+"0x04" = "CTL0"
+"0x08" = "CTL1"
+"0x0C" = "SAMPT0"
+"0x10" = "SAMPT1"
+"0x2C" = "RSQ0"
+"0x30" = "RSQ1"
+"0x34" = "RSQ2"
+"0x38" = "ISQ"
+"0x3C" = "IDATA0"
+"0x40" = "IDATA1"
+"0x44" = "IDATA2"
+"0x48" = "IDATA3"
+"0x4C" = "RDATA"
+
+[reset_values.RCU_BASE]
+"0x18" = "0x00000000"
+"0x1C" = "0x00000000"
+# RCU_CFG0 (0x04): seeded so the SPL's rcu_clock_freq_get reproduces the proven
+# 72 MHz tree WITHOUT executing SystemInit, keeping the usart vector scoped to
+# usart writes (plan Task 10 / M1 open item 2). Identical decode to F1x0:
+#   SWS(2:3)=2 (SEL_PLL), AHBPSC(4:7)=0 (/1), APB1PSC(8:10)=4 (/2),
+#   PLLSEL(16)=1 (HXTAL src), PLLMF(18:21)=7 (x9). HXTAL_VALUE=8MHz default.
+#   => CK_SYS=72MHz, AHB=72MHz, CK_APB1=36MHz; BAUD(USART1@115200)=0x139.
+"0x04" = "0x001D0408"
+
+[reset_values.GPIOA_BASE]
+"0x00" = "0x44444444"
+"0x04" = "0x44444444"
+
+[reset_values.GPIOB_BASE]
+"0x00" = "0x44444444"
+"0x04" = "0x44444444"
+
+[reset_values.USART1_BASE]
+"0x00" = "0x00000000"
+"0x0C" = "0x00000000"
+"0x10" = "0x00000000"
+
+# I2C0 registers reset to 0 (the bits these paths set/RMW start clear, so both oracles start equal).
+[reset_values.I2C0_BASE]
+"0x00" = "0x00000000"
+"0x04" = "0x00000000"
+"0x08" = "0x00000000"
+"0x14" = "0x00000000"
+"0x1C" = "0x00000000"
+"0x20" = "0x00000000"
+
+# SPI0 registers reset to 0 (CTL0/I2SCTL start clear; spi_init masks CTL0 with SPI_INIT_MASK and
+# clears I2SCTL I2SSEL from 0, so both oracles read the identical seed). STAT reset value is
+# irrelevant to the config golden (only the transfer reads it).
+[reset_values.SPI0_BASE]
+"0x00" = "0x00000000"
+"0x08" = "0x00000000"
+"0x1C" = "0x00000000"
+
+# ADC0 registers reset to 0 (CTL0/CTL1/SAMPT/RSQ start clear; the config golden's RMWs read 0 on
+# both oracles). STAT/RDATA reset is irrelevant to the config golden (only the transfer reads them);
+# the transfer with_polling vector scripts STAT EOC + RDATA via read_responses.
+[reset_values.ADC0_BASE]
+"0x00" = "0x00000000"
+"0x04" = "0x00000000"
+"0x08" = "0x00000000"
+"0x0C" = "0x00000000"
+"0x10" = "0x00000000"
+"0x2C" = "0x00000000"
+"0x30" = "0x00000000"
+"0x34" = "0x00000000"
+"0x38" = "0x00000000"
+
+# TIMER0 advanced-timer register block (M3 T3/T4). Identical on both families
+# (gd32f10x_timer.h / gd32f1x0_timer.h): CTL0 0x00, CTL1 0x04, SWEVG 0x14,
+# CHCTL0 0x18, CHCTL1 0x1C, CHCTL2 0x20, PSC 0x28, CAR 0x2C, CREP 0x30,
+# CH0CV 0x34 / CH1CV 0x38 / CH2CV 0x3C / CH3CV 0x40, CCHP 0x44 (DTCFG + break +
+# off-state + MOE/POEN bit 15).
+[register_names.TIMER0_BASE]
+"0x00" = "CTL0"
+"0x04" = "CTL1"
+"0x14" = "SWEVG"
+"0x18" = "CHCTL0"
+"0x1C" = "CHCTL1"
+"0x20" = "CHCTL2"
+"0x28" = "PSC"
+"0x2C" = "CAR"
+"0x30" = "CREP"
+"0x34" = "CH0CV"
+"0x38" = "CH1CV"
+"0x3C" = "CH2CV"
+"0x40" = "CH3CV"
+"0x44" = "CCHP"
+
+# TIMER0 registers reset to 0 (CTL0/CTL1/CHCTL0/CHCTL1/CHCTL2/CCHP start clear; the config golden's
+# RMWs read 0 on both oracles). PSC/CAR/CREP/CHxCV are written directly. final_state mode (the SPL
+# builds the registers with masked |=/&= pairs in a different write count/order than runtime-hal).
+[reset_values.TIMER0_BASE]
+"0x00" = "0x00000000"
+"0x04" = "0x00000000"
+"0x18" = "0x00000000"
+"0x1C" = "0x00000000"
+"0x20" = "0x00000000"
+"0x44" = "0x00000000"

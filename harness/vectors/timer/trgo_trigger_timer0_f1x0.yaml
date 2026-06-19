@@ -1,0 +1,52 @@
+name: trgo_trigger_timer0_f1x0
+description: |
+  Advanced-timer TIMER0 ADC-trigger config (M3 T6) on the F1x0 family: CH3 configured as the
+  output-compare ADC-trigger channel (PWM mode 0 + compare shadow + the trigger compare value near
+  the up-count top, ~CAR-1 = 2249) and the CR2/CTL1 master-mode TRGO selection = UPDATE event. This
+  is the timer HALF of the timer->ADC injected coupling (the ADC half is inject_bringup_adc0); the
+  cross-peripheral trigger-matrix invariant is asserted in test_timer.py against this + the ADC
+  vector once both land.
+
+  CH3 is NOT a bridge phase output: its compare match is the injected ADC's external trigger. It is
+  programmed as a compare channel (mode + shadow + CV) but its output (CH3EN) is left OFF (the
+  internal trigger event needs no pin), so this vector does NOT touch CHCTL2. The TRGO master mode is
+  set to UPDATE (the reference's coexisting expression, HP-5).
+
+  runtime-hal: PwmTimer::at(TIMER0_BASE).configure_trigger(2249, Pwm0, false, Update). Programs CH3 PWM0 (CHCTL1[14:12]),
+    CH3 compare shadow (CHCTL1 bit 11), CH3CV = 2249, and CTL1 MMC = UPDATE (2<<4).
+  GD SPL: timer_channel_output_mode_config(TIMER0, TIMER_CH_3, TIMER_OC_MODE_PWM0);
+          timer_channel_output_shadow_config(TIMER0, TIMER_CH_3, TIMER_OC_SHADOW_ENABLE);
+          timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_3, 2249U);
+          timer_master_output_trigger_source_select(TIMER0, TIMER_TRI_OUT_SRC_UPDATE);
+
+  The advanced-timer register block is IDENTICAL on both families (same offsets / bit positions), so
+  the same vector runs on F10x (trgo_trigger_timer0_f10x); only the SPL family build differs.
+
+# Mode rationale: final_state (per-register final written value; reads ignored). The end state:
+#   CHCTL1 +0x1C : CH3 PWM0 (0x6<<12=0x6000) | CH3 shadow (bit 11 = 0x800)  0x00006800
+#   CH3CV  +0x40 : trigger compare 2249                                     0x000008C9
+#   CTL1   +0x04 : MMC = UPDATE (2<<4)                                      0x00000020
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_timer.h]
+    body: |
+      timer_channel_output_mode_config(TIMER0, TIMER_CH_3, TIMER_OC_MODE_PWM0);
+      timer_channel_output_shadow_config(TIMER0, TIMER_CH_3, TIMER_OC_SHADOW_ENABLE);
+      timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_3, 2249U);
+      timer_master_output_trigger_source_select(TIMER0, TIMER_TRI_OUT_SRC_UPDATE);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::timer::PwmTimer;
+      use runtime_hal::config::{OcMode, TrgoSource};
+
+      const TIMER0_BASE: u32 = 0x4001_2C00;
+
+      pub fn body() {
+          // The T6 trigger-output step: CH3 compare channel (~CAR-1) + the TRGO master-mode select.
+          // oc_mode=Pwm0, ch_enable=false (does NOT touch CHCTL2), trgo=Update reproduce the old baked
+          // constants, so the trace is identical.
+          PwmTimer::at(TIMER0_BASE).configure_trigger(2249, OcMode::Pwm0, false, TrgoSource::Update);
+      }

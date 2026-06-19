@@ -1,0 +1,133 @@
+name: pwm_bringup_timer0_f1x0
+description: |
+  Advanced-timer TIMER0 complementary-PWM bring-up (M3 T3 + T4) on the F1x0 family: center-aligned
+  PWM, three complementary channel pairs, dead-time, polarity/idle, break (disabled), with MOE OFF.
+  This is the M3 T3/T4 config golden: runtime-hal's TIMER0 PSC/CAR/CKDIV/CHCTL/CHCTL2/CTL1/CCHP
+  writes reach the same END STATE as the GD SPL timer_init / timer_channel_output_config /
+  timer_channel_output_mode_config / timer_channel_output_shadow_config /
+  timer_channel_output_pulse_value_config / timer_auto_reload_shadow_enable / timer_break_config
+  recipe. The advanced-timer register block is IDENTICAL on both families (same offsets, same bit
+  positions, verified against gd32f1x0_timer.h / gd32f10x_timer.h), so the same vector runs on F10x
+  too (pwm_bringup_timer0_f10x); the only difference is the SPL family build.
+
+  Reference config (the RoboDurden / hoverboard bridge): PSC = 0, CAR/ARR = 2250, clock-division /2
+  (~16 kHz at 72 MHz), three pairs high CH0/1/2 + low CH0N/1N/2N, inverted low-side polarity, safe
+  HIGH idle, dead-time 0x1C, break DISABLED. CH3 (the ADC trigger) is T6, NOT touched here.
+
+  runtime-hal: PwmTimer::configure(TIMER0_BASE, &wiring) where wiring = period 2250, prescaler 0,
+    dead_time 0x1C, three channels with polarity=true (invert low side) + idle=true (safe HIGH),
+    break disabled. configure() programs the time base (PSC/CAR/CKDIV center-up), the three PWM-mode
+    compare channels (PWM0 + compare shadow + zero initial duty + complementary enable + polarity +
+    idle), ARSE, then the CCHP dead-time/off-state/break word, and LEAVES MOE OFF (no
+    timer_primary_output_config). MOE is the ArmGate's, never this path (DECISIONS.md #4 + SAFETY).
+  GD SPL: timer_init(CENTER_UP, CKDIV_DIV2, PSC 0, CAR 2250, CREP 0); per phase channel
+    timer_channel_output_config(EN | NEN, ocpolarity HIGH, ocnpolarity LOW, idle HIGH) +
+    timer_channel_output_mode_config(PWM_MODE0) + timer_channel_output_shadow_config(ENABLE) +
+    timer_channel_output_pulse_value_config(0); timer_auto_reload_shadow_enable;
+    timer_break_config(deadtime 0x1C, ROS_ENABLE, IOS_ENABLE, break DISABLE). NO
+    timer_primary_output_config (MOE stays OFF, the bridge disarmed).
+
+  Silicon checks (T10, NOT this task, bridge UNPOWERED): the complementary edges + measured
+  dead-time on a scope, MOE arming/disarming cleanly. This golden proves agreement-with-SPL config
+  (width-strict: a 16-vs-32-bit CHxCV slip or a wrong dead-time encoding diffs), not silicon edges.
+
+# Mode rationale: final_state (per-register final written value; reads ignored). The SPL builds
+# CTL0/CHCTL0/CHCTL1/CHCTL2/CTL1 with many masked |= / &= pairs (timer_init clears DIR|CAM then ORs;
+# timer_channel_output_config does per-bit clear-then-set) in a different write count/order than
+# runtime-hal's field-scoped Reg32 modify; the correctness criterion is the END STATE of each
+# register, which final_state checks directly:
+#   PSC    +0x28 : prescaler 0                                            0x00000000
+#   CTL0   +0x00 : CAM center-up (0x40) | CKDIV/2 (0x100) | ARSE (0x80)   0x000001C0
+#   CAR    +0x2C : period 2250                                            0x000008CA
+#   CREP   +0x30 : repetition 0                                           0x00000000
+#   SWEVG  +0x14 : UPG (update-event generate)                           0x00000001
+#   CHCTL0 +0x18 : CH0 + CH1 PWM0 (0x60) | compare-shadow (0x08), MS 0    0x00006868
+#   CHCTL1 +0x1C : CH2 PWM0 | shadow (low byte); CH3 untouched            0x00000068
+#   CHCTL2 +0x20 : three pairs EN(0)|NEN(2)|NP_LOW(3) = 0xD per channel   0x00000DDD
+#   CTL1   +0x04 : ISO0/0N..ISO2/2N HIGH (safe idle)                      0x00003F00
+#   CH0CV  +0x34 : initial duty 0                                         0x00000000
+#   CH1CV  +0x38 : initial duty 0                                         0x00000000
+#   CH2CV  +0x3C : initial duty 0                                         0x00000000
+#   CCHP   +0x44 : DTCFG 0x1C | ROS (0x800) | IOS (0x400), break+MOE OFF  0x00000C1C
+mode: final_state
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_timer.h, gd32f1x0_rcu.h]
+    body: |
+      timer_parameter_struct tp;
+      tp.prescaler        = 0U;
+      tp.alignedmode      = TIMER_COUNTER_CENTER_UP;
+      tp.counterdirection = TIMER_COUNTER_UP;
+      tp.clockdivision    = TIMER_CKDIV_DIV2;
+      tp.period           = 2250U;
+      tp.repetitioncounter= 0U;
+      timer_init(TIMER0, &tp);
+
+      timer_oc_parameter_struct oc;
+      oc.outputstate  = TIMER_CCX_ENABLE;
+      oc.outputnstate = TIMER_CCXN_ENABLE;
+      oc.ocpolarity   = TIMER_OC_POLARITY_HIGH;
+      oc.ocnpolarity  = TIMER_OCN_POLARITY_LOW;   /* inverted low side */
+      oc.ocidlestate  = TIMER_OC_IDLE_STATE_HIGH; /* safe idle */
+      oc.ocnidlestate = TIMER_OCN_IDLE_STATE_HIGH;
+
+      timer_channel_output_config(TIMER0, TIMER_CH_0, &oc);
+      timer_channel_output_mode_config(TIMER0, TIMER_CH_0, TIMER_OC_MODE_PWM0);
+      timer_channel_output_shadow_config(TIMER0, TIMER_CH_0, TIMER_OC_SHADOW_ENABLE);
+      timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_0, 0U);
+
+      timer_channel_output_config(TIMER0, TIMER_CH_1, &oc);
+      timer_channel_output_mode_config(TIMER0, TIMER_CH_1, TIMER_OC_MODE_PWM0);
+      timer_channel_output_shadow_config(TIMER0, TIMER_CH_1, TIMER_OC_SHADOW_ENABLE);
+      timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_1, 0U);
+
+      timer_channel_output_config(TIMER0, TIMER_CH_2, &oc);
+      timer_channel_output_mode_config(TIMER0, TIMER_CH_2, TIMER_OC_MODE_PWM0);
+      timer_channel_output_shadow_config(TIMER0, TIMER_CH_2, TIMER_OC_SHADOW_ENABLE);
+      timer_channel_output_pulse_value_config(TIMER0, TIMER_CH_2, 0U);
+
+      timer_auto_reload_shadow_enable(TIMER0);
+
+      timer_break_parameter_struct bp;
+      bp.runoffstate     = TIMER_ROS_STATE_ENABLE;
+      bp.ideloffstate    = TIMER_IOS_STATE_ENABLE;
+      bp.deadtime        = 0x1CU;
+      bp.breakpolarity   = TIMER_BREAK_POLARITY_LOW;
+      bp.outputautostate = TIMER_OUTAUTO_DISABLE;
+      bp.protectmode     = TIMER_CCHP_PROT_OFF;
+      bp.breakstate      = TIMER_BREAK_DISABLE;
+      timer_break_config(TIMER0, &bp);
+      /* NO timer_primary_output_config: MOE stays OFF (the bridge is disarmed). */
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::timer::PwmTimer;
+      use runtime_hal::config::{BreakConfig, PwmChannelConfig, PwmConfig, PwmAlign, OcMode, ClockDiv, TrgoSource};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let ch = |high: u8, low: u8| PwmChannelConfig { high, low, polarity: true, idle_high: true, idle_high_n: true };
+          let cfg = PwmConfig {
+              timer: PeriphLabel::Timer0,
+              channels: [ch(0x08, 0x1D), ch(0x09, 0x1E), ch(0x0A, 0x1F)],
+              period: 2250, prescaler: 0, dead_time: 0x1C,
+              brk: BreakConfig { enabled: false, level: false },
+              trigger_compare: 2249,
+              align: PwmAlign::Center2, arse: true, trigger_oc_mode: OcMode::Pwm0,
+              trigger_ch_enable: false, crep: 0, ckdiv: ClockDiv::Div2, trgo_src: TrgoSource::Update,
+          };
+          // Bring up the complementary bridge with MOE OFF. The compare offsets resolve into the
+          // returned PwmHandle (T5); the MOE gate is a separate ArmGate, not touched here.
+          let _ = PwmTimer::configure(&chip(), &cfg).unwrap();
+      }

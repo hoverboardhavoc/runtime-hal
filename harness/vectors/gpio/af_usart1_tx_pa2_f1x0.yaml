@@ -1,0 +1,48 @@
+name: af_usart1_tx_pa2_f1x0
+description: |
+  GPIO alternate-function config for PA2 = USART1 TX at AF1 on the F1x0
+  (ahb_ctl_afsel) GPIO model. The thinnest end-to-end slice: pure writes, no
+  polling, no clock bring-up. Exercises the vendored SPL build, the runtime-hal
+  Rust-snippet build, the MMIO hooks, reset-value seeding (the RMWs read first),
+  symbol-keying, width-strictness, and the ordered diff.
+
+  runtime-hal: a single configure_af(GPIOA_BASE, AhbCtlAfsel, 2, Tx) call.
+  GD SPL: gpio_mode_set + gpio_af_set + gpio_output_options_set for PA2.
+
+# Mode rationale: register_writes (ordered writes, reads ignored). The two
+# implementations agree on every meaningful write in value, width, and order:
+#   W4 CTL=0x20, W4 PUD=0x00, W4 AFSEL0=0x100, W4 OMODE=0x00, W4 OSPD=0x30.
+# The ONLY difference is that the SPL's gpio_af_set unconditionally rewrites BOTH
+# AFSEL halves (its loop touches AFSEL0 and AFSEL1), so the SPL emits an extra
+# `W4 AFSEL1 0x00` which is a no-op rewrite of AFSEL1's reset value. runtime-hal
+# correctly writes only AFSEL0 (the half holding pin 2). Both leave AFSEL1 = 0,
+# so end-state is identical; the SPL write is redundant, not a runtime-hal bug.
+# We `ignore` AFSEL1 (GPIOA_BASE+0x24) so register_writes compares the meaningful
+# ordered writes and matches cleanly. (final_state would also need this ignore,
+# since it keys per written address and the SPL writes AFSEL1 while runtime-hal
+# does not.)
+mode: register_writes
+
+ignore:
+  - "<GPIOA_BASE>+0x24"   # AFSEL1: SPL no-op rewrite; runtime-hal skips it (both leave it 0)
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_gpio.h]
+    body: |
+      gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_2);
+      gpio_af_set(GPIOA, GPIO_AF_1, GPIO_PIN_2);
+      gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::descriptor::GpioPath;
+      use runtime_hal::gpio::{configure_af, PinRole};
+
+      // Base equals the target file's GPIOA_BASE so symbols resolve to the
+      // golden's addresses.
+      const GPIOA_BASE: u32 = 0x4800_0000;
+
+      pub fn body() {
+          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 2, PinRole::Tx);
+      }

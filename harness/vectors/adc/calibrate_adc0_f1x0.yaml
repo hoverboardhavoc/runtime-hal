@@ -1,0 +1,63 @@
+name: calibrate_adc0_f1x0
+description: |
+  ADC calibration transfer-sequencing golden (M2 T10, with_polling) on the F1x0
+  family: the calibration POLL LOOPS of Adc::calibrate traced with read_responses
+  stubbing the CTL1 calibration-done bits (RSTCLB then CLB) busy -> done, so the
+  loops terminate and the ordered reads + writes trace. This is the calibration
+  with_polling segment the milestone asks for: it asserts runtime-hal spins on the
+  calibration-done bit (busy -> done) rather than proceeding blindly. A dropped poll
+  (proceeding before the bit clears) is the F130 hang-if-done-wrong class; the
+  planted-bug self-test catches it (test_selftest.py dropped-poll mutation on this
+  vector).
+
+  Like the clock-tree polling vector and the I2C/SPI transfer vectors, this is a
+  HARNESS self-test of runtime-hal's poll behaviour (driven from pytest with and
+  without the stub), not a two-oracle compare: the SPL adc_calibration_enable polls
+  the same two bits in the same order, but an ordered read+write diff against the SPL
+  would diverge on coding style, not on whether the polls happen. The two-oracle
+  END-STATE config agreement is proven by bringup_adc0_vrefint_f1x0. The ADC block is
+  identical on both families, so calibrate_adc0_f10x carries the same body + stub.
+
+  runtime-hal: Adc::at(ADC0_BASE).calibrate(). Sequence (the SPL adc_calibration_enable
+  order): set CTL1 RSTCLB -> poll CTL1 until RSTCLB clears -> set CTL1 CLB -> poll
+  CTL1 until CLB clears.
+
+  SEED PROVENANCE / re-seed flag (the ADC analogue of the I2C / SPI / CLOCK-1 seeds):
+  the CTL1 stub sequence below is SPL-DERIVED -- it is the calibration-done bits the
+  SPL / runtime-hal poll, in the order they poll them (RSTCLB busy -> done, then CLB
+  busy -> done), NOT a silicon capture. It must be RE-SEEDED from a real CTL1 read-back
+  captured over SWD during the on-silicon VREFINT/temperature bring-up in T13, the
+  same way the I2C handshake, SPI STAT, and clock poll stubs are to be re-seeded.
+  Until then this proves agreement-with-the-SPL-sequence, not silicon flag values.
+
+# with_polling: ordered reads + writes; a dropped poll is a failure (not just a wrong
+# value). The pytest drives extraction directly (stub vs no-stub).
+mode: with_polling
+
+# CTL1 (0x08) reads, in order, across calibrate() (REPLACE form, each read returns the
+# next scalar; the last sticks):
+#   R1 modify-read before setting RSTCLB         0x00000000 (nothing yet)
+#   R2 wait_clear(RSTCLB) iter 1: RSTCLB set     0x00000008 (busy)
+#   R3 wait_clear(RSTCLB) iter 2: RSTCLB clear   0x00000000 (done)
+#   R4 modify-read before setting CLB            0x00000000
+#   R5 wait_clear(CLB) iter 1: CLB set           0x00000004 (busy)
+#   R6 wait_clear(CLB) iter 2: CLB clear         0x00000000 (done)
+read_responses:
+  "<ADC0_BASE>+0x08": [0x00000000, 0x00000008, 0x00000000, 0x00000000, 0x00000004, 0x00000000]
+
+reset_overrides:
+  "<ADC0_BASE>+0x08": 0x00000000
+
+implementations:
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::adc::Adc;
+
+      const ADC0_BASE: u32 = 0x4001_2400;
+
+      pub fn body() {
+          // calibrate() alone (a bare handle, no configure noise): set RSTCLB, poll it clear, set
+          // CLB, poll it clear. This is exactly the SPL adc_calibration_enable sequence; the
+          // with_polling stub scripts the two done bits busy -> done so the bounded poll exits.
+          let _ = Adc::at(ADC0_BASE).calibrate();
+      }
