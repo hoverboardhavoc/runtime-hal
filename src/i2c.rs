@@ -257,7 +257,7 @@ impl I2c {
     ///    enabled when the chip handed back the [`crate::gpio::GpioPort`] the pins were split from
     ///    (the `split(&mut rcc)` clock-enable lives in `chip.gpiob()`), so it is not re-enabled here.
     /// 3. Configure both pins as AF open-drain with pull-up ([`PinRole::I2cAfOpenDrain`]) via
-    ///    [`configure_af`], which owns the F10x/F1x0 register-model branch internally (PB6/PB7 at
+    ///    `configure_af`, which owns the F10x/F1x0 register-model branch internally (PB6/PB7 at
     ///    AF1 on F1x0, AF-OD nibble on F10x: the bench-validated mux).
     /// 4. Program the timing from `clock` + `mode` and enable the peripheral + ACK (the SPL
     ///    `i2c_clock_config` -> `i2c_mode_addr_config` -> `i2c_enable` -> `i2c_ack_config` sequence).

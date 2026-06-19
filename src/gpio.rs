@@ -151,7 +151,7 @@ pub enum PinRole {
     /// number happens to equal the advanced-timer gate's AF2 (they share the AF group), but this is
     /// a distinct role so the general-PWM path documents its own routing. On F10x the AF is implied
     /// by the AF-push-pull nibble (0xB), and TIMER1's channels reach PB3 only through the AFIO
-    /// `TIMER1_REMAP` field (see [`remap_timer1_partial1`]); the per-pin AF mux does not exist there.
+    /// `TIMER1_REMAP` field (see `remap_timer1_partial1`); the per-pin AF mux does not exist there.
     GenTimerAfPushPull,
 }
 
@@ -230,7 +230,7 @@ impl PinRole {
 /// `port_base` is the resolved base of the pin's port (from the address table). `pin` is the
 /// logical `(port << 4) | pin` byte; only the low nibble (pin number 0..15) is used here, the port
 /// having already been resolved to `port_base`.
-pub fn configure_af(port_base: u32, path: GpioPath, pin: u8, role: PinRole) {
+pub(crate) fn configure_af(port_base: u32, path: GpioPath, pin: u8, role: PinRole) {
     let n = (pin & 0x0F) as u32;
     let cfg = role.config();
     match path {
@@ -352,7 +352,7 @@ const F10X_PCF0_TIMER1_REMAP_PARTIAL1: u32 = 0b01 << 8;
 /// `TIMER1_CH0` onto PA15), by writing the `TIMER1_REMAP[1:0]` field of `AFIO_PCF0` to `01`.
 ///
 /// This is the F10x half of the G3 general-timer routing (the F1x0 routes purely through the per-pin
-/// `AFSEL` mux in [`configure_af`], so this primitive does NOT exist for the F1x0 and is never called
+/// `AFSEL` mux in `configure_af`, so this primitive does NOT exist for the F1x0 and is never called
 /// there). The AFIO peripheral clock MUST be enabled before `AFIO_PCF0` is written; on F10x
 /// [`crate::Chip::free_jtag_pins`] already sets `RCU_APB2EN.AFIOEN`, and the G3 routing calls it
 /// (to free PB3 = JTDO) before this, so the clock is on. `rcu_base` is accepted so this can enable
@@ -368,7 +368,7 @@ const F10X_PCF0_TIMER1_REMAP_PARTIAL1: u32 = 0b01 << 8;
 /// value `01` = partial remap 1 = `TIMER1_CH1 / PB3`. (TIMER1 remap is not available on a 36-pin
 /// package; the bench parts are 48-pin C8, so PB3 is reachable. TIMER2 remap by contrast needs a
 /// 64/100/144-pin package, which is why the G3 target is TIMER1, not TIMER2.)
-pub fn remap_timer1_partial1(rcu_base: u32) {
+pub(crate) fn remap_timer1_partial1(rcu_base: u32) {
     // Ensure the AFIO peripheral clock is on (RCU_APB2EN.AFIOEN, bit 0) before touching AFIO_PCF0.
     // Idempotent RMW: harmless if free_jtag_pins already enabled it.
     const RCU_APB2EN_OFFSET: u32 = 0x18;
@@ -397,9 +397,9 @@ pub(crate) enum InputPull {
 
 /// Configure a logical pin as a general-purpose digital input with the given [`InputPull`].
 ///
-/// The input counterpart to [`configure_output`]: it owns the F10x/F1x0 register-model branch
-/// internally so callers never see the [`GpioPath`] split (the same standard [`configure_output`]
-/// and [`configure_af`] hold). `port_base` is the resolved base of the pin's port; `pin` is the
+/// The input counterpart to `configure_output`: it owns the F10x/F1x0 register-model branch
+/// internally so callers never see the [`GpioPath`] split (the same standard `configure_output`
+/// and `configure_af` hold). `port_base` is the resolved base of the pin's port; `pin` is the
 /// logical `(port << 4) | pin` byte, only the low nibble (pin number 0..15) is used.
 ///
 /// - F10x (CRL/CRH): a floating input is the nibble CNF `0b01` / MODE `0b00` = `0x4`; an input with
@@ -473,7 +473,7 @@ fn configure_input_f1x0(port_base: u32, n: u32, pull: InputPull) {
 /// offsets the hot-path hall reader uses), so callers never see the [`GpioPath`] split. Returns
 /// `true` if the pin reads high. `port_base` is the resolved port base; only `pin`'s low nibble is
 /// used.
-pub fn read_pin(port_base: u32, path: GpioPath, pin: u8) -> bool {
+pub(crate) fn read_pin(port_base: u32, path: GpioPath, pin: u8) -> bool {
     let n = (pin & 0x0F) as u32;
     let istat = match path {
         GpioPath::ApbCrlCrh => F10X_ISTAT,
@@ -486,8 +486,8 @@ pub fn read_pin(port_base: u32, path: GpioPath, pin: u8) -> bool {
 
 /// Configure a logical pin as a general-purpose push-pull output, 50 MHz.
 ///
-/// The plain-output counterpart to [`configure_af`]: it owns the F10x/F1x0 register-model branch
-/// internally so callers never see the [`GpioPath`] split (the same way [`configure_af`] hides it
+/// The plain-output counterpart to `configure_af`: it owns the F10x/F1x0 register-model branch
+/// internally so callers never see the [`GpioPath`] split (the same way `configure_af` hides it
 /// for alternate-function pins). `port_base` is the resolved base of the pin's port (from the
 /// address table); `pin` is the logical `(port << 4) | pin` byte, only the low nibble (pin number
 /// 0..15) is used here, the port having already been resolved to `port_base`.
@@ -496,7 +496,7 @@ pub fn read_pin(port_base: u32, path: GpioPath, pin: u8) -> bool {
 ///   50 MHz (MODE = `0b11`) -> `0x3` (`gd32f10x_gpio.c::gpio_init`).
 /// - F1x0 (CTL/OMODE/OSPD): `CTL` = output mode (`1`), `OMODE` = push-pull (`0`), `OSPD` = 50 MHz
 ///   (`3`) (`gd32f1x0_gpio.c`).
-pub fn configure_output(port_base: u32, path: GpioPath, pin: u8) {
+pub(crate) fn configure_output(port_base: u32, path: GpioPath, pin: u8) {
     let n = (pin & 0x0F) as u32;
     match path {
         GpioPath::ApbCrlCrh => configure_output_f10x(port_base, n),
@@ -543,7 +543,7 @@ fn configure_output_f1x0(port_base: u32, n: u32) {
 /// sets the pin, `1 << (pin + 16)` resets it, no read-modify-write. This owns the family offset
 /// branch internally (F10x `BOP` at `0x10`, F1x0 `BOP` at `0x18`), so callers never see the
 /// [`GpioPath`] split. `port_base` is the resolved port base; only `pin`'s low nibble is used.
-pub fn set_pin(port_base: u32, path: GpioPath, pin: u8, high: bool) {
+pub(crate) fn set_pin(port_base: u32, path: GpioPath, pin: u8, high: bool) {
     let n = (pin & 0x0F) as u32;
     let bop = match path {
         GpioPath::ApbCrlCrh => F10X_BOP,
@@ -558,12 +558,12 @@ pub fn set_pin(port_base: u32, path: GpioPath, pin: u8, high: bool) {
 /// This is the headline output API: application code drives the pin through the standard
 /// `embedded-hal` trait and never touches the [`GpioPath`] split or a raw register base. Build one
 /// with [`crate::Chip::output_pin`] (which resolves the port base from the chip's address table and
-/// configures the pin via [`configure_output`]), then call [`embedded_hal::digital::OutputPin::set_high`]
+/// configures the pin via `configure_output`), then call [`embedded_hal::digital::OutputPin::set_high`]
 /// / [`embedded_hal::digital::OutputPin::set_low`].
 ///
 /// The handle is `Copy` and carries no ownership: it holds the resolved port base, the chip's
 /// [`GpioPath`], and the logical pin byte. Driving the pin is the single atomic `GPIO_BOP` write of
-/// [`set_pin`], so it is infallible (the [`embedded_hal::digital::ErrorType::Error`] is
+/// `set_pin`, so it is infallible (the [`embedded_hal::digital::ErrorType::Error`] is
 /// [`core::convert::Infallible`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpioOutput {
@@ -580,9 +580,9 @@ impl GpioOutput {
     ///
     /// `port_base` is the resolved port base, `path` the chip's GPIO register-model selector, and
     /// `pin` the logical `(port << 4) | pin` byte. This does NOT configure the pin: callers go
-    /// through [`crate::Chip::output_pin`], which configures it with [`configure_output`] first.
+    /// through [`crate::Chip::output_pin`], which configures it with `configure_output` first.
     #[inline]
-    pub const fn new(port_base: u32, path: GpioPath, pin: u8) -> Self {
+    pub(crate) const fn new(port_base: u32, path: GpioPath, pin: u8) -> Self {
         Self {
             port_base,
             path,
@@ -715,7 +715,7 @@ impl<MODE> Pin<MODE> {
     /// The resolved base address of this pin's port (HAL-internal).
     ///
     /// Used by peripheral bring-ups that CONSUME `Pin` handles (e.g. [`crate::i2c::I2c::new`]) to
-    /// drive [`configure_af`] without exposing the [`GpioPath`] register model to the application.
+    /// drive `configure_af` without exposing the [`GpioPath`] register model to the application.
     #[inline]
     pub(crate) const fn port_base(&self) -> u32 {
         self.port_base
@@ -730,7 +730,7 @@ impl<MODE> Pin<MODE> {
 
     /// Reconfigure this pin as a general-purpose push-pull output, consuming the old typed value.
     ///
-    /// Drives the existing [`configure_output`] (which owns the F10x CRL/CRH vs F1x0
+    /// Drives the existing `configure_output` (which owns the F10x CRL/CRH vs F1x0
     /// CTL/OMODE/OSPD branch internally), so NO config-register handle is passed by the caller
     /// (the difference from stm32f1xx-hal's `into_push_pull_output(&mut gpioc.crh)`). Returns the
     /// pin re-typed as [`Pin<Output<PushPull>>`], which implements the `embedded-hal`
@@ -786,7 +786,7 @@ impl Pin<Output<PushPull>> {
     /// Borrow this configured output as a [`GpioOutput`] handle (the shared `GPIO_BOP` drive logic).
     ///
     /// The output trait impls below delegate to this so the BOP set/reset write lives in exactly one
-    /// place ([`set_pin`], via [`GpioOutput`]); the `Pin` does not duplicate it.
+    /// place (`set_pin`, via [`GpioOutput`]); the `Pin` does not duplicate it.
     #[inline]
     fn as_output(&self) -> GpioOutput {
         GpioOutput::new(self.port_base, self.path, self.pin)
@@ -846,7 +846,7 @@ impl<PULL> embedded_hal::digital::ErrorType for Pin<Input<PULL>> {
 }
 
 impl<PULL> embedded_hal::digital::InputPin for Pin<Input<PULL>> {
-    /// Read the pin's live level from the family's `GPIO_ISTAT` register (the single [`read_pin`]
+    /// Read the pin's live level from the family's `GPIO_ISTAT` register (the single `read_pin`
     /// access; F10x at `0x08`, F1x0 at `0x10`). Infallible (the
     /// [`embedded_hal::digital::ErrorType::Error`] is [`core::convert::Infallible`]).
     #[inline]

@@ -59,7 +59,7 @@ impl Chip {
     /// - **GPIO alternate function.** F10x ([`Family::F10x`]) selects AF through the `CRL`/`CRH`
     ///   mode/cnf nibbles plus the AFIO remap groups; F1x0 ([`Family::F1x0`]) selects it per pin
     ///   through `AFSEL` and a per-pin AF mux. (For the unified GPIO paths this is already handled by
-    ///   [`crate::gpio::configure_af`]; the escape hatch is for setup the HAL does not cover.)
+    ///   `configure_af`; the escape hatch is for setup the HAL does not cover.)
     /// - **Timer / peripheral catalog.** The two families carry different advanced/general-purpose
     ///   timer instances and different ADC/SPI/USART instance counts, so timer/PWM routing (which timer
     ///   drives which pin, with which AF) is genuinely family-specific.
@@ -109,7 +109,7 @@ impl Chip {
     /// [`embedded_hal::digital::OutputPin`] handle for it.
     ///
     /// Resolves `port` to its base from the chip's address table, configures `pin` as a 50 MHz
-    /// push-pull output through [`crate::gpio::configure_output`] (which owns the F10x/F1x0
+    /// push-pull output through `configure_output` (which owns the F10x/F1x0
     /// register-model branch internally), and returns the [`GpioOutput`] handle. Application code
     /// then drives the pin through the `embedded-hal` trait, never seeing the [`GpioPath`] split or
     /// a raw base. `pin` is the pin number (0..15) within the port. Returns
@@ -297,7 +297,7 @@ impl Chip {
     /// A mis-paired call is a COMPILE error, not a silent bad write to a reserved region.
     ///
     /// This is the type-safe replacement for branching on `family()` and then calling the raw
-    /// [`crate::gpio::configure_af`] with a hand-picked [`GpioPath`] (where passing the wrong path
+    /// `configure_af` with a hand-picked [`GpioPath`] (where passing the wrong path
     /// compiles fine and faults at runtime).
     ///
     /// ```rust,ignore

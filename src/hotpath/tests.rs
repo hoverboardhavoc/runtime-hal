@@ -278,7 +278,7 @@ fn configure_via_trait_then_set_duties() {
 
     // The trace's MOE writer is the gate, distinct from the handle (the only MOE writer). The gate
     // is built from the resolved base (the safety layer resolves it separately from the handle).
-    let gate = PwmController::arm_gate(chip.base(cfg.timer).unwrap());
+    let gate = ArmGate::new(chip.base(cfg.timer).unwrap());
     gate.arm();
     assert_eq!(
         Reg32::new(TIMER0_BASE, TIMER_CCHP).read() & CCHP_MOE,

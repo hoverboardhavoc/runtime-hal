@@ -56,6 +56,8 @@ use crate::chip::Chip;
 use crate::config::{OcMode, PwmConfig, TrgoSource};
 use crate::descriptor::MAX_PWM_CHANNELS;
 use crate::error::DescriptorError;
+use crate::hotpath::arming::ArmGate;
+use crate::hotpath::PwmHandle;
 use crate::reg::Reg32;
 
 // --- register offsets (identical on both families) --------------------------------------------
@@ -75,6 +77,8 @@ const CCHP: u32 = 0x44;
 
 // --- CTL0 fields (timer_init: center-aligned + direction + clock division + ARSE) -------------
 
+/// Counter enable (CEN), CTL0[0]. Set to START the timer counter; the bring-up leaves it clear.
+const CTL0_CEN: u32 = 1 << 0;
 const CTL0_DIR: u32 = 1 << 4;
 /// Center-aligned mode select, CTL0[6:5].
 const CTL0_CAM: u32 = 0b11 << 5;
@@ -159,13 +163,18 @@ const CCHP_BRKP_HIGH: u32 = 1 << 13;
 #[derive(Debug, Clone, Copy)]
 pub struct PwmTimer {
     base: u32,
+    period: u16,
 }
 
 impl PwmTimer {
-    /// Wrap an already-resolved advanced-timer base (no register access).
+    /// Wrap an already-resolved advanced-timer base (no register access). HAL-internal constructor for
+    /// the trigger-config path and tests; `period` is 0 (the per-cycle handle is built by
+    /// [`Self::configure`], which records the real period). NOT public: the application cannot supply a
+    /// base.
     #[inline]
-    pub const fn at(base: u32) -> PwmTimer {
-        PwmTimer { base }
+    #[allow(dead_code)] // internal/test constructor; the prod path builds PwmTimer via configure().
+    pub(crate) const fn at(base: u32) -> PwmTimer {
+        PwmTimer { base, period: 0 }
     }
 
     /// Configure the advanced timer for the complementary bridge from `wiring`, reproducing the GD
@@ -177,8 +186,16 @@ impl PwmTimer {
     /// returned [`PwmTimer`] is the resolved base; the caller builds the resolve-once
     /// [`crate::hotpath::PwmHandle`] from it (T5).
     pub fn configure(chip: &Chip, cfg: &PwmConfig) -> Result<PwmTimer, DescriptorError> {
+        // Guard: the config's timer label must be an ADVANCED timer in the APB2 advanced-timer
+        // window, else a non-advanced label (e.g. the general-purpose Timer1) would run the full
+        // complementary-bridge + CCHP dead-time bring-up against the wrong peripheral. Mirrors the
+        // injected-ADC path's check_adc_base guard. Also gives Timer7 (when present) a clean resolve.
+        chip.descriptor().addrs.check_timer_base(cfg.timer)?;
         let base = chip.base(cfg.timer)?;
-        let dev = PwmTimer { base };
+        let dev = PwmTimer {
+            base,
+            period: cfg.period,
+        };
         dev.timer_init(cfg);
         // Per-phase channel output config (mode + shadow + zero duty, enable/per-side idle/polarity).
         for (n, ch) in cfg.channels.iter().enumerate() {
@@ -358,10 +375,40 @@ impl PwmTimer {
         self.cchp().write(word);
     }
 
-    /// The underlying base address.
+    /// The underlying base address. HAL-internal only: the application reaches the timer through the
+    /// handle / arm gate / counter methods, never a raw base.
     #[inline]
-    pub const fn base(&self) -> u32 {
+    pub(crate) const fn base(&self) -> u32 {
         self.base
+    }
+
+    /// The per-cycle PWM handle for this configured timer (the resolve-once compare + trigger writer).
+    /// The base stays PRIVATE to the HAL: the application drives PWM only through this handle.
+    #[inline]
+    pub fn handle(&self) -> PwmHandle {
+        PwmHandle::new(self.base, self.period)
+    }
+
+    /// The MOE arming gate for this configured timer (the SOLE MOE writer; see the SAFETY notes). A
+    /// deliberately separate object from the per-cycle handle, also built from the HAL-private base.
+    #[inline]
+    pub fn arm_gate(&self) -> ArmGate {
+        ArmGate::new(self.base)
+    }
+
+    /// Start the timer counter (CTL0 CEN). The bring-up ([`Self::configure`]) deliberately leaves the
+    /// counter STOPPED; the application starts it here once ready. SAFE while disarmed: with MOE clear
+    /// the counter runs and compare events toggle the internal channels, but no output reaches the
+    /// gate pins, so no current flows until [`ArmGate::arm`].
+    #[inline]
+    pub fn enable_counter(&self) {
+        self.ctl0().modify(CTL0_CEN, CTL0_CEN);
+    }
+
+    /// Stop the timer counter (clear CTL0 CEN). With disarming (MOE clear) this fully stops the bridge.
+    #[inline]
+    pub fn disable_counter(&self) {
+        self.ctl0().modify(CTL0_CEN, 0);
     }
 
     // --- register accessors -------------------------------------------------------------------

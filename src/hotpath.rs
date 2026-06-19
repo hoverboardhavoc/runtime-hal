@@ -111,8 +111,9 @@ pub trait TriggeredAdc {
 ///
 /// The base is resolved at `configure` time from the [`Chip`] for the config's timer label, with the
 /// advanced-timer-window check; a base outside the window (or a non-timer label, or a missing base)
-/// surfaces as a [`crate::error::DescriptorError`] / [`PwmError`]. An already-resolved base can be
-/// used directly ([`Self::arm_gate`]) for the arming-gate path.
+/// surfaces as a [`crate::error::DescriptorError`] / [`PwmError`]. The arming gate is obtained from
+/// the configured [`crate::timer::PwmTimer`] ([`crate::timer::PwmTimer::arm_gate`]); the base stays
+/// internal to the HAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PwmController;
 
@@ -123,13 +124,6 @@ impl PwmController {
         PwmController
     }
 
-    /// The MOE arming gate for a resolved timer base (the only MOE writer). A deliberately separate
-    /// object from the per-cycle [`PwmHandle`]: the control loop gets the handle, the safety layer
-    /// gets the gate. The firmware resolves the base via `chip.base(cfg.timer)?` and passes it here.
-    #[inline]
-    pub fn arm_gate(base: u32) -> arming::ArmGate {
-        arming::ArmGate::new(base)
-    }
 }
 
 impl ComplementaryPwm for PwmController {
@@ -166,10 +160,12 @@ pub struct PwmHandle {
 }
 
 impl PwmHandle {
-    /// Construct the handle from a resolved timer base + period (used by the T5 `configure` body and
-    /// by host tests). Resolves the four compare-register accessors once; holds no MOE accessor.
+    /// Construct the handle from a resolved timer base + period. HAL-internal (used by
+    /// [`crate::timer::PwmTimer::handle`] and host tests); the application gets a handle from a
+    /// configured `PwmTimer`, never by supplying a base. Resolves the compare accessors once; holds no
+    /// MOE accessor.
     #[inline]
-    pub fn new(timer_base: u32, period: u16) -> Self {
+    pub(crate) fn new(timer_base: u32, period: u16) -> Self {
         Self {
             ch_cv: [
                 Reg32::new(timer_base, TIMER_CH0CV),
@@ -324,10 +320,11 @@ pub struct InjectedHandle {
 const ADC_IDATA: [u32; MAX_INJECTED_CHANNELS] = [0x3C, 0x40, 0x44, 0x48];
 
 impl InjectedHandle {
-    /// Construct the handle from a resolved ADC base + injected channel count (used by the T9
-    /// `configure` body and host tests). Resolves the injected-data accessors once.
+    /// Construct the handle from a resolved ADC base + injected channel count. HAL-internal (the
+    /// `TriggeredAdc::configure` body + host tests); the application gets it from configure, not by
+    /// supplying a base. Resolves the injected-data accessors once.
     #[inline]
-    pub fn new(adc_base: u32, len: u8) -> Self {
+    pub(crate) fn new(adc_base: u32, len: u8) -> Self {
         Self {
             idata: [
                 Reg32::new(adc_base, ADC_IDATA[0]),
@@ -385,9 +382,10 @@ pub mod arming {
     }
 
     impl ArmGate {
-        /// Construct the arming gate from the resolved timer base. Owned by the safety layer.
+        /// Construct the arming gate from the resolved timer base. HAL-internal: the application gets
+        /// its arm gate from [`crate::timer::PwmTimer::arm_gate`] (base private), not by base.
         #[inline]
-        pub fn new(timer_base: u32) -> Self {
+        pub(crate) fn new(timer_base: u32) -> Self {
             Self {
                 cchp: Reg32::new(timer_base, TIMER_CCHP),
             }

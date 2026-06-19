@@ -29,19 +29,19 @@
 //!
 //! - **F1x0** ([`crate::Family::F1x0`]): one per-pin AF mux field. PB3's `AFSEL` nibble is set to
 //!   **AF2** (`GD32F130xx Datasheet` Port B alternate-function summary: PB3 AF2 = `TIMER1_CH1`).
-//!   That is the whole routing: [`crate::gpio::configure_af`] with
+//!   That is the whole routing: `configure_af` with
 //!   [`crate::gpio::PinRole::GenTimerAfPushPull`].
 //! - **F10x** ([`crate::Family::F10x`]): PB3 is JTDO after reset and TIMER1_CH1 is not on PB3 by
 //!   default, so it takes THREE steps: (1) [`crate::Chip::free_jtag_pins`] to release PB3 from the
-//!   JTAG-DP (keeping SWD), (2) [`crate::gpio::remap_timer1_partial1`] to set `AFIO_PCF0`'s
+//!   JTAG-DP (keeping SWD), (2) `remap_timer1_partial1` to set `AFIO_PCF0`'s
 //!   `TIMER1_REMAP[9:8]` field to `01` (partial remap 1, which maps `TIMER1_CH1 / PB3`; GD32F10x
 //!   User Manual 7.5.9), and (3) PB3's CRL nibble set to alternate-function push-pull
-//!   ([`crate::gpio::configure_af`], where the F10x AF is implied by the nibble).
+//!   (`configure_af`, where the F10x AF is implied by the nibble).
 //!
 //! The constraint that fixes the target on TIMER1 (not TIMER2): TIMER2's remap to PB4/PB5 needs a
 //! 64/100/144-pin package (GD32F10x User Manual, TIMER alternate-function remapping notes), so on a
 //! 48-pin GD32F103C8 TIMER2's channels are NOT reachable; TIMER1's partial-remap-1 to PB3 IS. See
-//! [`crate::gpio::remap_timer1_partial1`]. The shared datapath ([`PwmOut::new`] + the duty setter)
+//! `remap_timer1_partial1`. The shared datapath ([`PwmOut::new`] + the duty setter)
 //! is identical once the pin is routed.
 //!
 //! # embedded-hal trait

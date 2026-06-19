@@ -74,10 +74,10 @@ pub use error::{
     UsartError, WatchdogError,
 };
 pub use gpio::{
-    configure_af, configure_output, read_pin, remap_timer1_partial1, set_pin, Floating, GpioOutput,
-    GpioPort, Input, Output, Pin, PinRole, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins,
-    PortPins, PullDown, PullUp, PushPull,
+    Floating, GpioOutput, GpioPort, Input, Output, Pin, PinRole, PortAPins, PortBPins, PortCPins,
+    PortDPins, PortFPins, PortPins, PullDown, PullUp, PushPull,
 };
+pub use hotpath::arming::ArmGate;
 pub use hotpath::dump::{AdcInjectedRegs, HotpathConfig, TimerRegs};
 pub use hotpath::hall::HallReader;
 pub use hotpath::{

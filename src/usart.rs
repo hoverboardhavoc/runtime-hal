@@ -329,7 +329,7 @@ impl Usart {
     ///    the chip handed back the [`crate::gpio::GpioPort`] the pins were split from, so it is not
     ///    re-enabled here.
     /// 3. Configure TX as AF push-pull ([`PinRole::Tx`]) and RX as AF input ([`PinRole::Rx`]) via
-    ///    [`configure_af`], taking each consumed pin's resolved port base / register-model path /
+    ///    `configure_af`, taking each consumed pin's resolved port base / register-model path /
     ///    logical pin byte (the application never built them).
     /// 4. Program BRR from `clock` + `baud`, the 8N1 /16 frame, and enable TX + RX + the peripheral.
     pub fn new<TX, RX>(

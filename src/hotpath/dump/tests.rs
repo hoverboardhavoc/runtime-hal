@@ -15,6 +15,7 @@ use crate::config::{
     PwmChannelConfig, PwmConfig, TimerTriggerLink, TrgoSource,
 };
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
+use crate::hotpath::arming::ArmGate;
 use crate::hotpath::{ComplementaryPwm, InjectedAdcController, PwmController, TriggeredAdc};
 use crate::reg::{mock, Reg32};
 use heapless::Vec;
@@ -149,7 +150,7 @@ fn dump_sees_moe_when_armed() {
     // Arm through the sole MOE writer, then dump: the capture must now show MOE set. This proves the
     // dump reads the live CCHP, so the gate can DETECT an unexpectedly-armed bridge.
     let base = chip.base(PeriphLabel::Timer0).unwrap();
-    PwmController::arm_gate(base).arm();
+    ArmGate::new(base).arm();
 
     let snap = HotpathConfig::dump(TIMER0_BASE, ADC0_BASE);
     assert!(snap.timer.moe(), "the dump must observe the armed MOE bit");
