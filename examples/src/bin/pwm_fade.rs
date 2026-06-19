@@ -3,28 +3,20 @@
 //! ONE binary, flashed unchanged to a GD32F103C8T6 (F10x family) or a GD32F130C8T6 (F1x0 family);
 //! `detect_chip()` picks the register model at boot. It drives `TIMER1_CH1` (a GENERAL-purpose
 //! timer, NOT the motor bridge) onto PB3 (the green LED) and sweeps the duty up and down so the LED
-//! FADES. The shared PWM datapath (`runtime_hal::PwmOut`) is identical on both boards; what differs,
-//! and what this example makes VISIBLE, is the per-family PIN ROUTING.
+//! FADES. The same call works on both boards; the per-family pin routing is HIDDEN inside the HAL.
 //!
-//! # The family difference this example makes visible
+//! # The family difference is absorbed, not exposed
 //!
-//! Getting the SAME timer channel (`TIMER1_CH1`) onto the SAME pin (PB3) takes a DIFFERENT register
-//! mechanism on each family, so the routing branches on `chip.family()` (the deliberate escape hatch
-//! for architecture-specific setup the HAL does not abstract). This is the visible F10x-vs-F1x0
-//! difference, not a hidden one:
-//!
-//! - **F10x (GD32F103)**: PB3 is JTDO after reset and `TIMER1_CH1` is on PA1 by default, so it takes
-//!   THREE steps. (1) `chip.free_jtag_pins()` releases PB3 from the JTAG debug port (keeping SWD
-//!   live). (2) `remap_timer1_partial1()` sets the AFIO `TIMER1_REMAP[9:8]` field to `01` (partial
-//!   remap 1), which maps `TIMER1_CH1 / PB3`. (3) PB3's CRL nibble is set to alternate-function
-//!   push-pull (on the F10x the AF is implied by the mode/cnf nibble, there is no per-pin AF mux).
-//! - **F1x0 (GD32F130)**: ONE field. PB3's per-pin `AFSEL` mux is set to AF2 (`TIMER1_CH1` on AF2,
-//!   per the GD32F130xx datasheet's Port B alternate-function summary). No AFIO, no remap.
+//! Getting `TIMER1_CH1` onto PB3 takes a DIFFERENT register mechanism on each family (F10x: free the
+//! JTAG overlay + AFIO `TIMER1_REMAP` partial-remap-1 + the CRL AF nibble; F1x0: one per-pin `AFSEL`
+//! field = AF2). The application does NOT branch on the family: it passes the output pin to
+//! `PwmOut::new`, which routes it via `Chip::route_general_pwm_pin` internally. There is no
+//! `chip.family()` / `chip.arch()` in this example, the HAL absorbs the difference.
 //!
 //! Why `TIMER1` and not `TIMER2`: on the 48-pin GD32F103C8, `TIMER2`'s remap to PB4/PB5 needs a
 //! 64/100/144-pin package, so those channels are not reachable. `TIMER1`'s partial-remap-1 to PB3
-//! IS reachable on the 48-pin part, which is why the G3 target is `TIMER1`. Neither path touches
-//! `TIMER0` (the motor bridge) or the MOE/POEN arming gate; `PwmOut` refuses an advanced-timer label.
+//! IS reachable on the 48-pin part. `PwmOut` refuses an advanced-timer label, so this can never reach
+//! `TIMER0` (the motor bridge) or the MOE/POEN arming gate.
 //!
 //! # Pin and clock
 //!
@@ -41,7 +33,7 @@ use cortex_m_rt::entry;
 use embedded_hal::pwm::SetDutyCycle;
 use panic_halt as _;
 
-use runtime_hal::{detect_chip, Arch, PeriphLabel, PinRole, PwmOut};
+use runtime_hal::{detect_chip, PeriphLabel, PwmOut};
 
 /// The 8 MHz reset IRC8M clock this example runs on (no PLL bring-up). It is the TIMER1 input clock.
 const TIMER_CLK_HZ: u32 = 8_000_000;
@@ -56,40 +48,12 @@ fn main() -> ! {
     //    part matching neither family panics here and `panic_halt` halts (no guessed register model).
     let chip = detect_chip().unwrap();
 
-    // 2. Architecture-aware pin routing: drive TIMER1_CH1 onto PB3. This is the VISIBLE family
-    //    branch, the kind of architecture-specific setup the HAL deliberately does NOT abstract. The
-    //    chip.arch() witness hands back a family TOKEN: each token bakes in the correct register model
-    //    and exposes only the operations that family supports, so the wrong-architecture register
-    //    write is a COMPILE error, not a runtime fault (e.g. remap_timer1_partial1 exists ONLY on the
-    //    F10x token; there is no AFIO on the F1x0).
-    match chip.arch() {
-        Arch::F10x(f10x) => {
-            // F10x: three steps to get TIMER1_CH1 onto PB3 (JTDO at reset, CH1 elsewhere by default).
-            // (a) Free PB3 from the JTAG debug port (keeps SWD live). F10x-only (absent on the F1x0).
-            f10x.free_jtag_pins().ok();
-            // (b) AFIO TIMER1_REMAP = partial-remap-1: maps TIMER1_CH1 -> PB3. F10x-only (no AFIO on
-            //     the F1x0); the method does not exist on the F1x0 token. Enables the AFIO clock too.
-            f10x.remap_timer1_partial1().ok();
-            // (c) PB3 = alternate-function push-pull (on the F10x the AF is implied by the nibble).
-            //     The F10x CRL/CRH path is baked into the token; the F1x0 AFSEL write is unreachable.
-            f10x.configure_pin_af(PB3, PinRole::GenTimerAfPushPull).ok();
-        }
-        Arch::F1x0(f1x0) => {
-            // F1x0: ONE field. PB3's per-pin AFSEL mux -> AF2 (TIMER1_CH1 on AF2). No AFIO, no remap.
-            // The F1x0 AFSEL path is baked into the token; the F10x CRL/CRH write is unreachable here.
-            f1x0.configure_pin_af(PB3, PinRole::GenTimerAfPushPull).ok();
-        }
-    }
-    // Enable the GPIOB port clock (the routing above wrote the port's config registers; the clock
-    // must be on for those writes to stick on hardware). The port getter enables it through the
-    // detected chip's clock path; we only need the side effect, not the split pins.
-    let _ = chip.gpiob();
-
-    // 3. Shared datapath: bring up the single-channel general PWM on TIMER1_CH1. PwmOut REFUSES an
-    //    advanced-timer label, so this can never reach TIMER0 / the MOE gate. The counter starts
-    //    running at zero duty; the general timer drives the pin as soon as the channel + counter are
-    //    enabled (no arming step). This call is IDENTICAL on both families.
-    let mut pwm = PwmOut::new(&chip, PeriphLabel::Timer1, PWM_FREQ_HZ, TIMER_CLK_HZ).unwrap();
+    // 2. Bring up the single-channel general PWM on TIMER1_CH1, routed to PB3. The per-family pin
+    //    routing (F10x AFIO remap + JTAG-free + CRL nibble; F1x0 AFSEL) is done INSIDE PwmOut::new,
+    //    so this one call is identical on both boards, no chip.family() / chip.arch() branch. PwmOut
+    //    REFUSES an advanced-timer label, so it can never reach TIMER0 / the MOE gate. The counter
+    //    starts running at zero duty (a general timer drives the pin with no arming step).
+    let mut pwm = PwmOut::new(&chip, PeriphLabel::Timer1, PB3, PWM_FREQ_HZ, TIMER_CLK_HZ).unwrap();
     let max = pwm.max_duty_cycle();
 
     // 4. Sweep the duty up then down forever so the green LED fades. The sweep is done in fixed steps

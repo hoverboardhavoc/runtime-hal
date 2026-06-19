@@ -15,12 +15,17 @@ use embedded_hal::pwm::SetDutyCycle;
 
 /// TIMER1 base (the general level-0 timer, the bottom of APB1; same on both families).
 const TIMER1_BASE: u32 = 0x4000_0000;
+/// The output pin the general PWM routes to (PB3 = green LED = TIMER1_CH1).
+const PB3: u8 = (1 << 4) | 3;
 
-/// A chip whose addrs resolves `Timer1` to [`TIMER1_BASE`] and `Timer0` to the advanced window.
+/// A chip whose addrs resolves `Timer1` to [`TIMER1_BASE`] and `Timer0` to the advanced window, plus
+/// GPIOB + RCU so the bring-up's internal pin routing (`route_general_pwm_pin(PB3)`) resolves.
 fn chip() -> Chip {
     let mut addrs = AddrTable::new();
     addrs.set(PeriphLabel::Timer1, TIMER1_BASE);
     addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
+    addrs.set(PeriphLabel::Gpiob, 0x4800_0400);
+    addrs.set(PeriphLabel::Rcu, 0x4002_1000);
     Chip::from_descriptor(McuDescriptor {
         gpio: GpioPath::AhbCtlAfsel,
         clock: ClockPath::F1x0Rcu,
@@ -56,7 +61,7 @@ fn new_brings_up_ch1_pwm_and_starts_counter() {
     mock::reset();
 
     // 8 MHz reset clock, ~1 kHz target: CAR = round(8_000_000 / 1000) - 1 = 7999.
-    let pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, 1_000, 8_000_000).unwrap();
+    let pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 1_000, 8_000_000).unwrap();
     assert_eq!(pwm.period(), 7999);
     assert_eq!(pwm.base(), TIMER1_BASE);
 
@@ -83,7 +88,7 @@ fn new_brings_up_ch1_pwm_and_starts_counter() {
 fn no_bridge_fields_are_ever_written() {
     let _g = mock::lock();
     mock::reset();
-    let _ = PwmOut::new(&chip(), PeriphLabel::Timer1, 1_000, 8_000_000).unwrap();
+    let _ = PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 1_000, 8_000_000).unwrap();
 
     // CCHP (0x44: dead-time / break / MOE-POEN) must be untouched: this is a general timer, the
     // word does not exist and the cold path must never write it.
@@ -101,7 +106,7 @@ fn refuses_advanced_timer_label() {
     let _g = mock::lock();
     mock::reset();
     // TIMER0 (the advanced bridge) must be REFUSED, and nothing must be written to its base.
-    let r = PwmOut::new(&chip(), PeriphLabel::Timer0, 1_000, 8_000_000);
+    let r = PwmOut::new(&chip(), PeriphLabel::Timer0, PB3, 1_000, 8_000_000);
     assert_eq!(r.err(), Some(PwmError::BadTimerBase));
     // Neither the advanced base nor the general base was touched.
     assert_eq!(Reg32::new(0x4001_2C00, CTL0).read(), 0, "TIMER0 untouched");
@@ -112,7 +117,7 @@ fn refuses_advanced_timer_label() {
 fn refuses_non_timer_label() {
     let _g = mock::lock();
     mock::reset();
-    let r = PwmOut::new(&chip(), PeriphLabel::Usart1, 1_000, 8_000_000);
+    let r = PwmOut::new(&chip(), PeriphLabel::Usart1, PB3, 1_000, 8_000_000);
     assert_eq!(r.err(), Some(PwmError::BadTimerBase));
 }
 
@@ -122,11 +127,11 @@ fn degenerate_frequency_is_rejected() {
     mock::reset();
     // Zero frequency and a frequency higher than half the timer clock (< 2 counts) are rejected.
     assert_eq!(
-        PwmOut::new(&chip(), PeriphLabel::Timer1, 0, 8_000_000).err(),
+        PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 0, 8_000_000).err(),
         Some(PwmError::DutyOutOfRange)
     );
     assert_eq!(
-        PwmOut::new(&chip(), PeriphLabel::Timer1, 8_000_000, 8_000_000).err(),
+        PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 8_000_000, 8_000_000).err(),
         Some(PwmError::DutyOutOfRange)
     );
 }
@@ -136,7 +141,7 @@ fn period_clamps_to_16_bit_counter() {
     let _g = mock::lock();
     mock::reset();
     // A very low frequency would need a CAR beyond 16 bits; it clamps to 0xFFFF.
-    let pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, 1, 8_000_000).unwrap();
+    let pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 1, 8_000_000).unwrap();
     assert_eq!(pwm.period(), u16::MAX);
     assert_eq!(reg(CAR), u32::from(u16::MAX));
 }
@@ -145,7 +150,7 @@ fn period_clamps_to_16_bit_counter() {
 fn set_duty_cycle_writes_ch1cv_as_32bit() {
     let _g = mock::lock();
     mock::reset();
-    let mut pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, 1_000, 8_000_000).unwrap();
+    let mut pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 1_000, 8_000_000).unwrap();
 
     // Half duty.
     pwm.set_duty_cycle(4000).unwrap();
@@ -162,7 +167,7 @@ fn set_duty_cycle_writes_ch1cv_as_32bit() {
 fn set_duty_cycle_clamps_to_period() {
     let _g = mock::lock();
     mock::reset();
-    let mut pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, 1_000, 8_000_000).unwrap();
+    let mut pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 1_000, 8_000_000).unwrap();
     let period = pwm.period();
     // A duty above the period clamps to the period (full-on, not never-matching).
     pwm.set_duty_cycle(u16::MAX).unwrap();
@@ -173,7 +178,7 @@ fn set_duty_cycle_clamps_to_period() {
 fn max_duty_cycle_is_the_period() {
     let _g = mock::lock();
     mock::reset();
-    let pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, 1_000, 8_000_000).unwrap();
+    let pwm = PwmOut::new(&chip(), PeriphLabel::Timer1, PB3, 1_000, 8_000_000).unwrap();
     assert_eq!(pwm.max_duty_cycle(), 7999);
     assert_eq!(pwm.max_duty_cycle(), pwm.period());
 }

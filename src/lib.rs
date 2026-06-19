@@ -48,7 +48,7 @@ pub mod watchdog;
 
 pub use adc::{is_internal_channel, Adc};
 pub use addr::{AddrTable, PeriphLabel};
-pub use chip::{Arch, Chip, F10xArch, F1x0Arch};
+pub use chip::Chip;
 pub use clock::{
     clear_reset_flags, configure_tree, configure_tree_timeout, enable_adc, enable_general_timer,
     enable_gpio_port, enable_i2c, enable_lsi, enable_spi, enable_timer, enable_usart,
@@ -66,7 +66,7 @@ pub use descriptor::{
     MAX_USARTS,
 };
 pub use detect::{
-    descriptor_f103, descriptor_f130, detect_chip, synthesize, Family, F10X_K2_THRESHOLD_KIB,
+    descriptor_f103, descriptor_f130, detect_chip, synthesize, F10X_K2_THRESHOLD_KIB,
     FLASH_DENSITY_ADDR,
 };
 pub use error::{

@@ -19,30 +19,27 @@
 //! all matching `gd32f10x_timer.h` / `gd32f1x0_timer.h`), MINUS every bridge-only field (no CHxN, no
 //! dead-time/CCHP, no break, no MOE/POEN). So this is ONE register model parameterised only by the
 //! general-timer base (data, from [`crate::addr::AddrTable`]); there is no [`crate::descriptor`]
-//! family selector here. The family difference is entirely in the PIN ROUTING, which the HAL leaves
-//! to the application (it is genuinely architecture-specific; see [`crate::Chip::family`]).
+//! family selector here.
 //!
-//! # Family routing (the visible F10x-vs-F1x0 difference the application owns)
+//! # Pin routing is HIDDEN (folded into the bring-up)
 //!
 //! The G3 target is `TIMER1_CH1 -> PB3` (the green LED, which lights without the SELF_HOLD rail).
-//! Getting that one channel onto that one pin is where the two families diverge:
+//! Getting that one channel onto that one pin takes different registers per family, but the caller
+//! never sees that: [`PwmOut::new`] takes the output pin and routes it via
+//! [`crate::Chip::route_general_pwm_pin`], which does the family work INTERNALLY (dispatching on the
+//! descriptor's register-model selector, not a caller-visible family flag):
 //!
-//! - **F1x0** ([`crate::Family::F1x0`]): one per-pin AF mux field. PB3's `AFSEL` nibble is set to
-//!   **AF2** (`GD32F130xx Datasheet` Port B alternate-function summary: PB3 AF2 = `TIMER1_CH1`).
-//!   That is the whole routing: `configure_af` with
-//!   [`crate::gpio::PinRole::GenTimerAfPushPull`].
-//! - **F10x** ([`crate::Family::F10x`]): PB3 is JTDO after reset and TIMER1_CH1 is not on PB3 by
-//!   default, so it takes THREE steps: (1) [`crate::Chip::free_jtag_pins`] to release PB3 from the
-//!   JTAG-DP (keeping SWD), (2) `remap_timer1_partial1` to set `AFIO_PCF0`'s
-//!   `TIMER1_REMAP[9:8]` field to `01` (partial remap 1, which maps `TIMER1_CH1 / PB3`; GD32F10x
-//!   User Manual 7.5.9), and (3) PB3's CRL nibble set to alternate-function push-pull
-//!   (`configure_af`, where the F10x AF is implied by the nibble).
+//! - **F1x0** (per-pin AF mux): PB3's `AFSEL` nibble is set to **AF2** (`GD32F130xx Datasheet` Port B
+//!   alternate-function summary: PB3 AF2 = `TIMER1_CH1`).
+//! - **F10x** (AFIO remap groups): PB3 is JTDO after reset and TIMER1_CH1 is not on PB3 by default,
+//!   so the routing frees the JTAG overlay (keeping SWD), sets the `AFIO_PCF0` `TIMER1_REMAP[9:8]`
+//!   field to `01` (partial remap 1, mapping `TIMER1_CH1 / PB3`; GD32F10x User Manual 7.5.9), and sets
+//!   PB3's CRL alternate-function nibble.
 //!
 //! The constraint that fixes the target on TIMER1 (not TIMER2): TIMER2's remap to PB4/PB5 needs a
 //! 64/100/144-pin package (GD32F10x User Manual, TIMER alternate-function remapping notes), so on a
-//! 48-pin GD32F103C8 TIMER2's channels are NOT reachable; TIMER1's partial-remap-1 to PB3 IS. See
-//! `remap_timer1_partial1`. The shared datapath ([`PwmOut::new`] + the duty setter)
-//! is identical once the pin is routed.
+//! 48-pin GD32F103C8 TIMER2's channels are NOT reachable; TIMER1's partial-remap-1 to PB3 IS. The
+//! shared datapath ([`PwmOut::new`] + the duty setter) is identical on both families.
 //!
 //! # embedded-hal trait
 //!
@@ -151,19 +148,25 @@ impl PwmOut {
     ///
     /// This REFUSES the advanced timers: `instance` MUST be a general-timer label (`Timer1`), or it
     /// returns [`PwmError::BadTimerBase`]. This is the host-enforced guard that keeps the cold-path
-    /// PWM off the motor bridge (it never touches TIMER0 or the MOE/POEN gate). The pin routing is
-    /// the APPLICATION's job and is NOT done here (it is family-specific; see the module docs); the
-    /// caller routes the pin to TIMER1_CH1 before or after this bring-up.
+    /// PWM off the motor bridge (it never touches TIMER0 or the MOE/POEN gate).
+    ///
+    /// `pin` is the output pin (`(port << 4) | pin`, e.g. PB3 for the green LED). It is routed to the
+    /// timer's CH1 alternate function INTERNALLY by [`Chip::route_general_pwm_pin`], which does the
+    /// family-specific register work (F1x0 per-pin AFSEL; F10x JTAG-free + AFIO remap + CRL nibble)
+    /// so the caller never names a family. A pin whose port is not in the descriptor is
+    /// [`PwmError::BadPin`].
     ///
     /// Steps (the SPL `timer_init` + single-channel `timer_channel_output_*` subset, MINUS every
     /// bridge field):
-    /// 1. PSC = 0, CAR = period, edge-aligned up-count (CTL0 DIR/CAM cleared), ARSE on.
-    /// 2. CH1 output PWM mode 0 + compare shadow enable (CHCTL0), zero initial duty (CH1CV).
-    /// 3. CH1 enable, active-high polarity (CHCTL2). NO complementary, NO break, NO MOE.
-    /// 4. CEN: start the counter. With CH1 enabled the pin is driven immediately (no arming step).
+    /// 1. Route `pin` to TIMER1_CH1 (family-internal).
+    /// 2. PSC = 0, CAR = period, edge-aligned up-count (CTL0 DIR/CAM cleared), ARSE on.
+    /// 3. CH1 output PWM mode 0 + compare shadow enable (CHCTL0), zero initial duty (CH1CV).
+    /// 4. CH1 enable, active-high polarity (CHCTL2). NO complementary, NO break, NO MOE.
+    /// 5. CEN: start the counter. With CH1 enabled the pin is driven immediately (no arming step).
     pub fn new(
         chip: &Chip,
         instance: PeriphLabel,
+        pin: u8,
         freq_hz: u32,
         timer_clk_hz: u32,
     ) -> Result<PwmOut, PwmError> {
@@ -179,7 +182,12 @@ impl PwmOut {
             .map_err(|_| PwmError::BadTimerBase)?;
         let base = chip.base(instance).map_err(|_| PwmError::BadTimerBase)?;
 
+        // Compute the period FIRST (cheap, can fail) so a degenerate frequency touches no GPIO.
         let period = Self::period_for(freq_hz, timer_clk_hz)?;
+
+        // Route the output pin to TIMER1_CH1, family-internal (the caller never sees the family).
+        chip.route_general_pwm_pin(pin).map_err(|_| PwmError::BadPin)?;
+
         let dev = PwmOut { base, period };
         dev.configure(period);
         Ok(dev)

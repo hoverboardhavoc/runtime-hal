@@ -258,6 +258,10 @@ pub enum PwmError {
     /// mistake the config path catches). Mirrors the [`DescriptorError::SelectorAddrMismatch`]
     /// class but at the hot-path config boundary.
     BadTimerBase,
+    /// The requested output pin could not be routed to the timer on this chip: the pin's GPIO port
+    /// (or the RCU) is not in the descriptor. The general-PWM bring-up routes its pin internally and
+    /// surfaces a routing failure here.
+    BadPin,
     /// An error the hot-path PWM does not name specifically (reserved).
     Other,
 }

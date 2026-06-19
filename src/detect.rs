@@ -22,7 +22,7 @@
 //!
 //! [`descriptor_f103`] / [`descriptor_f130`] are the single source of truth for the two parts' chip
 //! descriptors (the register-model selectors and base addresses). [`synthesize`] fills a descriptor
-//! from a [`Family`] and the density read; [`detect_chip`] then OVERWRITES the `adv_timers` /
+//! from a `Family` and the density read; [`detect_chip`] then OVERWRITES the `adv_timers` /
 //! `adc_count` fields with the MEASURED counts (the family constant is the fallback, not the truth).
 //!
 //! # What is host-testable and what is not
