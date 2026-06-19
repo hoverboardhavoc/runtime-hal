@@ -112,15 +112,23 @@ impl ClockConfig {
     /// #10 / DR-1 mitigation). The selector owns the register model AND the legal-range table; this
     /// keeps the chip-bound FACTS in the HAL and the application's CHOICE in code.
     ///
-    /// Range-checks (both families share the RCU register model, so the bounds are the same):
+    /// Range-checks. The RCU register MODEL is shared between the families, but the MAX SYSCLK and
+    /// the FLASH wait-state timing are per-part FACTS, so those bounds are selected off `path`:
     /// - the PLL multiplier must be in `2..=32` (the PLLMF field range);
     /// - each prescaler divisor must be a legal value (AHB: 1,2,4,..512; APB: 1,2,4,8,16);
-    /// - the wait-states must be in `0..=7` (the 3-bit WSCNT field) AND consistent with the target
-    ///   sysclk on these parts (0 WS up to 30 MHz, 1 WS up to 60 MHz, 2 WS up to 120 MHz);
-    /// - the resulting sysclk must not exceed the part's 120 MHz ceiling.
+    /// - the wait-states must fit the 3-bit WSCNT field AND be at least the per-family flash minimum;
+    /// - the resulting sysclk must not exceed the per-family ceiling.
+    ///
+    /// Per-family limits (GD datasheets, `reference/manuals/`):
+    /// - **F10x** (GD32F103): CK_SYS <= 108 MHz, and the flash runs **zero wait state at the full
+    ///   108 MHz** (GD32F103xx Datasheet Rev2.14: "at 108 MHz frequency with Flash accesses zero wait
+    ///   states"), so the minimum wait-state is 0 across the whole range.
+    /// - **F1x0**: CK_SYS <= 72 MHz (the F1x0 family max; GD32F130xx is a 48 MHz part, a per-part
+    ///   sub-limit the family probe cannot distinguish, so the board owns staying within it). The
+    ///   flash is zero-wait confirmed at 48 MHz (GD32F130xx Datasheet Rev3.7); above 48 MHz the
+    ///   minimum wait-state is 1 (a conservative floor: the >48 MHz region is the overclock / larger
+    ///   F1x0 parts, not confirmed zero-wait here, and under-setting wait states faults the core).
     pub fn validate_for(&self, path: ClockPath) -> Result<(), ClockError> {
-        let _ = path; // shared RCU register model; the legal ranges are family-independent here.
-
         if self.pll_mul < 2 || self.pll_mul > 32 {
             return Err(ClockError::InvalidPll);
         }
@@ -133,20 +141,17 @@ impl ClockConfig {
         if !is_legal_apb_psc(self.apb2_psc) {
             return Err(ClockError::InvalidPrescaler);
         }
-        if self.sysclk_hz > 120_000_000 {
+        // Per-family ceiling + flash-timing minimum wait-state (the only chip-bound facts here).
+        let (max_sysclk, min_ws): (u32, u8) = match path {
+            ClockPath::F10xRcc => (108_000_000, 0),
+            ClockPath::F1x0Rcu => (72_000_000, if self.sysclk_hz <= 48_000_000 { 0 } else { 1 }),
+        };
+        if self.sysclk_hz > max_sysclk {
             return Err(ClockError::InvalidWaitStates);
         }
         if self.wait_states > FMC_WS_WSCNT as u8 {
             return Err(ClockError::InvalidWaitStates);
         }
-        // Minimum wait-states for the target sysclk (the part's flash timing).
-        let min_ws: u8 = if self.sysclk_hz <= 30_000_000 {
-            0
-        } else if self.sysclk_hz <= 60_000_000 {
-            1
-        } else {
-            2
-        };
         if self.wait_states < min_ws {
             return Err(ClockError::InvalidWaitStates);
         }

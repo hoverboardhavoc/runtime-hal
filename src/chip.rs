@@ -268,6 +268,24 @@ impl Chip {
         self.desc.adc_count
     }
 
+    /// Whether this part HAS the given advanced timer (presence resolution): true iff `label` is an
+    /// advanced-timer label whose base resolved into the descriptor in the APB2 advanced-timer window.
+    /// `Timer0` is present on every part; `Timer7` only on parts detection measured a second advanced
+    /// timer on. This exposes the presence difference WITHOUT exposing a raw base: a caller asks
+    /// "is the second motor timer here?" and gets a yes/no, not an address.
+    #[inline]
+    pub fn has_advanced_timer(&self, label: PeriphLabel) -> bool {
+        self.desc.addrs.check_timer_base(label).is_ok()
+    }
+
+    /// Whether this part HAS the given ADC instance (presence resolution): true iff `label` is an ADC
+    /// label whose base resolved into the descriptor in the ADC window. Like [`Self::has_advanced_timer`],
+    /// this answers presence without handing out a base.
+    #[inline]
+    pub fn has_adc(&self, label: PeriphLabel) -> bool {
+        self.desc.addrs.check_adc_base(label).is_ok()
+    }
+
     /// The architecture-specific bring-up witness for family-divergent setup the HAL does not
     /// abstract (general-purpose timer / PWM pin routing).
     ///
@@ -441,6 +459,24 @@ mod tests {
         // family() is derived from the GpioPath (single source of truth), so it must agree with it.
         assert_eq!(Chip::from_descriptor(descriptor_f103()).gpio(), GpioPath::ApbCrlCrh);
         assert_eq!(Chip::from_descriptor(descriptor_f130()).gpio(), GpioPath::AhbCtlAfsel);
+    }
+
+    #[test]
+    fn has_advanced_timer_reflects_descriptor_presence() {
+        // Timer0 is present on every part; Timer7 only when its base is carried (detect_chip sets it
+        // for adv_timers == 2). The base-address const carries only Timer0, so Timer7 is absent here.
+        let f103 = Chip::from_descriptor(descriptor_f103());
+        assert!(f103.has_advanced_timer(PeriphLabel::Timer0));
+        assert!(!f103.has_advanced_timer(PeriphLabel::Timer7));
+        // A non-timer label is never an advanced timer.
+        assert!(!f103.has_advanced_timer(PeriphLabel::Gpioa));
+
+        // A part with a second advanced timer (as detect_chip populates for adv_timers == 2) reports
+        // it present, WITHOUT the caller ever seeing the base.
+        let mut d = descriptor_f103();
+        d.addrs.set(PeriphLabel::Timer7, 0x4001_3400);
+        let dual = Chip::from_descriptor(d);
+        assert!(dual.has_advanced_timer(PeriphLabel::Timer7));
     }
 
     #[test]

@@ -57,6 +57,11 @@ pub enum Family {
     F10x = 2,
 }
 
+/// TIM8 (TIMER7) base on the F10x high-density parts (APB2 advanced-timer window). Added to the
+/// descriptor by [`detect_chip`] only when a second advanced timer is measured, so a part without it
+/// resolves `Timer7` as [`crate::error::DescriptorError::MissingBase`].
+const TIMER7_BASE: u32 = 0x4001_3400;
+
 // --- the per-family chip descriptor constants (the register-model + base-address facts) -------
 //
 // These are the family-correct selectors and base addresses. `adv_timers` / `adc_count` carry the
@@ -206,6 +211,14 @@ pub fn detect_chip() -> Result<Chip, DetectError> {
     let counts = probe::measure_counts();
     desc.adv_timers = counts.adv_timers;
     desc.adc_count = counts.adc_count;
+
+    // 3. A part with a SECOND advanced timer (TIM8 = TIMER7, the F10x high-density parts) carries its
+    //    base so the hot path resolves it like any peripheral; one-advanced-timer parts leave it
+    //    absent, so a request for it fails loud (MissingBase) instead of being faked. The base is
+    //    fixed by the family at the APB2 advanced-timer window (TIM8 = 0x4001_3400 on the F10x).
+    if desc.adv_timers >= 2 {
+        desc.addrs.set(PeriphLabel::Timer7, TIMER7_BASE);
+    }
 
     Ok(Chip::from_descriptor(desc))
 }

@@ -537,9 +537,8 @@ mod tree_tests {
     #[test]
     fn wait_states_programmed_first_and_match_profile() {
         let _g = seed(ClockSource::Irc8m);
-        // 1 WS is only valid up to 60 MHz under the new validate_for flash-timing check, so use a
-        // 48 MHz target (1 WS legal). The intent is unchanged: configure_tree programs FMC WSCNT to
-        // exactly the config's wait-states.
+        // 48 MHz with 1 WS is a valid F1x0 config (>=0 WS minimum at 48 MHz; 1 is allowed). The
+        // intent: configure_tree programs FMC WSCNT to exactly the config's wait-states.
         let p = ClockConfig {
             sysclk_hz: 48_000_000,
             wait_states: 1,
@@ -897,7 +896,7 @@ mod tree_tests {
         fn boundary_max_pll_mul_32() {
             // pll_mul = 32 is the field maximum: PLLMF4 (BIT 27) set, CFG0_PLLMF(15) = 15<<18. We
             // pick a sysclk/WS that stays valid (high mul -> high clock); 96 MHz / 2 WS is in range
-            // (<=120 MHz ceiling, >=2 WS required above 60 MHz).
+            // on the F10x path (<=108 MHz ceiling; F10x is zero-wait, so any WS 0..=2 is accepted).
             let cfg = ClockConfig {
                 sysclk_hz: 96_000_000,
                 wait_states: 2,
@@ -982,16 +981,15 @@ mod tree_tests {
 
         #[test]
         fn boundary_wait_state_thresholds_match_validate_for_bands() {
-            // The validate_for flash-timing bands: 0 WS up to 30 MHz, 1 WS up to 60 MHz, 2 WS above.
-            // At each band edge, the minimum legal WS is accepted and one fewer is rejected, and the
-            // accepted WS reaches the FMC WSCNT field. This pins where WSCNT changes with sysclk.
+            // The F1x0 flash-timing bands: 0 WS up to 48 MHz (GD32F130 zero-wait), 1 WS above 48 MHz
+            // (conservative floor) up to the 72 MHz ceiling. At each band edge the minimum legal WS is
+            // accepted and one fewer is rejected, and the accepted WS reaches the FMC WSCNT field.
+            // This pins where WSCNT changes with sysclk on the F1x0 path.
             // (sysclk_hz, min_ws_accepted)
             let bands = [
-                (30_000_000u32, 0u8),
-                (30_000_001u32, 1u8),
-                (60_000_000u32, 1u8),
-                (60_000_001u32, 2u8),
-                (72_000_000u32, 2u8),
+                (48_000_000u32, 0u8),
+                (48_000_001u32, 1u8),
+                (72_000_000u32, 1u8),
             ];
             for (sysclk, min_ws) in bands {
                 let ok = ClockConfig {
@@ -1190,24 +1188,30 @@ mod tree_tests {
 
         #[test]
         fn reject_wait_states_too_few_for_sysclk() {
-            // 1 WS at 72 MHz is below the 2-WS minimum for >60 MHz flash timing.
-            assert_rejected(
-                &ClockConfig {
-                    sysclk_hz: 72_000_000,
-                    wait_states: 1,
-                    ..base()
-                },
-                ClockError::InvalidWaitStates,
-            );
-            // 0 WS at 48 MHz is below the 1-WS minimum for the 30..60 MHz band.
-            assert_rejected(
-                &ClockConfig {
-                    sysclk_hz: 48_000_000,
-                    wait_states: 0,
-                    ..base()
-                },
-                ClockError::InvalidWaitStates,
-            );
+            // Too-few-WS is an F1x0-path concern: F10x is zero-wait at the full 108 MHz, so no clock
+            // ever requires a wait state there. On the F1x0 path, above the 48 MHz zero-wait point a
+            // wait state is required, so 0 WS at 60 MHz and at 72 MHz are below the 1-WS minimum.
+            for sysclk in [60_000_000u32, 72_000_000] {
+                assert_eq!(
+                    ClockConfig {
+                        sysclk_hz: sysclk,
+                        wait_states: 0,
+                        ..base()
+                    }
+                    .validate_for(ClockPath::F1x0Rcu),
+                    Err(ClockError::InvalidWaitStates),
+                    "0 WS at {sysclk} Hz is too few on F1x0 (>48 MHz needs >=1 WS)"
+                );
+            }
+            // The same 0 WS at 48 MHz is now VALID on F1x0 (GD32F130 is zero-wait at 48 MHz), and is
+            // always valid on F10x (zero-wait at any clock).
+            let at_48 = ClockConfig {
+                sysclk_hz: 48_000_000,
+                wait_states: 0,
+                ..base()
+            };
+            assert_eq!(at_48.validate_for(ClockPath::F1x0Rcu), Ok(()));
+            assert_eq!(at_48.validate_for(ClockPath::F10xRcc), Ok(()));
         }
 
         #[test]
@@ -1225,15 +1229,44 @@ mod tree_tests {
 
         #[test]
         fn reject_sysclk_above_part_ceiling() {
-            // Above the 120 MHz part ceiling, with the max-legal WS so only the ceiling check fires.
-            assert_rejected(
-                &ClockConfig {
-                    sysclk_hz: 121_000_000,
-                    wait_states: 2,
-                    ..base()
-                },
-                ClockError::InvalidWaitStates,
+            // The ceiling is PER FAMILY: F10x = 108 MHz, F1x0 = 72 MHz. Use the max-legal WS so only
+            // the ceiling check fires. A clock just above each family's ceiling is rejected on that
+            // family, and the family's own ceiling is accepted.
+            let just_over = |hz: u32| ClockConfig {
+                sysclk_hz: hz,
+                wait_states: 2,
+                ..base()
+            };
+            // F10x: 109 MHz rejected, 108 MHz accepted.
+            assert_eq!(
+                just_over(109_000_000).validate_for(ClockPath::F10xRcc),
+                Err(ClockError::InvalidWaitStates)
             );
+            assert_eq!(just_over(108_000_000).validate_for(ClockPath::F10xRcc), Ok(()));
+            // F1x0: 73 MHz rejected, 72 MHz accepted.
+            assert_eq!(
+                just_over(73_000_000).validate_for(ClockPath::F1x0Rcu),
+                Err(ClockError::InvalidWaitStates)
+            );
+            assert_eq!(just_over(72_000_000).validate_for(ClockPath::F1x0Rcu), Ok(()));
+            // The per-family difference itself: 96 MHz is fine on F10x but over-ceiling on F1x0.
+            assert_eq!(just_over(96_000_000).validate_for(ClockPath::F10xRcc), Ok(()));
+            assert_eq!(
+                just_over(96_000_000).validate_for(ClockPath::F1x0Rcu),
+                Err(ClockError::InvalidWaitStates)
+            );
+        }
+
+        /// F10x is zero-wait at the full 108 MHz (GD32F103xx datasheet): 0 WS is accepted at the top
+        /// of its range, where the old shared ST-style ladder would have demanded 2.
+        #[test]
+        fn f10x_is_zero_wait_at_full_clock() {
+            let top = ClockConfig {
+                sysclk_hz: 108_000_000,
+                wait_states: 0,
+                ..base()
+            };
+            assert_eq!(top.validate_for(ClockPath::F10xRcc), Ok(()));
         }
 
         #[test]
