@@ -1,0 +1,30 @@
+[package]
+name = "runtime-hal-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Publishable, board-agnostic examples for runtime-hal. One image per example runs unmodified on both a GD32F103C8T6 (F10x) and a GD32F130C8T6 (F1x0): the chip is detected at runtime. A multi-bin layout (src/bin/blinky.rs, and later serial.rs, i2c.rs, ...) so the suite can grow. Kept OUTSIDE the library crate's own examples/ dir so the lib's host `cargo test` is unaffected."
+
+[dependencies]
+# The library under its normal real-MMIO no_std build (NOT the `mock` host-test feature: the
+# detection probe relies on a real bus fault, which no host/emulator raises). Path-dep on the parent.
+runtime-hal = { path = "..", default-features = false }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+embedded-hal = "1.0"
+
+# Our own imu + attitude crates, kept in-repo under examples/crates/ (see examples/crates/README.md)
+# so this repo builds and pushes standalone with no cross-repo path dep. Both are no_std fixed-point;
+# `imu::Mpu6050` is generic over embedded-hal 1.0 I2C, which runtime-hal's `I2c` implements. Compiled
+# for every bin but only linked into `imu_tilt`.
+imu = { path = "crates/imu" }
+attitude = { path = "crates/attitude" }
+
+# Size-optimised, debuggable release image for flashing to either board.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false
