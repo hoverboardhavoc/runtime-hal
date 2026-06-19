@@ -35,6 +35,10 @@
 //! F1x0 and only touching PB3/PB4/PA15 on the F10x) to match the other examples' boot shape. Runs on
 //! the 8 MHz reset IRC8M clock (no PLL bring-up), which is the `sysclk_hz` passed to `Timebase`.
 //!
+//! The buzzer's power rail is gated behind the SELF_HOLD power latch (PB12) on the bench board, so the
+//! example drives PB12 high at boot; otherwise the buzzer stays unpowered and silent regardless of the
+//! PB9 toggling. This is the same rail-enable the upper/lower LEDs need.
+//!
 //! # Interrupt wiring
 //!
 //! The SysTick exception symbol is owned by cortex-m-rt (`#[exception] SysTick`), so this example
@@ -92,6 +96,13 @@ fn main() -> ! {
     let gpiob = chip.gpiob().unwrap().split();
     let mut buzzer = gpiob.pb9.into_push_pull_output();
     let _ = buzzer.set_low();
+
+    // The bench board gates the buzzer's rail behind the SELF_HOLD power latch (PB12), the same way it
+    // gates the upper/lower LEDs: with PB12 low the buzzer is unpowered and silent. Drive it high so the
+    // buzzer is actually powered (the stock firmware does this at boot). Harmless on boards that do not
+    // gate the buzzer this way. Keep the handle alive for the program's life.
+    let mut self_hold = gpiob.pb12.into_push_pull_output();
+    let _ = self_hold.set_high();
 
     // Build the SysTick interrupt-mode timebase at 4 kHz. From here SysTick fires the exception every
     // 250 us; the exception (above) bumps the HAL tick count. Constructed on the 8 MHz reset clock.
