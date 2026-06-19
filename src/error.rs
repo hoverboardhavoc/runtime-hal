@@ -207,6 +207,37 @@ impl From<DescriptorError> for ClockError {
     }
 }
 
+/// Per-peripheral runtime error for the free-watchdog bring-up (G-WDG).
+///
+/// Like [`AdcError`], `embedded-hal` 1.0 has **NO watchdog trait** (the `watchdog::*` traits are
+/// `embedded-hal` 0.2 only), so this is a **plain runtime-hal error** implementing no `embedded-hal`
+/// `Error` via `ErrorKind`. It is kept separate from [`DescriptorError`] (DECISIONS.md #5: parse vs
+/// runtime). The bring-up's two bounded waits (the LSI/IRC40K stabilisation in the RCU layer and the
+/// FWDGT PSC/RLD update propagation) are the F130 hang-if-done-wrong class, the same shape as
+/// [`AdcError::Timeout`] / [`ClockError`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogError {
+    /// The LSI/IRC40K never reported stable (RSTSCK `IRC40KSTB`) within the spin budget, so the
+    /// watchdog's clock source is not running and it must not be started.
+    LsiNotStable,
+    /// The FWDGT PSC/RLD update never propagated to the LSI clock domain (STAT `PUD`/`RUD` never
+    /// cleared) within [`crate::watchdog::FWDGT_TIMEOUT`].
+    Timeout,
+    /// The descriptor did not resolve the RCU base the LSI-enable needs.
+    MissingRcuBase,
+}
+
+impl From<ClockError> for WatchdogError {
+    fn from(e: ClockError) -> Self {
+        // The only ClockError enable_lsi surfaces is a failed LSI stabilisation or a missing RCU base.
+        match e {
+            ClockError::MissingRcuBase => WatchdogError::MissingRcuBase,
+            _ => WatchdogError::LsiNotStable,
+        }
+    }
+}
+
 /// Per-peripheral runtime error for the advanced-timer complementary-PWM hot path (M3 T1).
 ///
 /// Like [`AdcError`], `embedded-hal` 1.0 has **NO PWM/timer error trait** for the complementary,

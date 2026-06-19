@@ -37,13 +37,18 @@ pub mod spi;
 pub mod timebase;
 pub mod timer;
 pub mod usart;
+/// Free (independent) watchdog bring-up (G-WDG): the FWDGT/IWDG on the LSI/IRC40K
+/// ([`watchdog::FreeWatchdog`]). Resolve-once handle + per-pass [`watchdog::FreeWatchdog::feed`];
+/// one model parameterised by base, no per-family register branch.
+pub mod watchdog;
 
 pub use adc::{is_internal_channel, Adc};
 pub use addr::{AddrTable, PeriphLabel};
 pub use chip::Chip;
 pub use clock::{
-    configure_tree, configure_tree_timeout, enable_adc, enable_gpio_port, enable_i2c, enable_spi,
-    enable_usart, ClockConfig, ClockSource, DEFAULT_CLOCK_SPIN_CAP,
+    clear_reset_flags, configure_tree, configure_tree_timeout, enable_adc, enable_gpio_port,
+    enable_i2c, enable_lsi, enable_spi, enable_usart, was_fwdgt_reset, ClockConfig, ClockSource,
+    DEFAULT_CLOCK_SPIN_CAP,
 };
 pub use config::{
     decode_pin, AdcChannel, AdcClockDiv, AdcConfig, BreakConfig, ClockDiv, InjectedAdcConfig,
@@ -62,7 +67,7 @@ pub use detect::{
 };
 pub use error::{
     AdcError, ClockError, DescriptorError, DetectError, HotPathError, I2cError, PwmError, SpiError,
-    UsartError,
+    UsartError, WatchdogError,
 };
 pub use gpio::{
     configure_af, configure_output, read_pin, set_pin, Floating, GpioOutput, GpioPort, Input,
@@ -85,3 +90,7 @@ pub use spi::{mode_bits, prescaler_for, spi_input_clock, DataSize, Spi};
 pub use timebase::{reload_for, Timebase, TimebaseError};
 pub use timer::PwmTimer;
 pub use usart::{compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel};
+pub use watchdog::{
+    clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,
+    PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,
+};

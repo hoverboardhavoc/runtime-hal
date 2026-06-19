@@ -304,6 +304,74 @@ pub fn enable_timer(
     Ok(())
 }
 
+// --- LSI / IRC40K (the free-watchdog clock source) + reset-cause flags (G-WDG) ----------------
+//
+// The free watchdog (FWDGT) is clocked from the always-available ~40 kHz internal RC oscillator
+// (IRC40K / LSI). Its enable + stabilisation flag and the watchdog reset-cause flag all live in the
+// RCU `RSTSCK` register (offset 0x24) with the SAME bit positions on both families
+// (gd32f1x0_rcu.h / gd32f10x_rcu.h): IRC40KEN bit 0, IRC40KSTB bit 1, RSTFC (reset-flag-clear) bit
+// 24, FWDGTRSTF bit 29. They sit in `clock.rs` because this module owns the RCU base + register
+// model, NOT because they branch by family (they do not); the FWDGT register block itself is one
+// model parameterised by base (see `watchdog.rs`).
+
+/// `RCU_RSTSCK` (reset source / clock register) offset (both families, 0x24).
+const RSTSCK: u32 = 0x24;
+/// IRC40K (LSI) enable (`RSTSCK_IRC40KEN`, bit 0).
+const RSTSCK_IRC40KEN: u32 = 1 << 0;
+/// IRC40K (LSI) stabilisation flag (`RSTSCK_IRC40KSTB`, bit 1).
+const RSTSCK_IRC40KSTB: u32 = 1 << 1;
+/// Reset-flag clear (`RSTSCK_RSTFC`, bit 24): write 1 to clear all the reset-cause flags.
+const RSTSCK_RSTFC: u32 = 1 << 24;
+/// Free-watchdog reset flag (`RSTSCK_FWDGTRSTF`, bit 29): set when the last reset was the FWDGT.
+const RSTSCK_FWDGTRSTF: u32 = 1 << 29;
+
+/// Spin budget for the IRC40K stabilisation poll. Iterations, not cycles (clock-independent),
+/// generous enough never to false-time a healthy oscillator but always escaping a dead one. Mirrors
+/// the other bounded bring-up polls ([`crate::adc::ADC_TIMEOUT`]).
+const LSI_STAB_TIMEOUT: u32 = 100_000;
+
+/// Enable and stabilise the LSI / IRC40K oscillator (the free-watchdog clock source).
+///
+/// Sets `RSTSCK.IRC40KEN` (the SPL `rcu_osci_on(RCU_IRC40K)`) and spins, bounded, until
+/// `RSTSCK.IRC40KSTB` reports it stable (the SPL `rcu_osci_stab_wait`). The enable bit and the
+/// stabilisation flag are at the same positions on both families, so there is no [`ClockPath`]
+/// branch here. Returns [`ClockError::SourceNotStable`] if the oscillator never stabilises within
+/// the bounded budget (the F130 hang-if-done-wrong class), instead of spinning forever.
+///
+/// This is the one clock-side prerequisite of [`crate::watchdog::FreeWatchdog::start`]: the watchdog
+/// cannot count until its clock is running.
+pub fn enable_lsi(rcu_base: u32) -> Result<(), ClockError> {
+    let rstsck = Reg32::new(rcu_base, RSTSCK);
+    rstsck.modify(RSTSCK_IRC40KEN, RSTSCK_IRC40KEN);
+    let mut budget = LSI_STAB_TIMEOUT;
+    while rstsck.read() & RSTSCK_IRC40KSTB == 0 {
+        budget -= 1;
+        if budget == 0 {
+            return Err(ClockError::SourceNotStable);
+        }
+    }
+    Ok(())
+}
+
+/// True if the last reset was caused by the free watchdog (`RSTSCK.FWDGTRSTF`).
+///
+/// The reset-cause flag persists across the reset until [`clear_reset_flags`] clears it, so a
+/// firmware reads it at boot to detect / log a watchdog recovery. Same bit position on both
+/// families. The public entry point is [`crate::watchdog::was_watchdog_reset`].
+#[inline]
+pub fn was_fwdgt_reset(rcu_base: u32) -> bool {
+    Reg32::new(rcu_base, RSTSCK).read() & RSTSCK_FWDGTRSTF != 0
+}
+
+/// Clear the RCU reset-cause flags by writing `RSTSCK.RSTFC` (reset-flag clear), so a later
+/// [`was_fwdgt_reset`] reflects only a fresh reset cause. Read the cause BEFORE clearing it. The
+/// public entry point is [`crate::watchdog::clear_reset_cause`].
+#[inline]
+pub fn clear_reset_flags(rcu_base: u32) {
+    // RSTFC is a write-1-to-clear control bit; set it in an RMW so the IRC40K enable is undisturbed.
+    Reg32::new(rcu_base, RSTSCK).modify(RSTSCK_RSTFC, RSTSCK_RSTFC);
+}
+
 // --- bit selection ----------------------------------------------------------------------------
 
 /// The enable register + bit for a USART under the selected path.

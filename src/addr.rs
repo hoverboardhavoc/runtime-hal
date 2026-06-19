@@ -63,11 +63,16 @@ pub enum PeriphLabel {
     /// TIMER7 (the second advanced timer on parts that declare `adv_timers == 2`; ST `TIM8`).
     /// Carried for completeness; the reference F1x0 board has only `Timer0`.
     Timer7 = 17,
+    // --- G-WDG addition. APPENDED after `Timer7` so the M1/M2/M3 discriminants (0..=17) and their
+    // `AddrTable` indices stay stable (the index-stability invariant). Additive, DECISIONS.md #3.
+    /// FWDGT (the free / independent watchdog; ST `IWDG`). On APB1 at `0x4000_3000` on BOTH families.
+    /// The register block is identical on both, so one model parameterised by this base drives it.
+    Fwdgt = 18,
 }
 
 impl PeriphLabel {
     /// Number of labels; the [`AddrTable`] capacity.
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 19;
 
     /// Index of this label into the address-table backing array.
     #[inline]
@@ -111,6 +116,12 @@ impl PeriphLabel {
     #[inline]
     pub const fn is_timer(self) -> bool {
         matches!(self, PeriphLabel::Timer0 | PeriphLabel::Timer7)
+    }
+
+    /// True for the free-watchdog label (G-WDG): `Fwdgt`.
+    #[inline]
+    pub const fn is_fwdgt(self) -> bool {
+        matches!(self, PeriphLabel::Fwdgt)
     }
 }
 
@@ -180,6 +191,14 @@ pub(crate) mod ranges {
     /// TIMER7 = `0x4001_3400` (F10x); the window spans both advanced-timer instances. (The window
     /// stops below USART0 at `0x4001_3800`, which is its own range.)
     pub const ADV_TIMER_APB2: (u32, u32) = (0x4001_2C00, 0x4001_3800);
+
+    // --- G-WDG free-watchdog window. Confirmed against the GD SPL CMSIS headers (gd32f10x.h /
+    // gd32f1x0.h: `FWDGT_BASE = APB1_BUS_BASE + 0x3000 = 0x4000_3000`). The base is identical on
+    // both families, so this window is family-independent.
+
+    /// (inclusive_lo, exclusive_hi) for the FWDGT base on **APB1**: `0x4000_3000`, a single 0x400
+    /// peripheral slot (the next slot at `0x4000_3400` is SPI/the F1x0 SPI block).
+    pub const FWDGT_APB1: (u32, u32) = (0x4000_3000, 0x4000_3400);
 
     /// The GPIO range the selected gpio path expects.
     pub const fn gpio_for(gpio: crate::descriptor::GpioPath) -> (u32, u32) {
@@ -366,6 +385,23 @@ impl AddrTable {
             None => Err(DescriptorError::MissingBase(timer)),
         }
     }
+
+    /// Validate that the FWDGT label's base sits in the APB1 free-watchdog window (G-WDG).
+    ///
+    /// `Fwdgt` is at `0x4000_3000` on both families. A base outside the window is
+    /// [`DescriptorError::SelectorAddrMismatch`]; a non-FWDGT label is
+    /// [`DescriptorError::UnknownSelector`]. Same shape as [`Self::check_timer_base`].
+    pub fn check_fwdgt_base(&self, fwdgt: PeriphLabel) -> Result<(), DescriptorError> {
+        if !fwdgt.is_fwdgt() {
+            return Err(DescriptorError::UnknownSelector);
+        }
+        let (lo, hi) = ranges::FWDGT_APB1;
+        match self.get(fwdgt) {
+            Some(base) if base >= lo && base < hi => Ok(()),
+            Some(_) => Err(DescriptorError::SelectorAddrMismatch),
+            None => Err(DescriptorError::MissingBase(fwdgt)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -397,13 +433,16 @@ mod tests {
         // M3 labels APPENDED after Adc1.
         assert_eq!(PeriphLabel::Timer0 as u8, 16);
         assert_eq!(PeriphLabel::Timer7 as u8, 17);
+        // G-WDG label APPENDED after Timer7.
+        assert_eq!(PeriphLabel::Fwdgt as u8, 18);
         // index() doubles as the discriminant.
         assert_eq!(PeriphLabel::Rcu.index(), 9);
         assert_eq!(PeriphLabel::Adc1.index(), 15);
         assert_eq!(PeriphLabel::Timer0.index(), 16);
         assert_eq!(PeriphLabel::Timer7.index(), 17);
+        assert_eq!(PeriphLabel::Fwdgt.index(), 18);
         // COUNT grew to cover the new labels.
-        assert_eq!(PeriphLabel::COUNT, 18);
+        assert_eq!(PeriphLabel::COUNT, 19);
     }
 
     #[test]
@@ -412,9 +451,30 @@ mod tests {
         assert!(PeriphLabel::Spi0.is_spi() && PeriphLabel::Spi1.is_spi());
         assert!(PeriphLabel::Adc0.is_adc() && PeriphLabel::Adc1.is_adc());
         assert!(PeriphLabel::Timer0.is_timer() && PeriphLabel::Timer7.is_timer());
+        assert!(PeriphLabel::Fwdgt.is_fwdgt());
         assert!(!PeriphLabel::Rcu.is_i2c());
         assert!(!PeriphLabel::Usart1.is_spi());
         assert!(!PeriphLabel::Adc0.is_timer());
+        assert!(!PeriphLabel::Timer0.is_fwdgt());
+    }
+
+    #[test]
+    fn check_fwdgt_base_accepts_apb1_window_and_rejects_others() {
+        let mut t = AddrTable::new();
+        // FWDGT = 0x4000_3000 on both families.
+        t.set(PeriphLabel::Fwdgt, 0x4000_3000);
+        assert_eq!(t.check_fwdgt_base(PeriphLabel::Fwdgt), Ok(()));
+        // A SPI base (0x4000_3800) is above the FWDGT slot: a mismatch.
+        t.set(PeriphLabel::Fwdgt, 0x4000_3800);
+        assert_eq!(
+            t.check_fwdgt_base(PeriphLabel::Fwdgt),
+            Err(DescriptorError::SelectorAddrMismatch)
+        );
+        // A non-FWDGT label is UnknownSelector.
+        assert_eq!(
+            t.check_fwdgt_base(PeriphLabel::Timer0),
+            Err(DescriptorError::UnknownSelector)
+        );
     }
 
     #[test]

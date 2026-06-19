@@ -83,6 +83,7 @@ pub const fn descriptor_f103() -> McuDescriptor {
     addrs.set(PeriphLabel::Spi0, 0x4001_3000); // F10x SPI0 on APB2
     addrs.set(PeriphLabel::Adc0, 0x4001_2400);
     addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
+    addrs.set(PeriphLabel::Fwdgt, 0x4000_3000); // free watchdog, APB1, same base both families
     McuDescriptor {
         gpio: GpioPath::ApbCrlCrh,
         clock: ClockPath::F10xRcc,
@@ -115,6 +116,7 @@ pub const fn descriptor_f130() -> McuDescriptor {
     addrs.set(PeriphLabel::Spi0, 0x4000_3800); // F1x0 single SPI on APB1, mapped as SPI0
     addrs.set(PeriphLabel::Adc0, 0x4001_2400);
     addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
+    addrs.set(PeriphLabel::Fwdgt, 0x4000_3000); // free watchdog, APB1, same base both families
     McuDescriptor {
         gpio: GpioPath::AhbCtlAfsel,
         clock: ClockPath::F1x0Rcu,
