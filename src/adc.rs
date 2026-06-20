@@ -142,7 +142,7 @@ const CTL0_EOICIE: u32 = 1 << 7;
 
 /// The injected external-trigger source codes for TIMER0 (ETSIC field value), identical on both
 /// families (`ADC_EXTTRIG_INSERTED_T0_TRGO` = 0, `ADC_EXTTRIG_INSERTED_T0_CH3` = 1). Stored as the
-/// raw 3-bit field value; shifted into `CTL1_ETSIC` by [`Adc::configure_injected`].
+/// raw 3-bit field value; shifted into `CTL1_ETSIC` by the injected-config bring-up.
 pub const ETSIC_T0_TRGO: u32 = 0;
 /// TIMER0 CH3 event select (`ADC_EXTTRIG_INSERTED_T0_CH3`).
 pub const ETSIC_T0_CH3: u32 = 1;
@@ -194,35 +194,37 @@ impl Adc {
     /// an ADC that is already brought up (e.g. to re-read a channel, or to drive the calibration /
     /// read primitives directly). [`Adc::bring_up`] / [`Adc::configure_single`] are the configuring
     /// entry points.
+    ///
+    /// HAL-internal (the application gets an [`Adc`] handle from [`crate::Chip::adc`], which resolves
+    /// the base from the descriptor, never a raw base): `pub(crate)` so a caller cannot fabricate an
+    /// ADC base.
     #[inline]
-    pub const fn at(base: u32) -> Adc {
+    pub(crate) const fn at(base: u32) -> Adc {
         Adc { base }
     }
 
-    /// Bring up ADC0 at `base` for a single software-triggered regular conversion of `channel`,
-    /// at `sample_time` (the `ADC_SAMPLETIME_*` field code 0..=7), reproducing the SPL
-    /// single-conversion recipe (see the module docs), including the calibration step.
+    /// Bring up THIS ADC for a single software-triggered regular conversion of `channel`, at
+    /// `sample_time` (the `ADC_SAMPLETIME_*` field code 0..=7), reproducing the SPL single-conversion
+    /// recipe (see the module docs), including the calibration step. The handle already carries the
+    /// base (resolved by [`crate::Chip::adc`]); this configures `self`.
     ///
     /// `channel` becomes rank 0 of a length-1 regular sequence; the read API
     /// ([`Adc::read_channel`]) can re-point rank 0 to another channel later without re-running
     /// bring-up. If `channel` is an internal channel (16 = temperature, 17 = VREFINT) the `TSVREN`
     /// enable bit is set (open item ADC-3). Returns [`AdcError::Timeout`] if calibration does not
     /// complete within [`ADC_TIMEOUT`].
-    pub fn bring_up(base: u32, channel: u8, sample_time: u8) -> Result<Adc, AdcError> {
-        let dev = Adc::configure_single(base, channel, sample_time);
-        dev.calibrate()?;
-        Ok(dev)
+    pub fn bring_up(&self, channel: u8, sample_time: u8) -> Result<(), AdcError> {
+        self.configure_single(channel, sample_time);
+        self.calibrate()
     }
 
-    /// Program the single-conversion configuration (everything BEFORE calibration), in the order
-    /// the SPL polled example does it, and return the handle. Pure writes / RMWs; **no polling**
-    /// here, so this is what the config golden traces (the calibration poll is a separate
-    /// `with_polling` segment, exactly as the SPL config golden excludes `adc_calibration_enable`).
-    /// [`Adc::bring_up`] is `configure_single` then [`Adc::calibrate`].
-    pub fn configure_single(base: u32, channel: u8, sample_time: u8) -> Adc {
-        let dev = Adc { base };
-        dev.configure(channel, sample_time);
-        dev
+    /// Program the single-conversion configuration on THIS ADC (everything BEFORE calibration), in
+    /// the order the SPL polled example does it. Pure writes / RMWs; **no polling** here, so this is
+    /// what the config golden traces (the calibration poll is a separate `with_polling` segment,
+    /// exactly as the SPL config golden excludes `adc_calibration_enable`). [`Adc::bring_up`] is
+    /// `configure_single` then [`Adc::calibrate`].
+    pub fn configure_single(&self, channel: u8, sample_time: u8) {
+        self.configure(channel, sample_time);
     }
 
     /// The CTL0/CTL1/RSQ/SAMPT field programming (everything before calibration), in SPL order.
@@ -296,7 +298,11 @@ impl Adc {
     /// - `adc_enable`: set CTL1 ADCON.
     ///
     /// The CH3/TRGO timer side is [`crate::timer`] (T6); calibration ([`Adc::calibrate`]) follows.
-    pub fn configure_injected(
+    ///
+    /// HAL-internal (`pub(crate)`): reached only via the public chip-based injected entry
+    /// [`InjectedAdcController::configure`], which resolves the ADC base from the descriptor; a caller
+    /// never supplies a raw base.
+    pub(crate) fn configure_injected(
         base: u32,
         channels: &[(u8, u8)],
         left_aligned: bool,
@@ -333,7 +339,10 @@ impl Adc {
     /// Bring up the injected group: [`Adc::configure_injected`] then the calibration step
     /// ([`Adc::calibrate`], the RSTCLB/CLB hang-if-done-wrong sequence M2 brought up). Returns
     /// [`AdcError::Timeout`] if calibration does not complete within [`ADC_TIMEOUT`].
-    pub fn bring_up_injected(
+    ///
+    /// HAL-internal (`pub(crate)`): reached only via [`InjectedAdcController::configure`], the public
+    /// chip-based injected entry that resolves the ADC base from the descriptor.
+    pub(crate) fn bring_up_injected(
         base: u32,
         channels: &[(u8, u8)],
         left_aligned: bool,
@@ -389,9 +398,10 @@ impl Adc {
         self.read_data()
     }
 
-    /// The underlying base address (for code that needs the register-level view).
+    /// The underlying base address (for code that needs the register-level view). HAL-internal
+    /// (`pub(crate)`): a handle never hands its raw base back to a caller.
     #[inline]
-    pub const fn base(&self) -> u32 {
+    pub(crate) const fn base(&self) -> u32 {
         self.base
     }
 
@@ -554,7 +564,7 @@ pub trait TriggeredAdc {
 
 /// The timer-triggered injected-ADC config object (M3 T8/T9): a resolved single-ADC base that
 /// implements [`TriggeredAdc`]. Its [`TriggeredAdc::configure`] runs the T8 injected bring-up
-/// ([`Adc::configure_injected`] + calibration) and resolves the injected-data offsets +
+/// (the internal injected-config + calibration) and resolves the injected-data offsets +
 /// the channel count once into an [`InjectedHandle`].
 ///
 /// The base is resolved at `configure` time from the [`Chip`] for the config's ADC label, with the
