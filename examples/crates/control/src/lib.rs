@@ -165,6 +165,13 @@ impl Commutator {
         Self { handle, step }
     }
 
+    /// Re-point the alignment offset at runtime (for a bench offset sweep without reflashing): rebuild
+    /// the decoder with the same direction and the new `offset` (taken mod 6).
+    #[inline]
+    pub fn set_offset(&mut self, offset: u8) {
+        self.step = SixStep::new(self.step.direction(), offset);
+    }
+
     /// Apply the commutation step for hall `code` at `duty` (the high-side chop compare).
     ///
     /// On a valid code: floats the floating phase (disables its outputs), enables the PWM + sink
