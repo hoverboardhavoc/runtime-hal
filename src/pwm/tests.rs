@@ -75,10 +75,18 @@ fn new_brings_up_ch1_pwm_and_starts_counter() {
     assert_eq!(reg(CTL0) & (1 << 0), 1 << 0, "CEN set (counter started)");
 
     // CHCTL0 CH1 half: PWM0 (COMCTL 0b110 << 12 = 0x6000), COMSEN (bit 11 = 0x800), MS = 0.
-    assert_eq!(reg(CHCTL0), 0x6000 | 0x800, "CH1 PWM0 + shadow, output mode");
+    assert_eq!(
+        reg(CHCTL0),
+        0x6000 | 0x800,
+        "CH1 PWM0 + shadow, output mode"
+    );
 
     // CHCTL2: only CH1EN (bit 4) set; CH1P clear; no complementary bits (CH1NEN/CH1NP = 0).
-    assert_eq!(reg(CHCTL2), 1 << 4, "CH1 enabled, active-high, no complementary");
+    assert_eq!(
+        reg(CHCTL2),
+        1 << 4,
+        "CH1 enabled, active-high, no complementary"
+    );
 
     // Zero initial duty (CH1CV at 0x38).
     assert_eq!(reg(0x38), 0, "CH1CV initial duty 0");

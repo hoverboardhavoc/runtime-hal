@@ -655,7 +655,8 @@ impl DualAdc {
         sample_time: u8,
     ) {
         self.primary.configure_single(primary_channel, sample_time);
-        self.secondary.configure_single(secondary_channel, sample_time);
+        self.secondary
+            .configure_single(secondary_channel, sample_time);
         // adc_mode_config(ADC_DAUL_REGULAL_PARALLEL): set SYNCM = routine-parallel on ADC0 (master).
         // Clear-then-set the 4-bit field, exactly as the SPL RMW does.
         self.primary

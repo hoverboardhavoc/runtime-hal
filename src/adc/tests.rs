@@ -304,9 +304,7 @@ mod injected {
     use crate::adc::{InjectedAdcController, InjectedHandle, TriggeredAdc};
     use crate::addr::{AddrTable, PeriphLabel};
     use crate::chip::Chip;
-    use crate::config::{
-        AdcClockDiv, InjectedAdcConfig, InjectedChannel, TimerTriggerLink,
-    };
+    use crate::config::{AdcClockDiv, InjectedAdcConfig, InjectedChannel, TimerTriggerLink};
     use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
     use crate::error::BringUpError;
     use crate::reg::{mock, Reg32};

@@ -79,7 +79,8 @@ fn pwm_config() -> PwmConfig {
 
 /// The reference injected-ADC config (two channels, CH3-triggered, left-aligned).
 fn injected_config() -> InjectedAdcConfig {
-    let mut channels: Vec<InjectedChannel, { crate::descriptor::MAX_INJECTED_CHANNELS }> = Vec::new();
+    let mut channels: Vec<InjectedChannel, { crate::descriptor::MAX_INJECTED_CHANNELS }> =
+        Vec::new();
     channels
         .push(InjectedChannel {
             channel: 0,
@@ -135,7 +136,10 @@ fn dump_shows_moe_clear_after_config_only_bring_up() {
     let snap = RegDumpConfig::dump(TIMER0_BASE, ADC0_BASE);
     // The SAFETY invariant the verification gate asserts: a configured-but-disarmed bridge reads MOE
     // clear. `moe()` is the typed accessor; the raw CCHP bit agrees.
-    assert!(!snap.timer.moe(), "config-only must leave the bridge disarmed");
+    assert!(
+        !snap.timer.moe(),
+        "config-only must leave the bridge disarmed"
+    );
     assert_eq!(snap.timer.cchp & CCHP_MOE, 0);
 }
 

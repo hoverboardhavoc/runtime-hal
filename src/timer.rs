@@ -55,7 +55,7 @@
 use crate::chip::Chip;
 use crate::config::{OcMode, PwmConfig, TrgoSource};
 use crate::descriptor::MAX_PWM_CHANNELS;
-use crate::error::{DescriptorError, BringUpError, PwmError};
+use crate::error::{BringUpError, DescriptorError, PwmError};
 use crate::reg::Reg32;
 
 use arming::ArmGate;

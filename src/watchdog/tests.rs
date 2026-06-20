@@ -175,7 +175,11 @@ fn feed_writes_only_the_reload_key() {
     // feed() writes ONLY the reload key to CTL, leaving PSC/RLD untouched.
     assert_eq!(r(CTL), KEY_RELOAD, "feed writes the reload key");
     assert_eq!(r(PSC) & 0x7, 5, "feed leaves PSC untouched");
-    assert_eq!(r(RLD) & RELOAD_MAX as u32, 2031, "feed leaves RLD untouched");
+    assert_eq!(
+        r(RLD) & RELOAD_MAX as u32,
+        2031,
+        "feed leaves RLD untouched"
+    );
 }
 
 // --- reset cause ------------------------------------------------------------------------------

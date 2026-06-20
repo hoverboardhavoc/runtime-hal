@@ -187,7 +187,8 @@ impl PwmOut {
         let period = Self::period_for(freq_hz, timer_clk_hz)?;
 
         // Route the output pin to TIMER1_CH1, family-internal (the caller never sees the family).
-        chip.route_general_pwm_pin(pin).map_err(|_| PwmError::BadPin)?;
+        chip.route_general_pwm_pin(pin)
+            .map_err(|_| PwmError::BadPin)?;
 
         let dev = PwmOut { base, period };
         dev.configure(period);
@@ -208,7 +209,7 @@ impl PwmOut {
             return Err(PwmError::DutyOutOfRange);
         }
         let car = ticks - 1; // CAR = period - 1.
-        // Clamp to a 16-bit counter (the longest period the hardware can express).
+                             // Clamp to a 16-bit counter (the longest period the hardware can express).
         let car = if car > u16::MAX as u64 {
             u16::MAX as u64
         } else {
@@ -284,7 +285,11 @@ impl embedded_hal::pwm::SetDutyCycle for PwmOut {
     /// period so the channel stays full-on rather than never matching).
     #[inline]
     fn set_duty_cycle(&mut self, duty: u16) -> Result<(), Self::Error> {
-        let d = if duty > self.period { self.period } else { duty };
+        let d = if duty > self.period {
+            self.period
+        } else {
+            duty
+        };
         self.compare(d);
         Ok(())
     }

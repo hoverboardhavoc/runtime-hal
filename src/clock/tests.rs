@@ -1242,15 +1242,24 @@ mod tree_tests {
                 just_over(109_000_000).validate_for(ClockPath::F10xRcc),
                 Err(ClockError::InvalidWaitStates)
             );
-            assert_eq!(just_over(108_000_000).validate_for(ClockPath::F10xRcc), Ok(()));
+            assert_eq!(
+                just_over(108_000_000).validate_for(ClockPath::F10xRcc),
+                Ok(())
+            );
             // F1x0: 73 MHz rejected, 72 MHz accepted.
             assert_eq!(
                 just_over(73_000_000).validate_for(ClockPath::F1x0Rcu),
                 Err(ClockError::InvalidWaitStates)
             );
-            assert_eq!(just_over(72_000_000).validate_for(ClockPath::F1x0Rcu), Ok(()));
+            assert_eq!(
+                just_over(72_000_000).validate_for(ClockPath::F1x0Rcu),
+                Ok(())
+            );
             // The per-family difference itself: 96 MHz is fine on F10x but over-ceiling on F1x0.
-            assert_eq!(just_over(96_000_000).validate_for(ClockPath::F10xRcc), Ok(()));
+            assert_eq!(
+                just_over(96_000_000).validate_for(ClockPath::F10xRcc),
+                Ok(())
+            );
             assert_eq!(
                 just_over(96_000_000).validate_for(ClockPath::F1x0Rcu),
                 Err(ClockError::InvalidWaitStates)
