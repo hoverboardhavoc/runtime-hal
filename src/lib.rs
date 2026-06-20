@@ -67,9 +67,9 @@ pub use config::{
 };
 pub use delay::Delay;
 pub use descriptor::{
-    AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize, MAX_ADCS, MAX_ADC_CHANNELS,
-    MAX_GPIO_PORTS, MAX_I2CS, MAX_INJECTED_CHANNELS, MAX_PWM_CHANNELS, MAX_SPIS, MAX_TIMERS,
-    MAX_USARTS,
+    AdcPath, ClockPath, CounterWidth, GpioPath, IrqLayout, McuDescriptor, PageSize, MAX_ADCS,
+    MAX_ADC_CHANNELS, MAX_GPIO_PORTS, MAX_I2CS, MAX_INJECTED_CHANNELS, MAX_PWM_CHANNELS, MAX_SPIS,
+    MAX_TIMERS, MAX_USARTS,
 };
 pub use detect::{
     descriptor_f103, descriptor_f130, detect_chip, F10X_K2_THRESHOLD_KIB, FLASH_DENSITY_ADDR,

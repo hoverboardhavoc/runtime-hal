@@ -82,6 +82,35 @@ pub enum AdcPath {
     Dual = 1,
 }
 
+/// A timer's counter (and auto-reload / compare) bit width, a typed silicon fact.
+///
+/// The general-purpose `TIMER1` is the one instance whose width differs across the GD32 parts this
+/// HAL covers: it is 32-bit on the GD32F1x0 (GD32F1x0 User Manual Rev3.6 section 15.2: "Counter
+/// width: 16bit (TIMER2), 32bit (TIMER1)") and 16-bit on the GD32F10x (GD32F10x User Manual Rev2.6
+/// section 15.2 general level0 timer: "Counter width: 16 bits"). The advanced timers (`TIMER0` /
+/// `TIMER7`) are 16-bit on both. This is exposed as a typed value (the EXPOSE-CAPABILITY mechanism),
+/// never a family flag: [`crate::Chip::counter_width`] resolves it internally and the caller matches
+/// the width, not the MCU family.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterWidth {
+    /// A 16-bit counter (max period `0xFFFF`).
+    Sixteen = 16,
+    /// A 32-bit counter (max period `0xFFFF_FFFF`).
+    ThirtyTwo = 32,
+}
+
+impl CounterWidth {
+    /// The maximum counter / auto-reload value this width can express (`0xFFFF` or `0xFFFF_FFFF`).
+    #[inline]
+    pub const fn max_count(self) -> u32 {
+        match self {
+            CounterWidth::Sixteen => u16::MAX as u32,
+            CounterWidth::ThirtyTwo => u32::MAX,
+        }
+    }
+}
+
 /// Interrupt / RAM-vector-table layout selector.
 ///
 /// `f1x0_grouped` (advanced-timer break/update/trigger/commutation bundled, EXTI lines grouped)

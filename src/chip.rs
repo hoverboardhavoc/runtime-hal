@@ -13,7 +13,9 @@
 
 use crate::addr::PeriphLabel;
 use crate::adc::{Adc, AdcCapability, DualAdc};
-use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
+use crate::descriptor::{
+    AdcPath, ClockPath, CounterWidth, GpioPath, IrqLayout, McuDescriptor, PageSize,
+};
 use crate::error::DescriptorError;
 use crate::gpio::gpio_in::INPUT_GROUP_LINES;
 use crate::gpio::{
@@ -225,6 +227,28 @@ impl Chip {
         self.desc.adc_count
     }
 
+    /// The counter (and auto-reload / compare) bit width of `label`'s timer, as a typed
+    /// [`CounterWidth`] silicon fact (the EXPOSE-CAPABILITY mechanism, never a family flag).
+    ///
+    /// The general-purpose `TIMER1` is the one instance whose width differs across the parts this HAL
+    /// covers: 32-bit on the GD32F1x0, 16-bit on the GD32F10x (confirmed against the User Manuals; see
+    /// [`CounterWidth`]). The advanced timers (`TIMER0` / `TIMER7`) are 16-bit on both, and any other
+    /// label is reported as 16-bit (the conservative default). The family difference is resolved
+    /// INTERNALLY from the descriptor's register-model selector, so the caller matches the width, not
+    /// the MCU family. (Note: the cold-path general PWM [`crate::pwm::PwmOut`] uses a 16-bit period
+    /// regardless, which is valid on both widths; this accessor lets a caller that wants a longer
+    /// period on the 32-bit part know the counter can carry it.)
+    #[inline]
+    pub const fn counter_width(&self, label: PeriphLabel) -> CounterWidth {
+        // The only > 16-bit counter is the general TIMER1 on the F1x0 (32-bit); everything else is
+        // 16-bit. The F10x-vs-F1x0 split is read off the clock-path selector (an internal register
+        // model detail), NOT surfaced as a family flag.
+        match (label, self.desc.clock) {
+            (PeriphLabel::Timer1, ClockPath::F1x0Rcu) => CounterWidth::ThirtyTwo,
+            _ => CounterWidth::Sixteen,
+        }
+    }
+
     /// Whether this part HAS the given advanced timer (presence resolution): true iff `label` is an
     /// advanced-timer label whose base resolved into the descriptor in the APB2 advanced-timer window.
     /// `Timer0` is present on every part; `Timer7` only on parts detection measured a second advanced
@@ -396,6 +420,25 @@ mod tests {
         let mut bad = descriptor_f103();
         bad.adc_count = 2;
         assert!(Chip::from_descriptor(bad).adc().is_err());
+    }
+
+    #[test]
+    fn counter_width_is_32bit_only_for_the_f1x0_general_timer1() {
+        use crate::descriptor::CounterWidth;
+        // F1x0: the general TIMER1 is 32-bit (User Manual: "32bit (TIMER1)"); advanced timers 16-bit.
+        let f130 = Chip::from_descriptor(descriptor_f130());
+        assert_eq!(f130.counter_width(PeriphLabel::Timer1), CounterWidth::ThirtyTwo);
+        assert_eq!(f130.counter_width(PeriphLabel::Timer0), CounterWidth::Sixteen);
+        assert_eq!(f130.counter_width(PeriphLabel::Timer7), CounterWidth::Sixteen);
+
+        // F10x: every general level0 timer is 16-bit, TIMER1 included.
+        let f103 = Chip::from_descriptor(descriptor_f103());
+        assert_eq!(f103.counter_width(PeriphLabel::Timer1), CounterWidth::Sixteen);
+        assert_eq!(f103.counter_width(PeriphLabel::Timer0), CounterWidth::Sixteen);
+
+        // The typed value carries the max count the width can express.
+        assert_eq!(CounterWidth::Sixteen.max_count(), 0xFFFF);
+        assert_eq!(CounterWidth::ThirtyTwo.max_count(), 0xFFFF_FFFF);
     }
 
     #[test]
