@@ -12,14 +12,21 @@ import pytest
 
 from regcmp import build_rusthal, extractor, paths, targets
 
+# Post-refactor public-API GPIO-AF body: gpio::configure_af is pub(crate), so route a timer gate pin
+# through the public chip router (which writes the GPIOA AF registers plus an RCU port-clock enable).
 RUST_BODY_GPIO_AF_F1X0 = """\
-use runtime_hal::descriptor::GpioPath;
-use runtime_hal::gpio::{configure_af, PinRole};
-
-const GPIOA_BASE: u32 = 0x4800_0000;
+use runtime_hal::{AddrTable, AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize, PeriphLabel};
+use runtime_hal::Chip;
 
 pub fn body() {
-    configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 2, PinRole::Tx);
+    let mut addrs = AddrTable::new();
+    addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+    addrs.set(PeriphLabel::Gpioa, 0x4800_0000);
+    let chip = Chip::from_descriptor(McuDescriptor {
+        gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+        irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+    });
+    let _ = chip.route_advanced_pwm_pin(0x08);
 }
 """
 
@@ -41,8 +48,10 @@ def test_rusthal_gpio_af_builds_and_traces(tmp_path):
     trace = extractor.extract(out, target)
     writes = [e for e in trace.events if e.op == "W"]
     assert writes, f"no writes captured; status={trace.status}"
-    # All writes land in the GPIOA window.
-    assert all(0x48000000 <= w.address < 0x48000400 for w in writes), writes
+    # The router writes the GPIOA AF registers (plus an RCU port-clock enable); assert the GPIOA
+    # window writes are present (the RCU enable is the only non-GPIOA write).
+    gpioa = [w for w in writes if 0x48000000 <= w.address < 0x48000400]
+    assert gpioa, f"no GPIOA writes captured; writes={writes}"
     assert "clean-exit" in trace.status, trace.status
 
 

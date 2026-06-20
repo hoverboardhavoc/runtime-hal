@@ -80,6 +80,25 @@ impl Chip {
         Ok(GpioOutput::new(base, self.desc.gpio, pin))
     }
 
+    /// Configure a pin as an analog input so the ADC mux samples its true voltage.
+    ///
+    /// Resolves `port` to its base from the chip's address table and configures `pin` as analog
+    /// through `configure_analog` (which owns the F10x/F1x0 register-model branch internally). The
+    /// reset state of a pin is a *digital* input on BOTH families (not analog), so an ADC input pin
+    /// must be set to analog explicitly or the ADC samples through an active digital input buffer and
+    /// reads a clamped / stuck value. There is no handle to return: an analog pin is owned by the ADC,
+    /// not driven or read as GPIO. `pin` is the pin number (0..15) within the port. Returns
+    /// [`DescriptorError::MissingBase`] if the port is not in the address table.
+    ///
+    /// The caller is expected to have enabled the port clock (e.g. via [`Chip::gpioa`]); this only
+    /// writes the pin's mode bits.
+    #[inline]
+    pub fn analog_pin(&self, port: PeriphLabel, pin: u8) -> Result<(), DescriptorError> {
+        let base = self.base(port)?;
+        gpio::configure_analog(base, self.desc.gpio, pin);
+        Ok(())
+    }
+
     /// Resolve a GPIO port label to a typed [`GpioPort`], enabling its port clock.
     ///
     /// Shared body of the named getters ([`Chip::gpioa`] .. [`Chip::gpiof`]): it resolves the port's

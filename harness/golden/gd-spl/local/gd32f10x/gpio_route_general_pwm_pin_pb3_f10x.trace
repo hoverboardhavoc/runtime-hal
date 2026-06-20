@@ -1,0 +1,19 @@
+# regcmp v0.1.0 captured 2026-06-20T09:23:57Z
+# vector:        gpio_route_general_pwm_pin_pb3_f10x
+# library:       gd-spl
+# target:        gd32f10x
+# compiler:      arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1 (Build arm-15.86)) 15.2.1 20251203
+# compile_flags: -Os -mcpu=cortex-m3 -mthumb -fno-common -ffreestanding -fno-builtin -std=gnu11 -Wall -ffunction-sections -fdata-sections -Wno-unused-but-set-variable -Wno-unused-variable -Wno-comment
+# emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
+# emulation:     clean-exit (sentinel reached at instr 207)
+# mode:          final_state
+R4 <RCU_BASE>+0x18 0x00000000   # APB2EN
+W4 <RCU_BASE>+0x18 0x00000001   # APB2EN
+R4 <AFIO_BASE>+0x04 0x00000000   # PCF0
+R4 <AFIO_BASE>+0x04 0x00000000   # PCF0
+W4 <AFIO_BASE>+0x04 0x00000000   # PCF0
+W4 <AFIO_BASE>+0x04 0x02000000   # PCF0
+R4 <AFIO_BASE>+0x04 0x02000000   # PCF0
+W4 <AFIO_BASE>+0x04 0x0F000200   # PCF0
+R4 <GPIOB_BASE>+0x00 0x44444444   # CTL0
+W4 <GPIOB_BASE>+0x00 0x4444B444   # CTL0

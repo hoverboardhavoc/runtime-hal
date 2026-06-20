@@ -79,7 +79,7 @@ implementations:
     body: |
       use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
       use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
-      use runtime_hal::hotpath::{ComplementaryPwm, PwmController};
+      use runtime_hal::timer::{ComplementaryPwm, PwmController};
       use runtime_hal::config::{BreakConfig, PwmChannelConfig, PwmConfig, PwmAlign, OcMode, ClockDiv, TrgoSource};
 
       fn chip() -> Chip {

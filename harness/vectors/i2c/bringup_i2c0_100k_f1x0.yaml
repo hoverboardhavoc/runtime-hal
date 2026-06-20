@@ -36,7 +36,15 @@ description: |
 #   CKCFG  +0x1C : CLKC = 180 (standard, FAST/DTCY 0) 0x000000B4
 #   SADDR0 +0x08 : own-address register value (raw)  0x00000024
 #   CTL0   +0x00 : I2CEN(0) | ACKEN(10)              0x00000401
+#
+# API NOTE (post-refactor): I2c::bring_up(config) is gone; the public bring-up is I2c::new, which
+# CONSUMES the split SCL/SDA pins and so ALSO routes GPIOB (and enables the port/peripheral clocks).
+# The compare is scoped with assert_only to the I2C0 timing/mode window, so the GPIOB AF writes and
+# the RCU clock enables are out of scope (the GPIOB AF side is covered by gpio_af_i2c0_scl_sda).
 mode: final_state
+
+assert_only:
+  - "<I2C0_BASE>"
 
 implementations:
   gd-spl/gd32f1x0:
@@ -51,12 +59,14 @@ implementations:
     body: |
       use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
       use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
-      use runtime_hal::i2c::{FastDuty, I2c};
+      use runtime_hal::i2c::I2c;
+      use runtime_hal::I2cMode;
       use runtime_hal::clock::ClockConfig;
-      use runtime_hal::config::I2cConfig;
 
       fn chip() -> Chip {
           let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpiob, 0x4800_0400);
           addrs.set(PeriphLabel::I2c0, 0x4000_5400);
           Chip::from_descriptor(McuDescriptor {
               gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
@@ -66,8 +76,10 @@ implementations:
 
       pub fn body() {
           // The default 72 MHz tree: APB1 = 36 MHz, so i2c_input_clock = 36 MHz and
-          // the SPL formula yields I2CCLK = 0x24, RT = 0x25, CKCFG = 0xB4.
-          let cfg = I2cConfig { i2c: PeriphLabel::I2c0, scl: 0x16, sda: 0x17, speed_hz: 100_000,
-              duty: FastDuty::Two, own_addr: 0x24 };
-          let _ = I2c::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+          // the SPL formula yields I2CCLK = 0x24, RT = 0x25, CKCFG = 0xB4. The own-address (0x24) is
+          // the bench-validated MASTER_OWN_ADDR I2c::new programs internally.
+          let chip = chip();
+          let pins = chip.gpiob().unwrap().split();
+          let _ = I2c::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::I2c0,
+              (pins.pb6, pins.pb7), I2cMode::standard(100_000)).unwrap();
       }

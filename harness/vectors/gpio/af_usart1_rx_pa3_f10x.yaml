@@ -1,32 +1,47 @@
 name: af_usart1_rx_pa3_f10x
 description: |
-  GPIO config for PA3 = USART1 RX on the F10x (apb_crl_crh) GPIO model. RX is a
-  floating input = nibble 0x4 (GPIO_MODE_IN_FLOATING; not an output, so no speed
-  ORed in). Pin 3 lives in CTL0 at nibble 3 (shift 12).
+  GPIO alternate-function routing for the USART1 RX pin (PA3 = RX) on the F10x
+  (apb_crl_crh) GPIO model. RX is a floating input (CTL0 nibble 0x4). After the
+  runtime-hal refactor the only public path is Usart::new(chip, clock, Usart1,
+  (pa2, pa3), baud), which routes BOTH TX (PA2) and RX (PA3); this vector traces
+  the same call as the TX vector with PA3's RX nibble as the headline.
 
-  runtime-hal: configure_af(GPIOA_BASE, ApbCrlCrh, 3, Rx).
-  GD SPL: gpio_init(GPIOA, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, GPIO_PIN_3).
+  runtime-hal: chip.gpioa().split(); Usart::new(chip, REFERENCE_72M_IRC8M, Usart1,
+               (pa2, pa3), 115200).
+  GD SPL: gpio_init(AF_PP, PA2) + gpio_init(IN_FLOATING, PA3).
 
-# Mode rationale: register_writes. Both oracles emit a single CTL0 RMW:
-#   W4 CTL0 = 0x44444444  (reset 0x44444444, nibble 3 -> 0x4, unchanged)  +0x00
-# Nibble 3's reset value is already 0x4 (floating input is the GPIO reset mode),
-# so the written value equals the reset value; the RMW still occurs and both
-# oracles emit the identical write.
-mode: register_writes
+# Mode rationale: final_state scoped to GPIOA. CTL0 nibble 3 (PA3) = 0x4 floating
+# input, which equals the reset nibble, so RX leaves CTL0's PA3 nibble unchanged.
+# Final CTL0 = 0x44444B44 (only PA2's TX nibble moved).
+mode: final_state
+
+assert_only:
+  - "<GPIOA_BASE>"
 
 implementations:
   gd-spl/gd32f10x:
     includes: [gd32f10x.h, gd32f10x_gpio.h]
     body: |
+      gpio_init(GPIOA, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2);
       gpio_init(GPIOA, GPIO_MODE_IN_FLOATING, GPIO_OSPEED_50MHZ, GPIO_PIN_3);
 
   runtime-hal/gd32f10x:
     body: |
-      use runtime_hal::descriptor::GpioPath;
-      use runtime_hal::gpio::{configure_af, PinRole};
-
-      const GPIOA_BASE: u32 = 0x4001_0800;
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::usart::Usart;
+      use runtime_hal::clock::ClockConfig;
 
       pub fn body() {
-          configure_af(GPIOA_BASE, GpioPath::ApbCrlCrh, 3, PinRole::Rx);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpioa, 0x4001_0800);
+          addrs.set(PeriphLabel::Usart1, 0x4000_4400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
+          });
+          let pins = chip.gpioa().unwrap().split();
+          let _ = Usart::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::Usart1,
+              (pins.pa2, pins.pa3), 115200).unwrap();
       }

@@ -6,5 +6,5 @@ compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
 chip_define:   
 compile_flags: cargo build --release --target thumbv7m-none-eabi
 emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
-emulation:     clean-exit (sentinel reached at instr 57)
+emulation:     clean-exit (sentinel reached at instr 189)
 mode:          with_polling

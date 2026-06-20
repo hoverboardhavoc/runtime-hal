@@ -16,7 +16,13 @@ description: |
 #   CTL0 +0x00 = 0x44444444 with nibbles 6,7 -> 0xF = 0xFF444444.
 # (The contrast with the SPI AF-PP vector, nibble 0xB, is exactly the
 # open-drain-vs-push-pull slip the width-strict golden catches.)
+# After the refactor the only public path that routes I2C pins is I2c::new, which
+# routes BOTH SCL (PB6) and SDA (PB7) and also programs the I2C0 + RCU registers.
+# Scope the compare to the GPIOB window with assert_only (only CTL0 is touched).
 mode: final_state
+
+assert_only:
+  - "<GPIOB_BASE>"
 
 implementations:
   gd-spl/gd32f10x:
@@ -26,14 +32,22 @@ implementations:
 
   runtime-hal/gd32f10x:
     body: |
-      use runtime_hal::descriptor::GpioPath;
-      use runtime_hal::gpio::{configure_af, PinRole};
-
-      const GPIOB_BASE: u32 = 0x4001_0C00;
-      const PB6: u8 = (1 << 4) | 6;
-      const PB7: u8 = (1 << 4) | 7;
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::i2c::I2c;
+      use runtime_hal::I2cMode;
+      use runtime_hal::clock::ClockConfig;
 
       pub fn body() {
-          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, PB6, PinRole::I2cAfOpenDrain);
-          configure_af(GPIOB_BASE, GpioPath::ApbCrlCrh, PB7, PinRole::I2cAfOpenDrain);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpiob, 0x4001_0C00);
+          addrs.set(PeriphLabel::I2c0, 0x4000_5400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
+          });
+          let pins = chip.gpiob().unwrap().split();
+          let _ = I2c::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::I2c0,
+              (pins.pb6, pins.pb7), I2cMode::standard(100_000)).unwrap();
       }

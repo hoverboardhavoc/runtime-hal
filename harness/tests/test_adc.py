@@ -179,3 +179,55 @@ def test_adc_read_traces_trigger_poll_then_data():
     rdata = next(i for i, e in enumerate(seq)
                  if i > eoc_done and e[0] == "R" and e[1] == "<ADC0_BASE>+0x4C")
     assert rsq < trig < eoc_done < rdata, seq
+
+
+# --- dual-ADC (F10x only): regular-simultaneous config two-oracle + SYNCM headline -------------
+
+DUAL_ADC = ("adc_dual_adc_simultaneous_f10x", "gd32f10x")
+
+
+@needs_tools
+def test_dual_adc_config_two_oracle():
+    """The F10x Dual arm: chip.adc() -> Dual; configure_simultaneous(ch4, ch5, st) reaches the same
+    end state as the GD SPL per-ADC single config + adc_mode_config(ADC_DAUL_REGULAL_PARALLEL)."""
+    vector_id, _family = DUAL_ADC
+    vec = vectors.find(vector_id)
+    out_dir = paths.build_dir() / vec.vector_id
+    rh, spl = runner.canonical_pair(vec)
+    cr, _a, _b = runner.compare_implementations(vec, rh, spl, out_dir)
+    assert cr.matched, "\n".join(cr.diff)
+
+
+@needs_tools
+def test_dual_adc_config_against_golden():
+    vector_id, family = DUAL_ADC
+    vec = vectors.find(vector_id)
+    out_dir = paths.build_dir() / vec.vector_id
+    slug = vec.impl_for("runtime-hal").slug
+    golden = paths.golden_dir() / "gd-spl" / "local" / family / f"{vector_id}.trace"
+    assert golden.exists(), f"golden missing: {golden}"
+    cr, _live = runner.compare_against_trace(vec, slug, golden, out_dir)
+    assert cr.matched, "\n".join(cr.diff)
+
+
+@needs_tools
+def test_dual_adc_sync_mode_is_regular_parallel():
+    """Headline dual-ADC number: ADC0 CTL0 SYNCM field ([19:16]) == 6 (ADC_DAUL_REGULAL_PARALLEL),
+    the regular-parallel sync mode that couples the two ADCs."""
+    vector_id, _family = DUAL_ADC
+    vec = vectors.find(vector_id)
+    out_dir = paths.build_dir() / vec.vector_id
+    slug = vec.impl_for("runtime-hal").slug
+    bt = runner.build_and_extract(vec, slug, out_dir)
+    lines = engine.lines_from_extracted(bt.trace)
+    ctl0 = [l for l in lines if l.op == "W" and l.address_str == "<ADC0_BASE>+0x04"]
+    assert ctl0, "no ADC0 CTL0 write in the runtime-hal trace"
+    syncm = (ctl0[-1].value >> 16) & 0xF
+    assert syncm == 6, f"ADC0 SYNCM must be 6 (regular-parallel), got {syncm}: {[l.render() for l in ctl0]}"
+
+
+@pytest.mark.parametrize("vector_id,family", [DUAL_ADC])
+def test_dual_adc_golden_committed(vector_id, family):
+    g = paths.golden_dir() / "gd-spl" / "local" / family / f"{vector_id}.trace"
+    assert g.exists(), f"golden missing: {g}"
+    assert f"# vector:        {vector_id}" in g.read_text()

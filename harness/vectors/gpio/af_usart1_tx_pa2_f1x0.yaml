@@ -1,48 +1,63 @@
 name: af_usart1_tx_pa2_f1x0
 description: |
-  GPIO alternate-function config for PA2 = USART1 TX at AF1 on the F1x0
-  (ahb_ctl_afsel) GPIO model. The thinnest end-to-end slice: pure writes, no
-  polling, no clock bring-up. Exercises the vendored SPL build, the runtime-hal
-  Rust-snippet build, the MMIO hooks, reset-value seeding (the RMWs read first),
-  symbol-keying, width-strictness, and the ordered diff.
+  GPIO alternate-function routing for the USART1 TX/RX pins (PA2 = TX, PA3 = RX)
+  at AF1 on the F1x0 (ahb_ctl_afsel) GPIO model. After the runtime-hal refactor
+  the only public path that routes a USART pin's alternate function is
+  Usart::new(chip, clock, Usart1, (pa2, pa3), baud), which routes BOTH pins at
+  once (TX = AF push-pull, RX = AF input). There is no public per-pin AF call, so
+  this vector now traces Usart::new and compares ONLY the GPIOA register window
+  (assert_only), excluding the RCU port/USART clock enables and the USART1 BAUD/
+  CTL programming that Usart::new also performs.
 
-  runtime-hal: a single configure_af(GPIOA_BASE, AhbCtlAfsel, 2, Tx) call.
-  GD SPL: gpio_mode_set + gpio_af_set + gpio_output_options_set for PA2.
+  runtime-hal: chip.gpioa().split(); Usart::new(chip, REFERENCE_72M_IRC8M, Usart1,
+               (pa2, pa3), 115200).
+  GD SPL: gpio_mode_set(AF) + gpio_af_set(AF_1) for PA2|PA3, then output options
+          for PA2 (TX drives the line) and PUD none for PA3 (RX input).
 
-# Mode rationale: register_writes (ordered writes, reads ignored). The two
-# implementations agree on every meaningful write in value, width, and order:
-#   W4 CTL=0x20, W4 PUD=0x00, W4 AFSEL0=0x100, W4 OMODE=0x00, W4 OSPD=0x30.
-# The ONLY difference is that the SPL's gpio_af_set unconditionally rewrites BOTH
-# AFSEL halves (its loop touches AFSEL0 and AFSEL1), so the SPL emits an extra
-# `W4 AFSEL1 0x00` which is a no-op rewrite of AFSEL1's reset value. runtime-hal
-# correctly writes only AFSEL0 (the half holding pin 2). Both leave AFSEL1 = 0,
-# so end-state is identical; the SPL write is redundant, not a runtime-hal bug.
-# We `ignore` AFSEL1 (GPIOA_BASE+0x24) so register_writes compares the meaningful
-# ordered writes and matches cleanly. (final_state would also need this ignore,
-# since it keys per written address and the SPL writes AFSEL1 while runtime-hal
-# does not.)
-mode: register_writes
+# Mode rationale: final_state, scoped to the GPIOA window with assert_only. Both
+# pins land in the same GPIOA registers (CTL, OMODE, OSPD, PUD, AFSEL0), so a
+# single-pin compare is not separable on the F1x0 (CTL/AFSEL0 carry both pins'
+# fields). End state on GPIOA:
+#   CTL    +0x00 : PA2 + PA3 = AF mode (2) -> (2<<4)|(2<<6) = 0xA0
+#   AFSEL0 +0x20 : PA2 + PA3 = AF1         -> (1<<8)|(1<<12) = 0x1100
+#   OMODE  +0x04 : push-pull               -> 0
+#   OSPD   +0x08 : PA2 50MHz (TX)          -> (3<<4) = 0x30 ; PA3 (RX input) leaves 0
+#   PUD    +0x0C : no pull                 -> 0
+# assert_only restricts the compare to the GPIOA base window, so the USART1 and
+# RCU writes Usart::new emits are out of scope (the matching SPL body does only
+# the GPIO config). The headline: CTL = 0xA0, AFSEL0 = 0x1100.
+mode: final_state
 
-ignore:
-  - "<GPIOA_BASE>+0x24"   # AFSEL1: SPL no-op rewrite; runtime-hal skips it (both leave it 0)
+assert_only:
+  - "<GPIOA_BASE>+0x00..0x0C"   # CTL, OMODE, OSPD, PUD
+  - "<GPIOA_BASE>+0x20"         # AFSEL0 (pins 2,3). AFSEL1 (+0x24) excluded: SPL no-op rewrites it, runtime-hal skips it.
 
 implementations:
   gd-spl/gd32f1x0:
     includes: [gd32f1x0.h, gd32f1x0_gpio.h]
     body: |
-      gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_2);
-      gpio_af_set(GPIOA, GPIO_AF_1, GPIO_PIN_2);
+      // TX (PA2) is AF push-pull; RX (PA3) is AF input (no output options).
+      gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_2 | GPIO_PIN_3);
+      gpio_af_set(GPIOA, GPIO_AF_1, GPIO_PIN_2 | GPIO_PIN_3);
       gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2);
 
   runtime-hal/gd32f1x0:
     body: |
-      use runtime_hal::descriptor::GpioPath;
-      use runtime_hal::gpio::{configure_af, PinRole};
-
-      // Base equals the target file's GPIOA_BASE so symbols resolve to the
-      // golden's addresses.
-      const GPIOA_BASE: u32 = 0x4800_0000;
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::usart::Usart;
+      use runtime_hal::clock::ClockConfig;
 
       pub fn body() {
-          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 2, PinRole::Tx);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpioa, 0x4800_0000);
+          addrs.set(PeriphLabel::Usart1, 0x4000_4400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          });
+          let pins = chip.gpioa().unwrap().split();
+          let _ = Usart::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::Usart1,
+              (pins.pa2, pins.pa3), 115200).unwrap();
       }

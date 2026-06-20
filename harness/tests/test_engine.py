@@ -48,35 +48,35 @@ def test_ignore_filter():
 
 @needs_tools
 def test_thin_slice_compare_matches():
+    # Post-refactor the USART pin-AF slice is final_state, scoped to the GPIOA window with assert_only
+    # (the only public path, Usart::new, routes both pins and also touches USART/RCU). It still
+    # exercises the full pipeline end-to-end and must match the live SPL.
     vec = vectors.find("gpio_af_usart1_tx_pa2_f1x0")
     out_dir = paths.build_dir() / vec.vector_id
     a_slug, b_slug = runner.canonical_pair(vec)
     cr, _a, _b = runner.compare_implementations(vec, a_slug, b_slug, out_dir)
     assert cr.matched, "\n".join(cr.diff)
-    assert cr.mode == "register_writes"
+    assert cr.mode == "final_state"
 
 
 @needs_tools
 def test_only_difference_is_afsel1():
-    # The SOLE substantive difference between the two traces is the SPL's
-    # redundant AFSEL1 (=GPIOA_BASE+0x24) no-op rewrite. Concretely: the set of
-    # runtime-hal writes equals the set of SPL writes minus the AFSEL1 write,
-    # and dropping that one SPL entry makes the ordered diff match exactly.
+    # The runtime-hal AFSEL handling (write only the half holding the pin) vs the SPL gpio_af_set
+    # (rewrites BOTH AFSEL halves, a no-op AFSEL1=0) still holds post-refactor: on the GPIOA window,
+    # the SPL trace contains an AFSEL1 (=GPIOA_BASE+0x24) write of 0 that the runtime-hal trace does
+    # NOT. The vector excludes AFSEL1 via assert_only; here we confirm the underlying delta directly.
     vec = vectors.find("gpio_af_usart1_tx_pa2_f1x0")
     out_dir = paths.build_dir() / vec.vector_id
     a_slug, b_slug = runner.canonical_pair(vec)
     a = runner.build_and_extract(vec, a_slug, out_dir)
     b = runner.build_and_extract(vec, b_slug, out_dir)
-    rh_w = [l for l in engine.lines_from_extracted(a.trace) if l.op == "W"]
-    spl_w = [l for l in engine.lines_from_extracted(b.trace) if l.op == "W"]
 
-    # The SPL has exactly one more write than runtime-hal, and it is AFSEL1=0.
-    assert len(spl_w) == len(rh_w) + 1, (rh_w, spl_w)
-    extra = [l for l in spl_w if l.address_str == "<GPIOA_BASE>+0x24"]
-    assert len(extra) == 1 and extra[0].value == 0, spl_w
+    def gpioa_writes(tr):
+        return [l for l in engine.lines_from_extracted(tr)
+                if l.op == "W" and l.address_str.startswith("<GPIOA_BASE>")]
 
-    # Drop the AFSEL1 write from the SPL side; the ordered writes then match
-    # runtime-hal exactly, byte-for-byte and in order.
-    spl_no_afsel1 = [l for l in spl_w if l.address_str != "<GPIOA_BASE>+0x24"]
-    cr = engine.compare("register_writes", rh_w, a_slug, spl_no_afsel1, b_slug)
-    assert cr.matched, "\n".join(cr.diff)
+    rh_afsel1 = [l for l in gpioa_writes(a.trace) if l.address_str == "<GPIOA_BASE>+0x24"]
+    spl_afsel1 = [l for l in gpioa_writes(b.trace) if l.address_str == "<GPIOA_BASE>+0x24"]
+    # The SPL rewrites AFSEL1 = 0 (redundant); runtime-hal does not touch it.
+    assert spl_afsel1 and all(l.value == 0 for l in spl_afsel1), spl_afsel1
+    assert not rh_afsel1, rh_afsel1

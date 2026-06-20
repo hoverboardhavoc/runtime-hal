@@ -30,6 +30,7 @@ description: |
 mode: final_state
 
 ignore:
+  - "<RCU_BASE>"          # route_advanced_pwm_pin enables each port clock (AHBEN); SPL body omits it
   - "<GPIOA_BASE>+0x20"   # AFSEL0: SPL no-op rewrite (pins 8..15 use AFSEL1)
   - "<GPIOB_BASE>+0x20"   # AFSEL0: SPL no-op rewrite
 
@@ -47,19 +48,26 @@ implementations:
 
   runtime-hal/gd32f1x0:
     body: |
-      use runtime_hal::descriptor::GpioPath;
-      use runtime_hal::gpio::{configure_af, PinRole};
-
-      const GPIOA_BASE: u32 = 0x4800_0000;
-      const GPIOB_BASE: u32 = 0x4800_0400;
+      use runtime_hal::{AddrTable, AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize, PeriphLabel};
+      use runtime_hal::Chip;
 
       pub fn body() {
-          // High side CH0/1/2 on PA8/9/10.
-          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 8,  PinRole::TimerAfPushPull);
-          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 9,  PinRole::TimerAfPushPull);
-          configure_af(GPIOA_BASE, GpioPath::AhbCtlAfsel, 10, PinRole::TimerAfPushPull);
-          // Low side CH0N/1N/2N on PB13/14/15.
-          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, 13, PinRole::TimerAfPushPull);
-          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, 14, PinRole::TimerAfPushPull);
-          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, 15, PinRole::TimerAfPushPull);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpioa, 0x4800_0000);
+          addrs.set(PeriphLabel::Gpiob, 0x4800_0400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel,
+              clock: ClockPath::F1x0Rcu,
+              adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped,
+              addrs,
+              flash_page: PageSize::K1,
+              adv_timers: 1,
+              adc_count: 1,
+          });
+          // High side CH0/1/2 on PA8/9/10, low side CH0N/1N/2N on PB13/14/15.
+          for pin in [0x08u8, 0x09, 0x0A, 0x1D, 0x1E, 0x1F] {
+              let _ = chip.route_advanced_pwm_pin(pin);
+          }
       }

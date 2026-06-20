@@ -1,0 +1,48 @@
+name: route_general_pwm_pin_pb3_f1x0
+description: |
+  GPIO alternate-function routing for the general-purpose-timer PWM output
+  (TIMER1_CH1 -> PB3) on the F1x0 (ahb_ctl_afsel) GPIO model, via the public
+  chip.route_general_pwm_pin(PB3) router. On the F1x0 this is a per-pin AF mux
+  write: PB3 set to AF2 (TIMER1_CH1), AF push-pull 50 MHz, plus the GPIOB port
+  clock enable (AHBEN). The AFIO remap mechanism is F10x-only (no AFIO on F1x0).
+
+  runtime-hal: chip.route_general_pwm_pin(0x13).
+  GD SPL: gpio_mode_set(AF) + gpio_af_set(AF_2, PIN_3) + gpio_output_options_set(PP,
+          50MHZ, PIN_3) on GPIOB.
+
+# Mode rationale: final_state, scoped to the GPIOB window with assert_only (the RCU
+# port-clock enable is excluded; the SPL body omits it). End state on GPIOB pin 3:
+#   CTL    +0x00 : PB3 = AF mode (2) at shift 6   -> 0x80
+#   AFSEL0 +0x20 : PB3 = AF2 at shift 12          -> 0x2000
+#   OMODE  +0x04 : push-pull                      -> 0
+#   OSPD   +0x08 : 50MHz (3) at shift 6           -> 0xC0
+#   PUD    +0x0C : no pull                        -> 0
+mode: final_state
+
+assert_only:
+  - "<GPIOB_BASE>+0x00..0x0C"   # CTL, OMODE, OSPD, PUD
+  - "<GPIOB_BASE>+0x20"         # AFSEL0 (pin 3). AFSEL1 (+0x24) excluded: SPL gpio_af_set no-op rewrite.
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_gpio.h]
+    body: |
+      gpio_mode_set(GPIOB, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_3);
+      gpio_af_set(GPIOB, GPIO_AF_2, GPIO_PIN_3);
+      gpio_output_options_set(GPIOB, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_3);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+
+      pub fn body() {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpiob, 0x4800_0400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          });
+          let _ = chip.route_general_pwm_pin(0x13); // PB3 = TIMER1_CH1
+      }

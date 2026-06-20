@@ -21,12 +21,19 @@ description: |
   TRIGGER-MATRIX INVARIANT (test_timer.py): the timer CH3 compare at ~CAR-1 (2249) AND the ADC
   injected ETSIC = TIMER0 CH3 (code 1): the single cross-peripheral check for the timer->ADC coupling.
 
-# Mode rationale: final_state. End state per register:
+# Mode rationale: final_state, scoped with assert_only to the calibration-FREE injected config
+# registers (CTL0/SAMPT1/ISQ), excluding CTL1 which the public injected path's calibration perturbs.
+# See inject_bringup_adc0_f1x0 for the full API-forced-scoping rationale. CTL1 ETSIC/ETEIC is
+# validated by test_trigger_matrix_invariant on the raw trace.
 #   CTL0   +0x04 : EOICIE (bit 7)                                          0x00000080
-#   CTL1   +0x08 : ADCON(0)|DAL(11)|ETSIC(1<<12)|ETEIC(15)                 0x00009801
 #   SAMPT1 +0x10 : ch4 (3*4=12) + ch5 (3*5=15) sample-time = 1 each        0x00009000
 #   ISQ    +0x38 : IL=1 (len-1, 1<<20); rank0 ch4 @10; rank1 ch5 @15       0x00129000
 mode: final_state
+
+assert_only:
+  - "<ADC0_BASE>+0x04"   # CTL0 EOICIE
+  - "<ADC0_BASE>+0x10"   # SAMPT1
+  - "<ADC0_BASE>+0x38"   # ISQ
 
 implementations:
   gd-spl/gd32f10x:
@@ -43,10 +50,29 @@ implementations:
 
   runtime-hal/gd32f10x:
     body: |
-      use runtime_hal::adc::{Adc, ETSIC_T0_CH3};
-
-      const ADC0_BASE: u32 = 0x4001_2400;
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::adc::TriggeredAdc;
+      use runtime_hal::adc::InjectedAdcController;
+      use runtime_hal::config::{InjectedAdcConfig, InjectedChannel, TimerTriggerLink, AdcClockDiv};
 
       pub fn body() {
-          let _ = Adc::configure_injected(ADC0_BASE, &[(4, 1), (5, 1)], true, ETSIC_T0_CH3);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Adc0, 0x4001_2400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
+          });
+          let mut channels = heapless::Vec::new();
+          let _ = channels.push(InjectedChannel { channel: 4, sample_time: 1 });
+          let _ = channels.push(InjectedChannel { channel: 5, sample_time: 1 });
+          let cfg = InjectedAdcConfig {
+              adc: PeriphLabel::Adc0,
+              channels,
+              left_aligned: true,
+              trigger_timer: PeriphLabel::Timer0,
+              trigger_link: TimerTriggerLink::Ch3,
+              clock_div: AdcClockDiv::Div6,
+          };
+          let _ = InjectedAdcController::new().configure(&chip, &cfg);
       }

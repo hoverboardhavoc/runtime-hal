@@ -25,10 +25,15 @@ description: |
 # The SPL's gpio_af_set rewrites BOTH AFSEL halves (its loop touches AFSEL1), a
 # no-op rewrite of AFSEL1's reset value 0 that runtime-hal skips; both leave
 # AFSEL1 = 0, so we ignore AFSEL1 (the same redundant-write the M1 af vectors note).
+# After the refactor the only public path that routes I2C pins is I2c::new, which
+# routes BOTH SCL (PB6) and SDA (PB7). It also programs the I2C0 timing/mode regs
+# and the RCU clock enables, so the compare is scoped to the GPIOB window with
+# assert_only (excluding AFSEL1 +0x24, the SPL no-op rewrite runtime-hal skips).
 mode: final_state
 
-ignore:
-  - "<GPIOB_BASE>+0x24"   # AFSEL1: SPL no-op rewrite; runtime-hal skips it (both leave it 0)
+assert_only:
+  - "<GPIOB_BASE>+0x00..0x0C"   # CTL, OMODE, OSPD, PUD
+  - "<GPIOB_BASE>+0x20"         # AFSEL0 (pins 6,7). AFSEL1 (+0x24) excluded: SPL no-op rewrite.
 
 implementations:
   gd-spl/gd32f1x0:
@@ -40,14 +45,22 @@ implementations:
 
   runtime-hal/gd32f1x0:
     body: |
-      use runtime_hal::descriptor::GpioPath;
-      use runtime_hal::gpio::{configure_af, PinRole};
-
-      const GPIOB_BASE: u32 = 0x4800_0400;
-      const PB6: u8 = (1 << 4) | 6;
-      const PB7: u8 = (1 << 4) | 7;
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::i2c::I2c;
+      use runtime_hal::I2cMode;
+      use runtime_hal::clock::ClockConfig;
 
       pub fn body() {
-          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, PB6, PinRole::I2cAfOpenDrain);
-          configure_af(GPIOB_BASE, GpioPath::AhbCtlAfsel, PB7, PinRole::I2cAfOpenDrain);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpiob, 0x4800_0400);
+          addrs.set(PeriphLabel::I2c0, 0x4000_5400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          });
+          let pins = chip.gpiob().unwrap().split();
+          let _ = I2c::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::I2c0,
+              (pins.pb6, pins.pb7), I2cMode::standard(100_000)).unwrap();
       }

@@ -40,8 +40,18 @@ GPIOF_BASE  = 0x40011C00
 I2C0_BASE   = 0x40005400
 SPI0_BASE   = 0x40013000
 ADC0_BASE   = 0x40012400
+# ADC1 (F10x second ADC) on APB2 at 0x40012800. F10x-only (the F1x0 has a single ADC = ADC0); used by
+# the dual/simultaneous-acquisition vector. Same register block as ADC0.
+ADC1_BASE   = 0x40012800
 # M3 (T3) advanced timer: TIMER0 on APB2 (ST TIM1), the complementary-PWM bridge timer.
 TIMER0_BASE = 0x40012C00
+# AFIO peripheral-config block on APB2 (0x40010000). F10x-ONLY: it holds the SWJ_CFG remap and the
+# per-peripheral remap groups (PCF0). The general-PWM pin router (route_general_pwm_pin) writes
+# AFIO_PCF0 to free the JTAG overlay + select the TIMER1 partial remap. (No AFIO on the F1x0.)
+AFIO_BASE   = 0x40010000
+
+[register_names.AFIO_BASE]
+"0x04" = "PCF0"
 
 [register_names.RCU_BASE]
 "0x00" = "CTL"
@@ -190,6 +200,34 @@ TIMER0_BASE = 0x40012C00
 # both oracles). STAT/RDATA reset is irrelevant to the config golden (only the transfer reads them);
 # the transfer with_polling vector scripts STAT EOC + RDATA via read_responses.
 [reset_values.ADC0_BASE]
+"0x00" = "0x00000000"
+"0x04" = "0x00000000"
+"0x08" = "0x00000000"
+"0x0C" = "0x00000000"
+"0x10" = "0x00000000"
+"0x2C" = "0x00000000"
+"0x30" = "0x00000000"
+"0x34" = "0x00000000"
+"0x38" = "0x00000000"
+
+# ADC1 register names + reset values (F10x dual-ADC; copies ADC0's layout).
+[register_names.ADC1_BASE]
+"0x00" = "STAT"
+"0x04" = "CTL0"
+"0x08" = "CTL1"
+"0x0C" = "SAMPT0"
+"0x10" = "SAMPT1"
+"0x2C" = "RSQ0"
+"0x30" = "RSQ1"
+"0x34" = "RSQ2"
+"0x38" = "ISQ"
+"0x3C" = "IDATA0"
+"0x40" = "IDATA1"
+"0x44" = "IDATA2"
+"0x48" = "IDATA3"
+"0x4C" = "RDATA"
+
+[reset_values.ADC1_BASE]
 "0x00" = "0x00000000"
 "0x04" = "0x00000000"
 "0x08" = "0x00000000"

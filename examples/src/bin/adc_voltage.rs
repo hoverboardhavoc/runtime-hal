@@ -1,22 +1,28 @@
-//! ADC voltage monitor on the bench twin-board (F103 master / F130 slave), one image, runtime-detected.
-//!
-//! Reads two voltages with the on-chip ADC and shows the bus level on two LEDs, while publishing the
-//! raw + converted values to a fixed RAM block for SWD readback:
+//! ADC voltage monitor: one runtime-detected image (F10x / F1x0), reads bus voltage and shows the
+//! level on two LEDs, publishing the raw + converted values to a fixed RAM block for SWD readback:
 //!
 //! - **VREFINT** (the internal ~1.2 V bandgap, ADC channel 17): a known voltage, so it yields the real
 //!   supply `VDDA = 1.2 V * 4095 / vrefint_raw`. This is the ADC-alive / accuracy anchor (no external
-//!   wiring, both boards). A healthy reading is roughly `vrefint_raw ~ 1489` at VDDA ~ 3.3 V.
+//!   wiring). A healthy reading is roughly `vrefint_raw ~ 1489` at VDDA ~ 3.3 V.
 //! - **VBATT** (the bus/battery divider on PA4 = ADC channel 4): converted to real bus volts via the
-//!   board calibration pair below.
+//!   divider ratio below.
+//!
+//! # Requires a board that wires the battery to PA4
+//!
+//! This only produces a real bus reading on a board whose PA4 is on the VBATT divider, i.e. a board
+//! that actually senses the pack voltage. A board that does not sense battery leaves PA4 on some
+//! other fixed node, so `vbatt_raw` reads a stuck value that does not track the bus. VREFINT / VDDA
+//! still read correctly regardless (no external pin), so the SWD block proves the ADC is alive
+//! either way.
 //!
 //! # LEDs
 //!
 //! - **Lower LED (PB5)** lit when the bus is **under 20 V**.
-//! - **Green LED (PB3)** lit when the bus is **over 25 V**.
+//! - **Upper LED (PB2)** lit when the bus is **over 25 V**.
 //! - Between 20 V and 25 V, neither is lit.
 //!
-//! PB3 (green) sits on the always-on rail; PB5 (lower) sits behind the SELF_HOLD power latch, so the
-//! example drives SELF_HOLD (PB12) high to power its rail.
+//! Both LEDs (PB2 upper, PB5 lower) sit behind the SELF_HOLD power latch, so the example drives
+//! SELF_HOLD (PB12) high to power their rail. Neither pin is JTAG-overlaid, so no JTAG freeing needed.
 //!
 //! # SWD readback
 //!
@@ -26,10 +32,10 @@
 //!
 //! # Calibration (board-specific, do this once)
 //!
-//! `BAT_CALIB_*` maps a raw VBATT count to real bus volts and is specific to the board's divider (the
-//! defaults are EFeru's config.h values, NOT necessarily this board's). To calibrate: set a known PSU
-//! voltage, read `ADC_OBS.vbatt_raw` over SWD, then set `BAT_CALIB_ADC` = that raw and `BAT_CALIB_CV` =
-//! the PSU volts * 100. The 20 V / 25 V LED thresholds are only meaningful once this is calibrated.
+//! `VBATT_DIVIDER` is the battery-volts-per-pin-volt ratio of the VBATT resistor divider (factor 30
+//! from the RoboDurden defines). Bus volts are reconstructed VDDA-referenced (VDDA measured live from
+//! VREFINT), so only the one divider constant is board-specific. Recalibrate from a known PSU point:
+//! `DIVIDER = bus_mv * 4095 / (vbatt_raw * vdda_mv)`. The 20 V / 25 V LED thresholds depend on it.
 //!
 //! # Safety
 //!
@@ -49,8 +55,8 @@ use runtime_hal::{detect_chip, enable_adc, AdcCapability, Delay, PeriphLabel};
 
 /// ADC channel for the internal VREFINT bandgap (16 = temperature, 17 = VREFINT on these parts).
 const VREFINT_CH: u8 = 17;
-/// ADC channel for VBATT: PA4 = ADC_IN4 (RoboDurden master `defines_2-2-20.h`: VBATT on PA4). Confirm
-/// the F130 slave wires the same channel before trusting its reading.
+/// ADC channel for VBATT: PA4 = ADC_IN4 (RoboDurden `defines`: VBATT on PA4). Only meaningful on a
+/// board that wires the battery divider to PA4 (see the module "Requires" note).
 const VBATT_CH: u8 = 4;
 /// Sample-time code 7 (239.5 cycles): needed for the high-impedance internal VREFINT, and safe for the
 /// VBATT resistor divider. Set once per channel before the read loop.
@@ -58,16 +64,18 @@ const SAMPLE_LONG: u8 = 7;
 /// The GD32 internal reference is ~1.2 V (1200 mV) nominal.
 const VREFINT_MV: u32 = 1200;
 
-// --- VBATT calibration (raw ADC count <-> real bus volts). BOARD-SPECIFIC; see the module docs. -----
-// Defaults from EFeru config.h (`BAT_CALIB_ADC` / `BAT_CALIB_REAL_VOLTAGE`): 1492 counts == 39.70 V.
-/// Raw ADC count measured at `BAT_CALIB_CV`.
-const BAT_CALIB_ADC: u32 = 1492;
-/// The bus voltage at `BAT_CALIB_ADC`, in centivolts (volts * 100). 3970 = 39.70 V.
-const BAT_CALIB_CV: u32 = 3970;
+// --- VBATT calibration: one divider ratio, VDDA-referenced. ------------------------------------
+// Bus voltage is reconstructed as `bus = (vbatt_raw / 4095) * VDDA * DIVIDER`, with VDDA measured
+// live from VREFINT each pass (so a drifting 3.3 V rail does not skew the reading). DIVIDER is the
+// battery-volts-per-pin-volt ratio of the VBATT resistor divider, factor 30 from the RoboDurden
+// defines (`ADC_BATTERY_VOLT`). One constant suffices across chip families: the battery-sensing
+// boards measured ~31x on both F10x and F1x0 silicon (within resistor tolerance of 30). Recalibrate
+// from a known supply point with DIVIDER = bus_mv * 4095 / (vbatt_raw * vdda_mv).
+const VBATT_DIVIDER: u32 = 30;
 
 /// Bus voltage below which the lower LED lights (millivolts).
 const LOW_MV: u32 = 20_000;
-/// Bus voltage above which the green LED lights (millivolts).
+/// Bus voltage above which the upper LED lights (millivolts).
 const HIGH_MV: u32 = 25_000;
 
 /// The reset IRC8M core clock this example runs on (no PLL bring-up); the `sysclk_hz` for `Delay`.
@@ -104,26 +112,30 @@ fn main() -> ! {
     // Detect the chip; a part matching neither family panics (panic_halt halts): fail-loud.
     let chip = detect_chip().unwrap();
 
-    // Port clocks: A (PA4 = VBATT) and B (the LEDs + SELF_HOLD). PA4 is left at its reset floating-input
-    // state; the ADC mux samples it. (An explicit analog-mode pin config is a HAL gap, noted; for a
-    // divider node the reset state reads correctly enough for this monitor.)
+    // Port clocks: A (PA4 = VBATT) and B (the LEDs + SELF_HOLD).
     let _ = chip.gpioa();
     let _ = chip.gpiob();
 
-    // SELF_HOLD (PB12) high to power the lower-LED rail; green (PB3) is on the always-on rail.
+    // PA4 must be ANALOG, not its reset digital-input state, or the ADC samples through the live
+    // digital input buffer and reads a stuck/clamped value (the stock firmware does the same with
+    // `pinMode(VBATT, GPIO_MODE_ANALOG)`). The reset state is a digital input on BOTH families.
+    chip.analog_pin(PeriphLabel::Gpioa, 4).unwrap(); // PA4 (ADC channel 4 = VBATT)
+
+    // SELF_HOLD (PB12) high to power the rail both LEDs (PB2 upper, PB5 lower) sit behind. Neither pin
+    // is JTAG-overlaid, so no JTAG freeing is needed (PB3/PB4/PA15 are the overlay pins; we avoid them).
     let mut self_hold = chip.output_pin(PeriphLabel::Gpiob, 12).unwrap();
     let _ = self_hold.set_high();
-    let mut led_green = chip.output_pin(PeriphLabel::Gpiob, 3).unwrap();
+    let mut led_upper = chip.output_pin(PeriphLabel::Gpiob, 2).unwrap();
     let mut led_lower = chip.output_pin(PeriphLabel::Gpiob, 5).unwrap();
-    let _ = led_green.set_low();
+    let _ = led_upper.set_low();
     let _ = led_lower.set_low();
 
     // Enable the ADC0 peripheral clock (the chip.adc() fruit resolves handles, not the bus clock).
     let rcu = chip.rcu_base().unwrap();
     enable_adc(rcu, chip.clock(), PeriphLabel::Adc0).unwrap();
 
-    // Voltage uses the SINGLE-ADC path: take the primary ADC of the capability fruit (both families;
-    // dual-simultaneous is for phase currents, not voltages).
+    // Voltage uses the SINGLE-ADC path: take the primary ADC of the capability fruit (dual-
+    // simultaneous is for phase currents, not voltages).
     let adc = match chip.adc().unwrap() {
         AdcCapability::Single(a) => a,
         AdcCapability::Dual(dual) => dual.primary(),
@@ -145,9 +157,9 @@ fn main() -> ! {
             0
         };
 
-        // VBATT -> bus volts via the board calibration (raw * volts-per-count).
+        // VBATT -> bus volts, VDDA-referenced: bus = (raw / 4095) * VDDA * DIVIDER.
         let vbatt_raw = adc.read_channel(VBATT_CH).unwrap_or(0);
-        let bus_mv = u32::from(vbatt_raw) * BAT_CALIB_CV * 10 / BAT_CALIB_ADC;
+        let bus_mv = u32::from(vbatt_raw) * vdda_mv * VBATT_DIVIDER / 4095;
 
         // Publish for SWD readback (one volatile struct store; seq proves liveness).
         seq = seq.wrapping_add(1);
@@ -165,16 +177,16 @@ fn main() -> ! {
             );
         }
 
-        // LEDs: lower under 20 V, green over 25 V, neither in between.
+        // LEDs: lower under 20 V, upper over 25 V, neither in between.
         if bus_mv < LOW_MV {
             let _ = led_lower.set_high();
-            let _ = led_green.set_low();
+            let _ = led_upper.set_low();
         } else if bus_mv > HIGH_MV {
-            let _ = led_green.set_high();
+            let _ = led_upper.set_high();
             let _ = led_lower.set_low();
         } else {
             let _ = led_lower.set_low();
-            let _ = led_green.set_low();
+            let _ = led_upper.set_low();
         }
 
         delay.delay_ms(100);

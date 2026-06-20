@@ -21,7 +21,9 @@ def test_committed_golden_exists():
     assert GOLDEN.exists(), f"golden missing: {GOLDEN}"
     text = GOLDEN.read_text()
     assert "# vector:        gpio_af_usart1_tx_pa2_f1x0" in text
-    assert "W4 <GPIOA_BASE>+0x00 0x00000020" in text
+    # Post-refactor: Usart::new routes BOTH PA2 (TX) and PA3 (RX), so CTL carries both pins' AF mode
+    # (2<<4 | 2<<6 = 0xA0), not just PA2's 0x20.
+    assert "W4 <GPIOA_BASE>+0x00 0x000000A0" in text
 
 
 @needs_tools
@@ -39,8 +41,8 @@ def test_edited_golden_fails(tmp_path):
     out_dir = paths.build_dir() / vec.vector_id
     slug = vec.impl_for("runtime-hal").slug
     edited = tmp_path / "edited.trace"
-    # Perturb the CTL write value 0x20 -> 0x21.
-    edited.write_text(GOLDEN.read_text().replace("0x00000020", "0x00000021"))
+    # Perturb the CTL write value 0xA0 -> 0xA1.
+    edited.write_text(GOLDEN.read_text().replace("0x000000A0", "0x000000A1"))
     cr, _live = runner.compare_against_trace(vec, slug, edited, out_dir)
     assert not cr.matched
     assert any("+0x00" in d for d in cr.diff)

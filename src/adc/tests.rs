@@ -198,6 +198,13 @@ fn read_channel_triggers_repoints_rank0_and_returns_value() {
         CTL1_SWRCST,
         "software trigger (SWRCST) set"
     );
+    // EOC is cleared after the read so the NEXT channel's poll waits for its own conversion rather
+    // than returning this one's stale RDATA (the multi-channel mirroring bug).
+    assert_eq!(
+        r(STAT) & STAT_EOC,
+        0,
+        "EOC cleared after read so the next read does not see a stale flag"
+    );
 }
 
 #[test]

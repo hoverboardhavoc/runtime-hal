@@ -1,0 +1,72 @@
+name: set_channel_outputs_timer0_f1x0
+description: |
+  Advanced-timer TIMER0 per-channel output enable via the public PwmHandle
+  set_channel_outputs([true, false, true]) on the F1x0 family: enable the main +
+  complementary outputs of CH0 and CH2, disable CH1. This is the PwmHandle channel-
+  gating surface (distinct from the per-cycle duty write and the MOE ArmGate).
+
+  runtime-hal: PwmController::new().configure(&chip, &cfg); h.set_channel_outputs([true, false, true]).
+    set_channel_outputs RMWs CHCTL2: per enabled channel it sets CCxEN (bit0 of the
+    channel nibble) AND CCxNEN (bit2), per disabled channel it clears both.
+  GD SPL: the full bring-up channel enables, then disable CH1's main + complementary
+    output (timer_channel_output_state_config / _complementary_output_state_config).
+
+# Mode rationale: final_state, scoped to CHCTL2 (+0x20) with assert_only. Both oracles do the full
+# complementary-bridge channel bring-up (the same oc config as pwm_bringup, which sets per channel
+# CCxEN(bit0) | CCxNEN(bit2) | CCxNP(bit3, from OCN_POLARITY_LOW) = 0xD), THEN set_channel_outputs
+# clears CH1's CCxEN/CCxNEN (mask = CCxEN|CCxNEN only; the CCxNP polarity bit is left intact). End
+# state for [CH0 on, CH1 off, CH2 on]:
+#   CHCTL2 +0x20 : CH0 = 0xD, CH1 = 0x8 (polarity bit only), CH2 = 0xD<<8 = 0x00000D8D
+mode: final_state
+
+assert_only:
+  - "<TIMER0_BASE>+0x20"   # CHCTL2: per-channel CCxEN/CCxNEN/CCxNP
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_timer.h]
+    body: |
+      timer_oc_parameter_struct oc;
+      oc.outputstate  = TIMER_CCX_ENABLE;
+      oc.outputnstate = TIMER_CCXN_ENABLE;
+      oc.ocpolarity   = TIMER_OC_POLARITY_HIGH;
+      oc.ocnpolarity  = TIMER_OCN_POLARITY_LOW;   /* sets CCxNP (bit3 of the channel nibble) */
+      oc.ocidlestate  = TIMER_OC_IDLE_STATE_HIGH;
+      oc.ocnidlestate = TIMER_OCN_IDLE_STATE_HIGH;
+      timer_channel_output_config(TIMER0, TIMER_CH_0, &oc);
+      timer_channel_output_config(TIMER0, TIMER_CH_1, &oc);
+      timer_channel_output_config(TIMER0, TIMER_CH_2, &oc);
+      /* set_channel_outputs([true,false,true]): disable CH1 main + complementary (CCxNP retained). */
+      timer_channel_output_state_config(TIMER0, TIMER_CH_1, TIMER_CCX_DISABLE);
+      timer_channel_complementary_output_state_config(TIMER0, TIMER_CH_1, TIMER_CCXN_DISABLE);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::timer::{ComplementaryPwm, PwmController};
+      use runtime_hal::config::{BreakConfig, PwmChannelConfig, PwmConfig, PwmAlign, OcMode, ClockDiv, TrgoSource};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let ch = |high: u8, low: u8| PwmChannelConfig { high, low, polarity: true, idle_high: true, idle_high_n: true };
+          let cfg = PwmConfig {
+              timer: PeriphLabel::Timer0,
+              channels: [ch(0x08, 0x1D), ch(0x09, 0x1E), ch(0x0A, 0x1F)],
+              period: 2250, prescaler: 0, dead_time: 0x1C,
+              brk: BreakConfig { enabled: false, level: false },
+              trigger_compare: 2249,
+              align: PwmAlign::Center2, arse: true, trigger_oc_mode: OcMode::Pwm0,
+              trigger_ch_enable: false, crep: 0, ckdiv: ClockDiv::Div2, trgo_src: TrgoSource::Update,
+          };
+          let h = PwmController::new().configure(&chip(), &cfg).unwrap();
+          h.set_channel_outputs([true, false, true]);
+      }

@@ -1,12 +1,36 @@
-# regcmp v0.1.0 captured 2026-06-17T18:51:01Z
+# regcmp v0.1.0 captured 2026-06-20T09:08:30Z
 # vector:        i2c_transfer_whoami_f1x0
 # library:       runtime-hal
 # target:        gd32f1x0
 # compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
 # compile_flags: cargo build --release --target thumbv7m-none-eabi
 # emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
-# emulation:     clean-exit (sentinel reached at instr 335)
+# emulation:     clean-exit (sentinel reached at instr 792)
 # mode:          with_polling
+R4 <RCU_BASE>+0x14 0x00000000   # AHBEN
+W4 <RCU_BASE>+0x14 0x00040000   # AHBEN
+R4 <RCU_BASE>+0x1C 0x00000000   # APB1EN
+W4 <RCU_BASE>+0x1C 0x00200000   # APB1EN
+R4 <GPIOB_BASE>+0x00 0x00000000   # CTL
+W4 <GPIOB_BASE>+0x00 0x00002000   # CTL
+R4 <GPIOB_BASE>+0x0C 0x00000000   # PUD
+W4 <GPIOB_BASE>+0x0C 0x00001000   # PUD
+R4 <GPIOB_BASE>+0x20 0x00000000   # AFSEL0
+W4 <GPIOB_BASE>+0x20 0x01000000   # AFSEL0
+R4 <GPIOB_BASE>+0x04 0x00000000   # OMODE
+W4 <GPIOB_BASE>+0x04 0x00000040   # OMODE
+R4 <GPIOB_BASE>+0x08 0x00000000   # OSPD
+W4 <GPIOB_BASE>+0x08 0x00003000   # OSPD
+R4 <GPIOB_BASE>+0x00 0x00002000   # CTL
+W4 <GPIOB_BASE>+0x00 0x0000A000   # CTL
+R4 <GPIOB_BASE>+0x0C 0x00001000   # PUD
+W4 <GPIOB_BASE>+0x0C 0x00005000   # PUD
+R4 <GPIOB_BASE>+0x20 0x01000000   # AFSEL0
+W4 <GPIOB_BASE>+0x20 0x11000000   # AFSEL0
+R4 <GPIOB_BASE>+0x04 0x00000040   # OMODE
+W4 <GPIOB_BASE>+0x04 0x000000C0   # OMODE
+R4 <GPIOB_BASE>+0x08 0x00003000   # OSPD
+W4 <GPIOB_BASE>+0x08 0x0000F000   # OSPD
 R4 <I2C0_BASE>+0x04 0x00000000   # CTL1
 W4 <I2C0_BASE>+0x04 0x00000024   # CTL1
 W4 <I2C0_BASE>+0x20 0x00000025   # RT

@@ -68,16 +68,17 @@ implementations:
 
   runtime-hal/gd32f1x0:
     body: |
-      use runtime_hal::adc::Adc;
-
-      const ADC0_BASE: u32 = 0x4001_2400;
+      use runtime_hal::Chip;
+      use runtime_hal::detect::descriptor_f130;
+      use runtime_hal::adc::AdcCapability;
 
       pub fn body() {
-          // VREFINT = internal channel 17; sample-time code 7 = 239.5 cycles (the slowest, what the
-          // internal channels need to settle, open item ADC-3). configure_single programs the single
-          // software-triggered conversion config WITHOUT the calibration poll, exactly as this
-          // config golden's SPL body excludes adc_calibration_enable (which polls). The calibration
-          // poll is exercised in the with_polling transfer_vrefint vector. bring_up() = this +
-          // calibrate().
-          let _ = Adc::configure_single(ADC0_BASE, 17, 7);
+          let chip = Chip::from_descriptor(descriptor_f130());
+          // VREFINT = internal channel 17; sample-time code 7 = 239.5 cycles (the slowest). The Single
+          // arm of the ADC selector; configure_single programs the software-triggered single conversion
+          // config WITHOUT the calibration poll, exactly as this config golden's SPL body excludes
+          // adc_calibration_enable. bring_up() = configure_single + calibrate().
+          if let Ok(AdcCapability::Single(adc)) = chip.adc() {
+              adc.configure_single(17, 7);
+          }
       }

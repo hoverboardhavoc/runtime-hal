@@ -1,0 +1,77 @@
+name: dual_adc_simultaneous_f10x
+description: |
+  Dual-ADC regular-simultaneous (routine-parallel) configuration on the F10x family
+  (the only family with two ADCs). ADC0 (master) samples channel 4, ADC1 (slave)
+  samples channel 5, both at 7.5-cycle sample time (code 1); ADC0 CTL0 SYNCM is set to the
+  regular-parallel sync mode. This is the Dual arm of the chip ADC selector (the F1x0
+  has only the Single arm). configure_simultaneous is config-only (no poll), so it is
+  a clean final_state two-oracle golden.
+
+  runtime-hal: chip.adc() -> AdcCapability::Dual(d); d.configure_simultaneous(4, 5, 1).
+    Internally: configure_single(ch4) on ADC0, configure_single(ch5) on ADC1, then set
+    ADC0 CTL0 SYNCM = 6 (regular-parallel).
+  GD SPL: per-ADC single-channel regular config (scan/continuous off, right align, length
+    1, rank0 = ch4 on ADC0 / ch5 on ADC1, sample time, software ext-trigger, ADCON) plus
+    adc_mode_config(ADC_DAUL_REGULAL_PARALLEL) which sets ADC0 CTL0 SYNCM = CTL0_SYNCM(6).
+    (Note the GD SPL's macro spelling: DAUL / REGULAL.)
+
+  The read path (read_simultaneous) polls ADC0 EOC, which Unicorn cannot set, so it is
+  NOT traced here; this golden is the configuration write end-state only (same scope as
+  the calibrate / clock-lock vectors).
+
+# Mode rationale: final_state. configure_single (per ADC) + the SYNCM set are all bare config writes.
+# End state (per the runtime-hal trace; both ADCs configured single, ADC0 carries SYNCM):
+#   ADC0 CTL0  +0x04 : SM cleared + SYNCM = 6<<16 = 0x00060000
+#   ADC0 CTL1  +0x08 : ADCON | ETSRC(software 7<<17) | ETERC(20)      0x001E0001
+#   ADC0 SAMPT1 +0x10: ch4 sample time code 1 (1 << 3*4=12)           0x00001000
+#   ADC0 RSQ2  +0x34 : rank0 = ch4                                    0x00000004
+#   ADC1 CTL1  +0x08 : ADCON | ETSRC | ETERC(20)                      0x001E0001
+#   ADC1 SAMPT1 +0x10: ch5 sample time code 1 (1 << 3*5=15)           0x00008000
+#   ADC1 RSQ2  +0x34 : rank0 = ch5                                    0x00000005
+# Headline (test): ADC0 CTL0 SYNCM field ([19:16]) == 6.
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_adc.h]
+    body: |
+      adc_special_function_config(ADC0, ADC_SCAN_MODE, DISABLE);
+      adc_special_function_config(ADC0, ADC_CONTINUOUS_MODE, DISABLE);
+      adc_data_alignment_config(ADC0, ADC_DATAALIGN_RIGHT);
+      adc_channel_length_config(ADC0, ADC_REGULAR_CHANNEL, 1U);
+      adc_regular_channel_config(ADC0, 0U, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
+      adc_external_trigger_source_config(ADC0, ADC_REGULAR_CHANNEL, ADC0_1_2_EXTTRIG_REGULAR_NONE);
+      adc_external_trigger_config(ADC0, ADC_REGULAR_CHANNEL, ENABLE);
+      adc_enable(ADC0);
+
+      adc_special_function_config(ADC1, ADC_SCAN_MODE, DISABLE);
+      adc_special_function_config(ADC1, ADC_CONTINUOUS_MODE, DISABLE);
+      adc_data_alignment_config(ADC1, ADC_DATAALIGN_RIGHT);
+      adc_channel_length_config(ADC1, ADC_REGULAR_CHANNEL, 1U);
+      adc_regular_channel_config(ADC1, 0U, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
+      adc_external_trigger_source_config(ADC1, ADC_REGULAR_CHANNEL, ADC0_1_2_EXTTRIG_REGULAR_NONE);
+      adc_external_trigger_config(ADC1, ADC_REGULAR_CHANNEL, ENABLE);
+      adc_enable(ADC1);
+
+      adc_mode_config(ADC_DAUL_REGULAL_PARALLEL);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::adc::AdcCapability;
+
+      pub fn body() {
+          // Dual-ADC descriptor: adc_count = 2, AdcPath::Dual, Adc0 AND Adc1 bases carried.
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Adc0, 0x4001_2400);
+          addrs.set(PeriphLabel::Adc1, 0x4001_2800);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Dual,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 2,
+          });
+          if let Ok(AdcCapability::Dual(d)) = chip.adc() {
+              // ADC0 ch4, ADC1 ch5, 1.5-cycle sample time. Config-only (no EOC poll).
+              d.configure_simultaneous(4, 5, 1);
+          }
+      }

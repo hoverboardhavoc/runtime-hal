@@ -51,13 +51,16 @@ reset_overrides:
 implementations:
   runtime-hal/gd32f1x0:
     body: |
-      use runtime_hal::adc::Adc;
-
-      const ADC0_BASE: u32 = 0x4001_2400;
+      use runtime_hal::Chip;
+      use runtime_hal::detect::descriptor_f130;
+      use runtime_hal::adc::AdcCapability;
 
       pub fn body() {
-          // calibrate() alone (a bare handle, no configure noise): set RSTCLB, poll it clear, set
-          // CLB, poll it clear. This is exactly the SPL adc_calibration_enable sequence; the
-          // with_polling stub scripts the two done bits busy -> done so the bounded poll exits.
-          let _ = Adc::at(ADC0_BASE).calibrate();
+          // calibrate() alone (no configure noise): set RSTCLB, poll it clear, set CLB, poll it clear.
+          // This is exactly the SPL adc_calibration_enable sequence; the with_polling stub scripts the
+          // two done bits busy -> done so the bounded poll exits.
+          let chip = Chip::from_descriptor(descriptor_f130());
+          if let Ok(AdcCapability::Single(adc)) = chip.adc() {
+              let _ = adc.calibrate();
+          }
       }

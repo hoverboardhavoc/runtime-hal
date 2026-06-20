@@ -404,7 +404,21 @@ impl Adc {
     pub fn read_channel(&self, channel: u8) -> Result<u16, AdcError> {
         self.set_regular_rank(0, channel);
         self.software_trigger();
-        self.read_data()
+        let value = self.read_data()?;
+        // Clear EOC after reading (the SPL's `adc_flag_clear(ADC_FLAG_EOC)` step). Without it the
+        // flag stays set, so the NEXT read's EOC poll passes immediately on the stale flag and
+        // returns the PRIOR conversion's RDATA: a second channel (e.g. VBATT right after VREFINT)
+        // then mirrors the first channel's value instead of tracking its own input.
+        self.clear_eoc();
+        Ok(value)
+    }
+
+    /// Clear the regular end-of-conversion flag (STAT EOC), the SPL's `adc_flag_clear(ADC_FLAG_EOC)`
+    /// (a write-0-to-clear of the EOC bit). Called after a read so the next conversion's EOC poll
+    /// waits for that conversion, not a stale flag from the prior channel.
+    #[inline]
+    pub fn clear_eoc(&self) {
+        self.stat().modify(STAT_EOC, 0);
     }
 
     /// The underlying base address (for code that needs the register-level view). HAL-internal

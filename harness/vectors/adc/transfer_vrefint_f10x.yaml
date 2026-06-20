@@ -25,10 +25,18 @@ reset_overrides:
 implementations:
   runtime-hal/gd32f10x:
     body: |
-      use runtime_hal::adc::Adc;
-
-      const ADC0_BASE: u32 = 0x4001_2400;
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::adc::AdcCapability;
 
       pub fn body() {
-          let _ = Adc::at(ADC0_BASE).read_channel(17);
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Adc0, 0x4001_2400);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
+          });
+          if let Ok(AdcCapability::Single(adc)) = chip.adc() {
+              let _ = adc.read_channel(17);
+          }
       }

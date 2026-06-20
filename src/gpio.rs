@@ -94,6 +94,10 @@ const F1X0_MODE_INPUT: u32 = 0;
 /// CTL = general-purpose output (`GPIO_MODE_OUTPUT = 1`, `gd32f1x0_gpio.h:295`).
 const F1X0_MODE_OUTPUT: u32 = 1;
 const F1X0_MODE_AF: u32 = 2;
+/// CTL = analog mode (`GPIO_MODE_ANALOG = 3`, `gd32f1x0_gpio.h`): disconnects the Schmitt-trigger
+/// digital input buffer so the ADC mux can sample the pin. The reset state is INPUT (`0`), NOT
+/// analog, so an ADC input pin must be set to this explicitly.
+const F1X0_MODE_ANALOG: u32 = 3;
 const F1X0_OSPEED_50MHZ: u32 = 3;
 const F1X0_PUPD_NONE: u32 = 0;
 const F1X0_PUPD_PULLUP: u32 = 1;
@@ -465,6 +469,44 @@ fn configure_input_f1x0(port_base: u32, n: u32, pull: InputPull) {
     };
     let pud_shift = 2 * n;
     Reg32::new(port_base, F1X0_PUD).modify(0x3u32 << pud_shift, pupd << pud_shift);
+}
+
+/// Configure a logical pin as an analog input, disconnecting the digital input buffer so the ADC
+/// mux samples the true pin voltage.
+///
+/// The analog counterpart to [`configure_input`]: it owns the F10x/F1x0 register-model branch
+/// internally so callers never see the [`GpioPath`] split. The reset state of an ADC pin is a
+/// *digital* input on BOTH families (F10x floating input, F1x0 `CTL` = input `0`), not analog, so
+/// the ADC otherwise samples through an active Schmitt trigger and reads a clamped / stuck value.
+/// This mirrors the SPL `pinMode(VBATT, GPIO_MODE_ANALOG)` the stock firmware does before sampling.
+///
+/// - F10x (CRL/CRH): the pin's 4-bit nibble = analog (CNF `0b00` / MODE `0b00`) = `0x0`, per
+///   `gd32f10x_gpio.c::gpio_init` (`GPIO_MODE_AIN`).
+/// - F1x0 (CTL/PUD): `CTL` = analog mode (`0b11`); `GPIO_PUD` cleared to floating (a pull would
+///   distort the analog reading), per `gd32f1x0_gpio.c::gpio_mode_set`.
+pub(crate) fn configure_analog(port_base: u32, path: GpioPath, pin: u8) {
+    let n = (pin & 0x0F) as u32;
+    match path {
+        GpioPath::ApbCrlCrh => {
+            // F10x: analog input is the all-zero nibble (CNF 00 / MODE 00).
+            let (offset, within) = if n < 8 {
+                (F10X_CTL0, n)
+            } else {
+                (F10X_CTL1, n - 8)
+            };
+            let shift = 4 * within;
+            Reg32::new(port_base, offset).modify(0xFu32 << shift, 0x0u32 << shift);
+        }
+        GpioPath::AhbCtlAfsel => {
+            // F1x0: CTL = analog (0b11), PUD = floating.
+            let ctl_shift = 2 * n;
+            Reg32::new(port_base, F1X0_CTL)
+                .modify(0x3u32 << ctl_shift, F1X0_MODE_ANALOG << ctl_shift);
+            let pud_shift = 2 * n;
+            Reg32::new(port_base, F1X0_PUD)
+                .modify(0x3u32 << pud_shift, F1X0_PUPD_NONE << pud_shift);
+        }
+    }
 }
 
 /// Read the live level of a logical input pin from the family's `GPIO_ISTAT` register.

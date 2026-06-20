@@ -1,11 +1,13 @@
-# regcmp v0.1.0 captured 2026-06-17T16:53:31Z
+# regcmp v0.1.0 captured 2026-06-20T08:46:47Z
 # vector:        gpio_af_usart1_tx_pa2_f10x
 # library:       gd-spl
 # target:        gd32f10x
 # compiler:      arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1 (Build arm-15.86)) 15.2.1 20251203
 # compile_flags: -Os -mcpu=cortex-m3 -mthumb -fno-common -ffreestanding -fno-builtin -std=gnu11 -Wall -ffunction-sections -fdata-sections -Wno-unused-but-set-variable -Wno-unused-variable -Wno-comment
 # emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
-# emulation:     clean-exit (sentinel reached at instr 133)
-# mode:          register_writes
+# emulation:     clean-exit (sentinel reached at instr 267)
+# mode:          final_state
 R4 <GPIOA_BASE>+0x00 0x44444444   # CTL0
+W4 <GPIOA_BASE>+0x00 0x44444B44   # CTL0
+R4 <GPIOA_BASE>+0x00 0x44444B44   # CTL0
 W4 <GPIOA_BASE>+0x00 0x44444B44   # CTL0

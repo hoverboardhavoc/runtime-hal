@@ -18,6 +18,9 @@ crate-type = ["staticlib"]
 # Path dep on the runtime-hal crate at the repo root. Default features = real
 # volatile MMIO. The `mock` feature is deliberately NOT enabled.
 runtime-hal = { path = "../.." }
+# Matches runtime-hal's heapless (Cargo.lock 0.8.0): the injected-ADC config carries a
+# heapless::Vec the injected-bringup snippet builds directly.
+heapless = "0.8.0"
 
 [profile.release]
 # LTO must not inline the path-fn call away to nothing observable, and panic =
