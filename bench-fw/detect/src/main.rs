@@ -9,7 +9,7 @@
 //!
 //! It writes a fixed-layout result struct ([`DetectResult`]) to a `.bss` `static mut`, writes the
 //! `magic` word LAST, then idles in `wfi`, the same result-struct pattern the `coldpath` firmware uses:
-//! the SWD reader resolves the struct address with `arm-none-eabi-nm`, reads it NON-HALTING, and `magic`
+//! the SWD reader reads the struct at its FIXED address ([`RESULT_ADDR`]) NON-HALTING, and `magic`
 //! written last means the whole run completed. The struct address is NOT pinned to a fixed section
 //! (a fixed RAM-origin section collided with cortex-m-rt's RAM allocation).
 //!
@@ -98,11 +98,17 @@ struct DetectResult {
 /// The magic value written last once the whole run completed.
 const MAGIC: u32 = 0x4DF7_0B1E;
 
-/// The result struct, a zero-initialised `static mut` in `.bss`. `#[no_mangle]` keeps it a findable
-/// symbol so the SWD reader resolves its address via `arm-none-eabi-nm`; `magic` starts 0, so no
-/// fixed section / RAM-origin placement is needed.
-#[no_mangle]
-static mut DETECT_RESULT: DetectResult = DetectResult {
+/// Fixed RAM address of the result struct: the top of the (shrunk) RAM region, reserved by `memory.x`
+/// (cortex-m-rt's RAM ends 256 bytes early so it never allocates here). The SWD reader just reads this
+/// CONSTANT address: no `arm-none-eabi-nm` symbol resolution needed (the size-optimised release ELF
+/// drops the `.symtab` that `nm` reads, so a symbol-based read is unreliable; a fixed address is not).
+const RESULT_ADDR: u32 = 0x2000_1F00;
+
+/// The initial result contents, written to [`RESULT_ADDR`] at startup. This region is OUTSIDE `.bss`
+/// (it sits above cortex-m-rt's RAM), so the C runtime does NOT zero it; `main` writes this initialiser
+/// first so a reader sees `magic == 0` (run not complete) and the documented field defaults until the
+/// run overwrites them and writes `magic` LAST.
+const INIT_RESULT: DetectResult = DetectResult {
     magic: 0,
     gpioa_readback: 0,
     gpioa_base: 0,
@@ -122,6 +128,11 @@ static mut DETECT_RESULT: DetectResult = DetectResult {
 
 #[entry]
 fn main() -> ! {
+    // Initialise the fixed-address result region (it is outside .bss, so the C runtime did not zero
+    // it): write the defaults first, magic = 0 until the run completes.
+    // SAFETY: RESULT_ADDR is reserved RAM (see memory.x); single writer.
+    unsafe { core::ptr::write_volatile(result_ptr(), INIT_RESULT) };
+
     // Runtime detection, the same primitives `detect_chip` runs, decomposed here so the intermediate
     // outcome can be recorded: the bus-fault-safe family probe, then the family -> chip synthesis,
     // then the MEASURED peripheral counts. This runs on the reset IRC8M clock. The HAL installs its
@@ -234,7 +245,7 @@ enum StructField {
 
 #[inline]
 fn result_ptr() -> *mut DetectResult {
-    core::ptr::addr_of_mut!(DETECT_RESULT)
+    RESULT_ADDR as *mut DetectResult
 }
 
 fn store_u32(field: StructField, val: u32) {

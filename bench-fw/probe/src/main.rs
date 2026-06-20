@@ -19,7 +19,7 @@
 //! each candidate peripheral two independent ways and records both plus
 //! the raw sub-results, classifies present/absent/disagree, writes a fixed-layout result struct to a
 //! `.bss` `static mut`, writes `magic` LAST, and idles in `wfi`, exactly the bench-fw-detect pattern:
-//! the SWD reader resolves the struct address with `arm-none-eabi-nm`, reads it NON-HALTING, and
+//! the SWD reader reads the struct at its FIXED address ([`RESULT_ADDR`]) NON-HALTING, and
 //! `magic` written last means the whole run completed. The struct is NOT pinned to a fixed section
 //! (the bench-fw-m2 lesson: a fixed RAM-origin section collided with cortex-m-rt's RAM allocation).
 //!
@@ -208,7 +208,7 @@ struct PeriphRecord {
 }
 
 /// The fixed-layout result. `#[repr(C)]`; `magic` is written LAST (0 = the run never completed). The
-/// SWD reader resolves `PROBE_RESULT`'s address via `arm-none-eabi-nm` and decodes by byte offset.
+/// SWD reader reads `ProbeResult` at the fixed [`RESULT_ADDR`] and decodes by byte offset.
 #[repr(C)]
 struct ProbeResult {
     /// 0x4DF7_9505, written LAST = the full run completed.
@@ -230,11 +230,16 @@ struct ProbeResult {
     records: [PeriphRecord; 5],
 }
 
-/// The result struct, a zero-initialised `static mut` in `.bss`. `#[no_mangle]` keeps it a findable
-/// symbol so the SWD reader resolves its address via `arm-none-eabi-nm`; `magic` starts 0, so no fixed
-/// section / RAM-origin placement is needed (the bench-fw-m2 lesson).
-#[no_mangle]
-static mut PROBE_RESULT: ProbeResult = ProbeResult {
+/// Fixed RAM address of the result struct: the top of the (shrunk) RAM region, reserved by `memory.x`
+/// (cortex-m-rt's RAM ends 256 bytes early so it never allocates here). The SWD reader reads this
+/// CONSTANT directly, no `arm-none-eabi-nm` resolution needed (the size-optimised release ELF drops
+/// the `.symtab` nm reads, so a symbol-based read is unreliable; a fixed address is not).
+const RESULT_ADDR: u32 = 0x2000_1F00;
+
+/// Initial result contents, written to [`RESULT_ADDR`] at startup. The region is OUTSIDE `.bss` (above
+/// cortex-m-rt's RAM), so the C runtime does NOT zero it; `main` writes this first so a reader sees
+/// `magic == 0` until the run completes and writes `magic` LAST.
+const INIT_RESULT: ProbeResult = ProbeResult {
     magic: 0,
     flash_density: 0,
     detected_family: 0,
@@ -257,6 +262,11 @@ static mut PROBE_RESULT: ProbeResult = ProbeResult {
 
 #[entry]
 fn main() -> ! {
+    // Initialise the fixed-address result region (outside .bss, so not zeroed by the C runtime):
+    // write the defaults first, magic = 0 until the run completes.
+    // SAFETY: RESULT_ADDR is reserved RAM (see memory.x); single writer.
+    unsafe { core::ptr::write_volatile(result_ptr(), INIT_RESULT) };
+
     // Step 1: the bus-fault-safe family probe (giving the detected family + the family-correct
     // register model). We record the family DEFAULT adv_timers/adc_count (the synthesized
     // descriptor's constant) so the bench decode can compare it against the MEASURED per-instance
@@ -411,7 +421,7 @@ enum Field {
 
 #[inline]
 fn result_ptr() -> *mut ProbeResult {
-    core::ptr::addr_of_mut!(PROBE_RESULT)
+    RESULT_ADDR as *mut ProbeResult
 }
 
 fn store_u32(field: Field, val: u32) {

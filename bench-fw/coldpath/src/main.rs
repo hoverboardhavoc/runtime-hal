@@ -67,10 +67,10 @@ const SPI_PATTERN: [u8; 4] = [0xA5, 0x3C, 0x00, 0xFF];
 
 // --- the SWD-readable result struct -----------------------------------------------------------
 
-/// The fixed-layout anchor results. A debugger reads it back over SWD: `magic` is written LAST, so
-/// a reader that sees `MAGIC` knows every anchor ran. The struct is an ordinary zero-initialised
-/// `static mut` in `.bss`; its address is recovered with `arm-none-eabi-nm`, so it needs no fixed
-/// address (and pinning one at RAM origin collided with cortex-m-rt's own RAM allocation).
+/// The fixed-layout anchor results. A debugger reads it back over SWD at the fixed [`RESULT_ADDR`]:
+/// `magic` is written LAST, so a reader that sees `MAGIC` knows every anchor ran. The struct lives at
+/// a reserved tail of RAM (see `memory.x`), so the reader needs no `arm-none-eabi-nm` symbol
+/// resolution (pinning a section at RAM ORIGIN instead collided with cortex-m-rt's RAM allocation).
 ///
 /// `#[repr(C)]` fixes the field order and offsets so the SWD reader can index by byte offset.
 #[repr(C)]
@@ -104,11 +104,16 @@ struct M2Anchors {
 /// The magic value written last once every anchor has run.
 const MAGIC: u32 = 0x4D32_0A2C;
 
-/// The result struct, a zero-initialised `static mut` in `.bss`. `#[no_mangle]` keeps it a findable
-/// symbol so the SWD reader can resolve its address via `arm-none-eabi-nm`. `magic` starts 0 (the
-/// "did the run complete?" check), so no fixed section or RAM-origin placement is needed.
-#[no_mangle]
-static mut M2_ANCHORS: M2Anchors = M2Anchors {
+/// Fixed RAM address of the result struct: the top of the (shrunk) RAM region, reserved by `memory.x`
+/// (cortex-m-rt's RAM ends 256 bytes early so it never allocates here). The SWD reader reads this
+/// CONSTANT directly, no `arm-none-eabi-nm` resolution needed (the size-optimised release ELF drops
+/// the `.symtab` nm reads, so a symbol-based read is unreliable; a fixed address is not).
+const RESULT_ADDR: u32 = 0x2000_1F00;
+
+/// Initial result contents, written to [`RESULT_ADDR`] at startup. The region is OUTSIDE `.bss` (above
+/// cortex-m-rt's RAM), so the C runtime does NOT zero it; `main` writes this first so a reader sees
+/// `magic == 0` until the run completes and writes `magic` LAST.
+const INIT_ANCHORS: M2Anchors = M2Anchors {
     magic: 0,
     clock_ok: 0,
     i2c_who_am_i: 0,
@@ -132,6 +137,11 @@ const M2_CLOCK: ClockConfig = ClockConfig::REFERENCE_72M_IRC8M;
 
 #[entry]
 fn main() -> ! {
+    // Initialise the fixed-address result region (outside .bss, so not zeroed by the C runtime):
+    // write the defaults first, magic = 0 until the run completes.
+    // SAFETY: RESULT_ADDR is reserved RAM (see memory.x); single writer.
+    unsafe { core::ptr::write_volatile(anchors_ptr(), INIT_ANCHORS) };
+
     // Detect the chip at runtime (family probe + peripheral measurement -> Chip), the full faithful
     // chain. A part matching neither family halts rather than misconfiguring; the human then sees
     // magic == 0 (the run never reached completion).
@@ -386,7 +396,7 @@ fn run_spi(chip: &Chip, rcu: u32) {
 
 #[inline]
 fn anchors_ptr() -> *mut M2Anchors {
-    core::ptr::addr_of_mut!(M2_ANCHORS)
+    RESULT_ADDR as *mut M2Anchors
 }
 
 macro_rules! store {
