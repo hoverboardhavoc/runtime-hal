@@ -211,45 +211,39 @@ pub struct FreeWatchdog {
 }
 
 impl FreeWatchdog {
-    /// A bare handle over the FWDGT at `base`, performing **no** register access. Use this to feed a
-    /// watchdog that is already running (e.g. across a function boundary). [`FreeWatchdog::start`] is
-    /// the configuring entry point.
-    #[inline]
-    pub const fn at(base: u32) -> FreeWatchdog {
-        FreeWatchdog { base }
-    }
-
-    /// Bring up and START the free watchdog at `base` with the requested `timeout`, enabling its
-    /// LSI/IRC40K clock source first.
+    /// Bring up and START the free watchdog with the requested `timeout`, enabling its LSI/IRC40K
+    /// clock source first.
     ///
-    /// `chip` supplies the RCU base + clock path so the LSI can be enabled through
+    /// `chip` supplies both the FWDGT base and the RCU base + clock path: the FWDGT base is resolved
+    /// internally from the descriptor's [`crate::addr::AddrTable`]
+    /// (`chip.base(PeriphLabel::Fwdgt)`), and the LSI is enabled through
     /// [`crate::clock::enable_lsi`] before the watchdog is started (the watchdog cannot count until
-    /// its clock is running). `base` is the FWDGT base, resolved from the descriptor's
-    /// [`crate::addr::AddrTable`] (`chip.base(PeriphLabel::Fwdgt)`); pass it explicitly so the caller
-    /// owns the resolve-once step, the same shape the other peripherals use.
+    /// its clock is running). The caller never holds a raw FWDGT base, the same shape the other
+    /// peripherals use.
     ///
     /// Steps:
-    /// 1. Enable + stabilise the LSI/IRC40K ([`crate::clock::enable_lsi`], bounded poll).
-    /// 2. The five-write key recipe (see the module docs): unlock, PSC, RLD, wait PSC/RLD update,
+    /// 1. Resolve the FWDGT base from the chip's address table.
+    /// 2. Enable + stabilise the LSI/IRC40K ([`crate::clock::enable_lsi`], bounded poll).
+    /// 3. The five-write key recipe (see the module docs): unlock, PSC, RLD, wait PSC/RLD update,
     ///    reload, start.
     ///
-    /// Returns [`WatchdogError::LsiNotStable`] if the LSI never stabilises, or
-    /// [`WatchdogError::Timeout`] if the PSC/RLD update never propagates, both within their bounded
-    /// budgets (the F130 hang-if-done-wrong class). On success the watchdog is RUNNING and must be
-    /// fed within the timeout from here on.
+    /// Returns [`WatchdogError::MissingRcuBase`] if the descriptor carries neither the RCU nor the
+    /// FWDGT base, [`WatchdogError::LsiNotStable`] if the LSI never stabilises, or
+    /// [`WatchdogError::Timeout`] if the PSC/RLD update never propagates, the last two within their
+    /// bounded budgets (the F130 hang-if-done-wrong class). On success the watchdog is RUNNING and
+    /// must be fed within the timeout from here on.
     ///
     /// SAFETY (bench): once started, the free watchdog cannot be stopped in software (only a reset
     /// clears it). Use a GENEROUS timeout and feed it every loop pass; see
     /// [`FreeWatchdog::freeze_on_debug_halt`] to keep an SWD session from being reset out from under
     /// the core.
-    pub fn start(
-        chip: &crate::Chip,
-        base: u32,
-        timeout: WdgTimeout,
-    ) -> Result<FreeWatchdog, WatchdogError> {
+    pub fn start(chip: &crate::Chip, timeout: WdgTimeout) -> Result<FreeWatchdog, WatchdogError> {
         let rcu = chip.rcu_base().map_err(|_| WatchdogError::MissingRcuBase)?;
         clock::enable_lsi(rcu)?;
 
+        let base = chip
+            .base(crate::addr::PeriphLabel::Fwdgt)
+            .map_err(|_| WatchdogError::MissingRcuBase)?;
         let dev = FreeWatchdog { base };
         let (divisor, reload) = timeout.resolve();
         dev.program(psc_code(divisor), reload)?;
@@ -298,12 +292,6 @@ impl FreeWatchdog {
         const DBG_CTL_OFFSET: u32 = 0x04;
         const FWDGT_HOLD: u32 = 1 << 8;
         Reg32::new(DBG_BASE, DBG_CTL_OFFSET).modify(FWDGT_HOLD, FWDGT_HOLD);
-    }
-
-    /// The underlying FWDGT base address.
-    #[inline]
-    pub const fn base(&self) -> u32 {
-        self.base
     }
 
     // --- polling --------------------------------------------------------------------------------

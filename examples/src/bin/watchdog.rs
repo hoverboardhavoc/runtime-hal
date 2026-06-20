@@ -60,7 +60,7 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin, StatefulOutputPin};
 use panic_halt as _;
 
-use runtime_hal::{detect_chip, was_watchdog_reset, FreeWatchdog, PeriphLabel, WdgTimeout};
+use runtime_hal::{detect_chip, was_watchdog_reset, FreeWatchdog, WdgTimeout};
 
 /// A generous watchdog timeout. Generous so a long init / an SWD halt cannot reset-loop the board.
 const WDG_TIMEOUT_MS: u32 = 8_000;
@@ -123,9 +123,8 @@ fn main() -> ! {
     FreeWatchdog::freeze_on_debug_halt();
 
     // 2. Start the free watchdog with the generous timeout. This enables + stabilises the LSI/IRC40K,
-    //    then runs the five-write key recipe. The base is resolved once from the descriptor.
-    let fwdgt_base = chip.base(PeriphLabel::Fwdgt).unwrap();
-    let mut wdg = FreeWatchdog::start(&chip, fwdgt_base, WdgTimeout::from_millis(WDG_TIMEOUT_MS))
+    //    then runs the five-write key recipe. The FWDGT base is resolved internally from the descriptor.
+    let mut wdg = FreeWatchdog::start(&chip, WdgTimeout::from_millis(WDG_TIMEOUT_MS))
         .expect("watchdog start (LSI stable + FWDGT update)");
 
     // 3. Run forever. While pad A is untouched, feed the watchdog every pass and blink the normal LED
