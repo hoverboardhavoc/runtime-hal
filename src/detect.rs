@@ -21,8 +21,8 @@
 //! # The per-family chip-capability constants live HERE
 //!
 //! [`descriptor_f103`] / [`descriptor_f130`] are the single source of truth for the two parts' chip
-//! descriptors (the register-model selectors and base addresses). [`synthesize`] fills a descriptor
-//! from a `Family` and the density read; [`detect_chip`] then OVERWRITES the `adv_timers` /
+//! descriptors (the register-model selectors and base addresses). The internal `synthesize` step
+//! fills a descriptor from a `Family` and the density read; [`detect_chip`] then OVERWRITES the `adv_timers` /
 //! `adc_count` fields with the MEASURED counts (the family constant is the fallback, not the truth).
 //!
 //! # What is host-testable and what is not
@@ -46,9 +46,13 @@ pub mod bringup;
 /// The MCU family the probe resolves. A single family determination fixes all four register-model
 /// selectors, the base-address table, and the family-default timer/ADC capability counts (which the
 /// peripheral-presence measurement then refines).
+///
+/// HAL-internal (`pub(crate)`): the family is the detection-internal discriminator that drives
+/// descriptor synthesis; it is never returned to a caller (the silicon-purity principle: no caller
+/// names a family). The HAL hands back a [`Chip`] / capability fruits, never a `Family`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Family {
+pub(crate) enum Family {
     /// GD32F1x0 (e.g. F130): GPIO on AHB2 at `0x4800_0000`, the `RCU_AHBEN` GPIO clock enable.
     /// Wire code 1 (matches the `bench-fw-detect` `detected_family` sentinel).
     F1x0 = 1,
@@ -164,7 +168,10 @@ pub const F10X_K2_THRESHOLD_KIB: u16 = 128;
 /// The `adv_timers` / `adc_count` fields carry the family DEFAULT; [`detect_chip`] overwrites them
 /// with the MEASURED per-instance counts. The result passes `addrs.check_ranges(gpio, clock)` by
 /// construction (it reuses the family-correct bases).
-pub fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
+///
+/// HAL-internal (`pub(crate)`): it takes the internal [`Family`] discriminator and returns an
+/// [`McuDescriptor`], a detection-internal step on the way to [`detect_chip`]; not a caller surface.
+pub(crate) fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
     match family {
         Family::F1x0 => descriptor_f130(), // flash_page is the family constant K1; density unused.
         Family::F10x => {
@@ -187,7 +194,7 @@ pub fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
 /// It runs the bus-fault-safe ordered GPIO+RCU family probe ([`crate::detect::probe::run`]) for the family
 /// discriminator, MEASURES the advanced-timer and ADC instance counts ([`crate::detect::probe::measure_counts`])
 /// rather than trusting the family constant, synthesizes the per-family [`McuDescriptor`]
-/// ([`synthesize`]) with the density-derived flash page, writes the MEASURED counts into it, and
+/// (the internal `synthesize` step) with the density-derived flash page, writes the MEASURED counts into it, and
 /// returns the resulting [`Chip`].
 ///
 /// Fail-loud: if neither family matched it returns [`DetectError::NoFamily`] rather than guessing a

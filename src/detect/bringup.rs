@@ -78,7 +78,13 @@ pub const CONSOLE_PINS_ASSUMED: bool = true;
 ///
 /// `family` is accepted for symmetry / logging; the register model is taken from `chip.clock()` (the
 /// synthesized clock path), which the family already fixed.
-pub fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, DescriptorError> {
+///
+/// HAL-internal (`pub(crate)`): it takes the internal [`Family`] discriminator, so it cannot be a
+/// caller surface while the silicon-purity principle keeps `Family` out of the public API. It is the
+/// retained section-6 default console bring-up, exercised by the host tests; nothing else in-crate
+/// calls it, hence `#[allow(dead_code)]` for the non-test lib build.
+#[allow(dead_code)]
+pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, DescriptorError> {
     let _ = family; // the register model is carried by chip.clock(); family is for logging only.
     let path = chip.clock();
     let rcu = chip.rcu_base()?;
@@ -116,7 +122,9 @@ pub fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, DescriptorEr
 }
 
 /// A copy of `chip` with the shared USART0 base added, for the console bring-up. The detected chip
-/// the firmware holds is untouched (it stays byte-for-byte equal to the per-family constant).
+/// the firmware holds is untouched (it stays byte-for-byte equal to the per-family constant). Only
+/// [`apply_defaults`] uses it; `#[allow(dead_code)]` for the non-test lib build (see that fn).
+#[allow(dead_code)]
 fn with_usart0(chip: &Chip) -> Chip {
     let mut desc = *chip.descriptor();
     desc.addrs.set(PeriphLabel::Usart0, USART0_BASE);
@@ -155,5 +163,26 @@ mod tests {
     fn usart0_base_is_the_shared_apb2_base() {
         // 0x4001_3800 on both families (addr::ranges::USART_APB2 low bound).
         assert_eq!(USART0_BASE, crate::addr::ranges::USART_APB2.0);
+    }
+
+    #[test]
+    fn apply_defaults_brings_up_the_console_on_both_families() {
+        use crate::detect::{descriptor_f103, descriptor_f130, Family};
+        use crate::reg::mock;
+
+        // apply_defaults takes the internal Family discriminator (for logging only) and brings up
+        // the section-6 default IRC8M console on USART0. Exercise both families: it enables the
+        // GPIOA + USART0 clocks, configures PA9/PA10, and returns Ok with the console Usart. The
+        // detected chip itself is untouched (the USART0 base is added only to a local copy).
+        let _g = mock::lock();
+
+        mock::reset();
+        let f130 = Chip::from_descriptor(descriptor_f130());
+        assert!(apply_defaults(&f130, Family::F1x0).is_ok());
+        assert!(f130.base(PeriphLabel::Usart0).is_err(), "detected chip untouched");
+
+        mock::reset();
+        let f103 = Chip::from_descriptor(descriptor_f103());
+        assert!(apply_defaults(&f103, Family::F10x).is_ok());
     }
 }

@@ -71,8 +71,7 @@ pub use descriptor::{
     MAX_USARTS,
 };
 pub use detect::{
-    descriptor_f103, descriptor_f130, detect_chip, synthesize, F10X_K2_THRESHOLD_KIB,
-    FLASH_DENSITY_ADDR,
+    descriptor_f103, descriptor_f130, detect_chip, F10X_K2_THRESHOLD_KIB, FLASH_DENSITY_ADDR,
 };
 pub use error::{
     AdcError, ClockError, DescriptorError, DetectError, BringUpError, I2cError, PwmError, SpiError,
