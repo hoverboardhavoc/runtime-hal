@@ -155,7 +155,7 @@ pub enum PinRole {
     /// number happens to equal the advanced-timer gate's AF2 (they share the AF group), but this is
     /// a distinct role so the general-PWM path documents its own routing. On F10x the AF is implied
     /// by the AF-push-pull nibble (0xB), and TIMER1's channels reach PB3 only through the AFIO
-    /// `TIMER1_REMAP` field (see `remap_timer1_partial1`); the per-pin AF mux does not exist there.
+    /// `TIMER1_REMAP` field (see `remap_timer1_partial0`); the per-pin AF mux does not exist there.
     GenTimerAfPushPull,
 }
 
@@ -346,14 +346,21 @@ const F10X_AFIO_PCF0: u32 = 0x04;
 /// `TIMER1_REMAP[1:0]` field in `AFIO_PCF0`, bits `[9:8]` (GD32F10x User Manual 7.5.9, line 9206:
 /// `9:8 TIMER1_REMAP[1:0] TIMER1 remapping`).
 const F10X_PCF0_TIMER1_REMAP: u32 = 0b11 << 8;
-/// `TIMER1_REMAP` partial-remap-1 value `01`: maps `TIMER1_CH0-ETI / PA15, TIMER1_CH1 / PB3,
+/// `TIMER1_REMAP` partial-remap value `01`: maps `TIMER1_CH0-ETI / PA15, TIMER1_CH1 / PB3,
 /// TIMER1_CH2 / PA2, TIMER1_CH3 / PA3` (GD32F10x User Manual 7.5.9, line 9208-9209: "01: Enable the
 /// remapping function partially (TIMER1_CH0-TIMER1_ETI / PA15, TIMER1_CH1 / PB3, ...)"). This is the
 /// value that puts TIMER1_CH1 onto PB3 (the green LED), the G3 target.
-const F10X_PCF0_TIMER1_REMAP_PARTIAL1: u32 = 0b01 << 8;
+///
+/// Naming: this field value `01` is the GD32 SPL's `GPIO_TIMER1_PARTIAL_REMAP0` (`0x00180100`,
+/// field `01`), NOT `GPIO_TIMER1_PARTIAL_REMAP1`. The SPL's `GPIO_TIMER1_PARTIAL_REMAP1`
+/// (`0x00180200`) is a DIFFERENT value, field `10`, which routes `TIMER1_CH2/CH3` to `PB10/PB11`
+/// and does NOT put any channel on PB3. We name this constant `..._PARTIAL0` to match the SPL and
+/// avoid that trap; the written register value remains `01`.
+const F10X_PCF0_TIMER1_REMAP_PARTIAL0: u32 = 0b01 << 8;
 
-/// **F10x-only**: remap TIMER1 to partial-remap-1, putting `TIMER1_CH1` onto **PB3** (and
-/// `TIMER1_CH0` onto PA15), by writing the `TIMER1_REMAP[1:0]` field of `AFIO_PCF0` to `01`.
+/// **F10x-only**: remap TIMER1 to partial remap (value `01` = the SPL's
+/// `GPIO_TIMER1_PARTIAL_REMAP0`), putting `TIMER1_CH1` onto **PB3** (and `TIMER1_CH0` onto PA15),
+/// by writing the `TIMER1_REMAP[1:0]` field of `AFIO_PCF0` to `01`.
 ///
 /// This is the F10x half of the G3 general-timer routing (the F1x0 routes purely through the per-pin
 /// `AFSEL` mux in `configure_af`, so this primitive does NOT exist for the F1x0 and is never called
@@ -369,18 +376,20 @@ const F10X_PCF0_TIMER1_REMAP_PARTIAL1: u32 = 0b01 << 8;
 ///
 /// Register facts (GD32F10x User Manual 7.5.9 "AFIO port configuration register 0 (AFIO_PCF0)"):
 /// `AFIO_PCF0` at AFIO base `0x4001_0000` offset `0x04`; `TIMER1_REMAP[1:0]` is bits `[9:8]`;
-/// value `01` = partial remap 1 = `TIMER1_CH1 / PB3`. (TIMER1 remap is not available on a 36-pin
-/// package; the bench parts are 48-pin C8, so PB3 is reachable. TIMER2 remap by contrast needs a
-/// 64/100/144-pin package, which is why the G3 target is TIMER1, not TIMER2.)
-pub(crate) fn remap_timer1_partial1(rcu_base: u32) {
+/// value `01` = partial remap = `TIMER1_CH1 / PB3`. This `01` is the SPL's
+/// `GPIO_TIMER1_PARTIAL_REMAP0`; the SPL's `GPIO_TIMER1_PARTIAL_REMAP1` is the distinct value `10`
+/// (`TIMER1_CH2/CH3` -> PB10/PB11), which is NOT what we want. (TIMER1 remap is not available on a
+/// 36-pin package; the bench parts are 48-pin C8, so PB3 is reachable. TIMER2 remap by contrast
+/// needs a 64/100/144-pin package, which is why the G3 target is TIMER1, not TIMER2.)
+pub(crate) fn remap_timer1_partial0(rcu_base: u32) {
     // Ensure the AFIO peripheral clock is on (RCU_APB2EN.AFIOEN, bit 0) before touching AFIO_PCF0.
     // Idempotent RMW: harmless if free_jtag_pins already enabled it.
     const RCU_APB2EN_OFFSET: u32 = 0x18;
     const AFIOEN: u32 = 1 << 0;
     Reg32::new(rcu_base, RCU_APB2EN_OFFSET).modify(AFIOEN, AFIOEN);
-    // TIMER1_REMAP = 0b01 (partial remap 1): TIMER1_CH1 -> PB3.
+    // TIMER1_REMAP = 0b01 (SPL GPIO_TIMER1_PARTIAL_REMAP0): TIMER1_CH1 -> PB3.
     Reg32::new(F10X_AFIO_BASE, F10X_AFIO_PCF0)
-        .modify(F10X_PCF0_TIMER1_REMAP, F10X_PCF0_TIMER1_REMAP_PARTIAL1);
+        .modify(F10X_PCF0_TIMER1_REMAP, F10X_PCF0_TIMER1_REMAP_PARTIAL0);
 }
 
 // --- general-purpose digital input ------------------------------------------------------------

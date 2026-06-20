@@ -339,7 +339,8 @@ const F1X0_AF2: u32 = 2;
 // The cold-path general PWM fades the green LED on PB3. The two families route the SAME timer
 // channel to the SAME pin by DIFFERENT mechanisms (the deliberate visible difference):
 //  - F1x0: per-pin AFSEL mux. PB3 -> TIMER1_CH1 is AF2 (GD32F130xx Datasheet Port B AF summary).
-//  - F10x: AFIO TIMER1_REMAP partial-remap-1 (AFIO_PCF0[9:8] = 01) + the CRL AF push-pull nibble.
+//  - F10x: AFIO TIMER1_REMAP partial remap (AFIO_PCF0[9:8] = 01 = SPL GPIO_TIMER1_PARTIAL_REMAP0)
+//    + the CRL AF push-pull nibble.
 
 // PB3 logical byte (port B = 1, pin 3).
 const PB3: u8 = (1u8 << 4) | 3;
@@ -380,28 +381,29 @@ fn f10x_gen_timer_pb3_is_af_pp_nibble() {
 }
 
 #[test]
-fn f10x_remap_timer1_partial1_sets_pcf0_field_to_01_and_enables_afio() {
+fn f10x_remap_timer1_partial0_sets_pcf0_field_to_01_and_enables_afio() {
     let _g = seed();
     // The AFIO peripheral-config block lives at the fixed F10x absolute base 0x4001_0000; AFIO_PCF0
     // is at offset 0x04. The RCU base is the F10x RCU base.
     const RCU_BASE: u32 = 0x4002_1000;
     const AFIO_PCF0: u32 = 0x4001_0004;
-    crate::gpio::remap_timer1_partial1(RCU_BASE);
+    crate::gpio::remap_timer1_partial0(RCU_BASE);
     // AFIO clock enabled: RCU_APB2EN (0x18) bit 0.
     assert_eq!(Reg32::new(RCU_BASE, 0x18).read() & 1, 1);
-    // TIMER1_REMAP[9:8] = 0b01 (partial remap 1: TIMER1_CH1 -> PB3); no other PCF0 bits set.
+    // TIMER1_REMAP[9:8] = 0b01 (SPL GPIO_TIMER1_PARTIAL_REMAP0: TIMER1_CH1 -> PB3); no other PCF0
+    // bits set.
     assert_eq!(Reg32::new(AFIO_PCF0, 0).read(), 0b01 << 8);
 }
 
 #[test]
-fn f10x_remap_timer1_partial1_preserves_swj_cfg() {
+fn f10x_remap_timer1_partial0_preserves_swj_cfg() {
     let _g = seed();
     // free_jtag_pins sets SWJ_CFG (AFIO_PCF0[26:24]) = 0b010; the TIMER1 remap RMW must not disturb
     // it (the green-LED routing frees JTAG first, then remaps TIMER1).
     const RCU_BASE: u32 = 0x4002_1000;
     const AFIO_PCF0: u32 = 0x4001_0004;
     Reg32::new(AFIO_PCF0, 0).write(0b010 << 24); // pretend free_jtag_pins ran
-    crate::gpio::remap_timer1_partial1(RCU_BASE);
+    crate::gpio::remap_timer1_partial0(RCU_BASE);
     let pcf0 = Reg32::new(AFIO_PCF0, 0).read();
     assert_eq!(pcf0 & (0b111 << 24), 0b010 << 24, "SWJ_CFG preserved");
     assert_eq!(pcf0 & (0b11 << 8), 0b01 << 8, "TIMER1_REMAP = 01");

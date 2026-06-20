@@ -331,8 +331,9 @@ impl Chip {
     ///
     /// - **F1x0** (per-pin AF mux): set `pin`'s `AFSEL` to AF2 (TIMER1_CH1).
     /// - **F10x** (AFIO remap groups): free the JTAG overlay (releasing PA15 / PB3 / PB4 from the
-    ///   JTAG-DP while keeping SWD live), set the AFIO `TIMER1_REMAP` partial-remap-1 field (which maps
-    ///   TIMER1_CH1 to PB3), then set `pin`'s CRL/CRH alternate-function nibble.
+    ///   JTAG-DP while keeping SWD live), set the AFIO `TIMER1_REMAP` partial-remap field to `0b01`
+    ///   (the SPL's `GPIO_TIMER1_PARTIAL_REMAP0`, which maps TIMER1_CH1 to PB3; NOT the SPL's
+    ///   `GPIO_TIMER1_PARTIAL_REMAP1` = `0b10` -> PB10/PB11), then set `pin`'s CRL/CRH AF nibble.
     ///
     /// Enables `pin`'s GPIO port clock as part of the routing. The family branch is on the descriptor's
     /// register-model selector ([`GpioPath`]), an internal detail, NOT a caller-visible family flag.
@@ -355,9 +356,10 @@ impl Chip {
                 );
             }
             GpioPath::ApbCrlCrh => {
-                // F10x: free the JTAG overlay, AFIO TIMER1 partial-remap-1, then the CRL AF nibble.
+                // F10x: free the JTAG overlay, AFIO TIMER1 partial remap (0b01 = SPL
+                // GPIO_TIMER1_PARTIAL_REMAP0), then the CRL AF nibble.
                 self.free_jtag_pins()?;
-                gpio::remap_timer1_partial1(rcu);
+                gpio::remap_timer1_partial0(rcu);
                 gpio::configure_af(
                     port_base,
                     GpioPath::ApbCrlCrh,
@@ -574,7 +576,8 @@ mod tests {
         mock::reset();
         let chip = Chip::from_descriptor(descriptor_f103());
         assert_eq!(chip.route_general_pwm_pin(PB3), Ok(()));
-        // F10x: AFIO_PCF0 TIMER1_REMAP[9:8] = 0b01 (partial remap 1 -> TIMER1_CH1 / PB3).
+        // F10x: AFIO_PCF0 TIMER1_REMAP[9:8] = 0b01 (SPL GPIO_TIMER1_PARTIAL_REMAP0 -> TIMER1_CH1 /
+        // PB3).
         assert_eq!(Reg32::new(AFIO_PCF0, 0).read() & (0b11 << 8), 0b01 << 8);
         // PB3 CRL nibble [15:12] = AF push-pull 50 MHz = 0xB.
         assert_eq!(Reg32::new(F10X_GPIOB_BASE, 0x00).read() & (0xF << 12), 0xB << 12);

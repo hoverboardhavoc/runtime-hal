@@ -33,12 +33,13 @@
 //!   alternate-function summary: PB3 AF2 = `TIMER1_CH1`).
 //! - **F10x** (AFIO remap groups): PB3 is JTDO after reset and TIMER1_CH1 is not on PB3 by default,
 //!   so the routing frees the JTAG overlay (keeping SWD), sets the `AFIO_PCF0` `TIMER1_REMAP[9:8]`
-//!   field to `01` (partial remap 1, mapping `TIMER1_CH1 / PB3`; GD32F10x User Manual 7.5.9), and sets
+//!   field to `01` (partial remap = SPL `GPIO_TIMER1_PARTIAL_REMAP0`, mapping `TIMER1_CH1 / PB3`;
+//!   GD32F10x User Manual 7.5.9), and sets
 //!   PB3's CRL alternate-function nibble.
 //!
 //! The constraint that fixes the target on TIMER1 (not TIMER2): TIMER2's remap to PB4/PB5 needs a
 //! 64/100/144-pin package (GD32F10x User Manual, TIMER alternate-function remapping notes), so on a
-//! 48-pin GD32F103C8 TIMER2's channels are NOT reachable; TIMER1's partial-remap-1 to PB3 IS. The
+//! 48-pin GD32F103C8 TIMER2's channels are NOT reachable; TIMER1's partial remap (0b01) to PB3 IS. The
 //! shared datapath ([`PwmOut::new`] + the duty setter) is identical on both families.
 //!
 //! # embedded-hal trait

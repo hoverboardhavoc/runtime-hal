@@ -3,28 +3,35 @@ description: |
   GPIO alternate-function routing for the general-purpose-timer PWM output
   (TIMER1_CH1 -> PB3) on the F10x (apb_crl_crh) GPIO model, via the public
   chip.route_general_pwm_pin(PB3) router. On the F10x there is no per-pin AF mux:
-  TIMER1_CH1 lands on PB3 only after the AFIO TIMER1 partial-remap-1, and PB3 is a
+  TIMER1_CH1 lands on PB3 only after the AFIO TIMER1 partial remap (0b01), and PB3 is a
   JTAG-overlay pin, so the router first frees the JTAG-DP (SWJ_CFG = SW-only), sets
   the AFIO TIMER1 partial remap, then sets PB3's CRL alternate-function nibble.
 
   runtime-hal: chip.route_general_pwm_pin(0x13).
   GD SPL: rcu_periph_clock_enable(RCU_AF); gpio_pin_remap_config(GPIO_SWJ_SWDPENABLE_REMAP, ENABLE);
-          gpio_pin_remap_config(GPIO_TIMER1_PARTIAL_REMAP1, ENABLE);
+          gpio_pin_remap_config(GPIO_TIMER1_PARTIAL_REMAP0, ENABLE);
           gpio_init(GPIOB, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_3).
 
 # Mode rationale: final_state, scoped with assert_only to the GPIOB CRL register only (the PB3
 # AF-PP nibble), where runtime-hal and the SPL AGREE (both -> 0x4444B444).
 #
-# FINDING (reported, NOT papered over): the AFIO_PCF0 (+0x04) end state does NOT agree between the
-# two oracles, so it is excluded from this compare:
+# Naming/oracle correction: the SPL macro for the PB3-targeting TIMER1 partial remap is
+# GPIO_TIMER1_PARTIAL_REMAP0 (0x00180100, field 0b01 = TIMER1_CH1 / PB3), NOT
+# GPIO_TIMER1_PARTIAL_REMAP1 (0x00180200, field 0b10 = TIMER1_CH2/CH3 / PB10/PB11). An earlier
+# version of this vector called PARTIAL_REMAP1 (0b10), which disagreed with the HAL's correct 0b01
+# and produced a spurious AFIO_PCF0 TIMER1_REMAP divergence. With PARTIAL_REMAP0 the TIMER1_REMAP
+# field now AGREES: runtime-hal writes 0b01 (bit8) and the SPL writes 0b01 (bit8).
+#
+# Remaining divergence (reported, NOT papered over): the AFIO_PCF0 (+0x04) end state still does not
+# match as a full word because the SWJ_CFG field differs, so the register is excluded from the
+# compare:
 #   runtime-hal route_general_pwm_pin -> 0x02000100  (SWJ_CFG=0b010 SW-only at [26:24]; TIMER1_REMAP
-#     = 0b01 at [9:8], i.e. bit8)
-#   GD SPL  GPIO_SWJ_SWDPENABLE_REMAP + GPIO_TIMER1_PARTIAL_REMAP1 -> 0x0F000200 (the SPL packed-macro
-#     decode lands SWJ in [27:24] and TIMER1_REMAP = 0b10 at bit9, NOT bit8)
-# The TIMER1_REMAP field value differs (runtime-hal 0b01 vs the SPL PARTIAL_REMAP1 macro 0b10) and
-# the SWJ_CFG field width/position differs. This is a real runtime-hal-vs-SPL divergence on the AFIO
-# remap encoding; it is reported, not masked by a golden. The GPIOB AF nibble (the pin's drive type)
-# agrees and is the part this vector pins.
+#     = 0b01 at bit8)
+#   GD SPL  GPIO_SWJ_SWDPENABLE_REMAP + GPIO_TIMER1_PARTIAL_REMAP0 -> 0x0F000100 (the SPL packed-macro
+#     decode lands SWJ in [27:24]; TIMER1_REMAP = 0b01 at bit8, matching the HAL)
+# The TIMER1_REMAP field now agrees (both 0b01); the SWJ_CFG field width/position is the only AFIO
+# divergence, a separate runtime-hal-vs-SPL encoding difference. The GPIOB AF nibble (the pin's
+# drive type) agrees and is the part this vector pins.
 mode: final_state
 
 assert_only:
@@ -36,7 +43,7 @@ implementations:
     body: |
       rcu_periph_clock_enable(RCU_AF);
       gpio_pin_remap_config(GPIO_SWJ_SWDPENABLE_REMAP, ENABLE);
-      gpio_pin_remap_config(GPIO_TIMER1_PARTIAL_REMAP1, ENABLE);
+      gpio_pin_remap_config(GPIO_TIMER1_PARTIAL_REMAP0, ENABLE);
       gpio_init(GPIOB, GPIO_MODE_AF_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_3);
 
   runtime-hal/gd32f10x:
@@ -52,5 +59,5 @@ implementations:
               gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
               irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
           });
-          let _ = chip.route_general_pwm_pin(0x13); // PB3 = TIMER1_CH1 (AFIO partial remap 1)
+          let _ = chip.route_general_pwm_pin(0x13); // PB3 = TIMER1_CH1 (AFIO partial remap, 0b01)
       }

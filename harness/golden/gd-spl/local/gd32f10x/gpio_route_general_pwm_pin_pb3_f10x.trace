@@ -1,4 +1,4 @@
-# regcmp v0.1.0 captured 2026-06-20T09:23:57Z
+# regcmp v0.1.0 captured 2026-06-20T11:21:35Z
 # vector:        gpio_route_general_pwm_pin_pb3_f10x
 # library:       gd-spl
 # target:        gd32f10x
@@ -14,6 +14,6 @@ R4 <AFIO_BASE>+0x04 0x00000000   # PCF0
 W4 <AFIO_BASE>+0x04 0x00000000   # PCF0
 W4 <AFIO_BASE>+0x04 0x02000000   # PCF0
 R4 <AFIO_BASE>+0x04 0x02000000   # PCF0
-W4 <AFIO_BASE>+0x04 0x0F000200   # PCF0
+W4 <AFIO_BASE>+0x04 0x0F000100   # PCF0
 R4 <GPIOB_BASE>+0x00 0x44444444   # CTL0
 W4 <GPIOB_BASE>+0x00 0x4444B444   # CTL0
