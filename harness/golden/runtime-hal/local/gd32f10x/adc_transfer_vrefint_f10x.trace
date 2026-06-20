@@ -1,11 +1,11 @@
-# regcmp v0.1.0 captured 2026-06-17T19:31:35Z
+# regcmp v0.1.0 captured 2026-06-20T11:36:05Z
 # vector:        adc_transfer_vrefint_f10x
 # library:       runtime-hal
 # target:        gd32f10x
 # compiler:      rustc 1.96.0 (ac68faa20 2026-05-25)
 # compile_flags: cargo build --release --target thumbv7m-none-eabi
 # emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
-# emulation:     clean-exit (sentinel reached at instr 33)
+# emulation:     clean-exit (sentinel reached at instr 484)
 # mode:          with_polling
 R4 <ADC0_BASE>+0x34 0x00000000   # RSQ2
 W4 <ADC0_BASE>+0x34 0x00000011   # RSQ2
@@ -14,3 +14,5 @@ W4 <ADC0_BASE>+0x08 0x00400000   # CTL1
 R4 <ADC0_BASE>+0x00 0x00000000   # STAT
 R4 <ADC0_BASE>+0x00 0x00000002   # STAT
 R4 <ADC0_BASE>+0x4C 0x000005D2   # RDATA
+R4 <ADC0_BASE>+0x00 0x00000002   # STAT
+W4 <ADC0_BASE>+0x00 0x00000000   # STAT
