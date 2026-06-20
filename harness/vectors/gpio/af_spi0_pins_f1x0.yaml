@@ -1,0 +1,67 @@
+name: af_spi0_pins_f1x0
+description: |
+  GPIO alternate-function config for the representative SPI0 pins SCK = PA5, MISO =
+  PA6, MOSI = PA7 on the F1x0 (ahb_ctl_afsel) GPIO model. SCK/MOSI are AF
+  push-pull outputs; MISO is an AF input (no output drive). SPI0 is on AF0 for
+  F1x0 (the gd32f1x0 AF table), so the AFSEL nibbles are 0 while CTL routes the
+  pins through the AF mux. The pinout is representative descriptor data; the point
+  is the AF-push-pull config path, not a board-specific pinout.
+
+  Restored after the API refactor: Spi::bring_up configures only the SPI peripheral
+  registers and writes no GPIO, so there is no Spi::new that routes the pins. The
+  public path that routes a SPI pin's AF is now Chip::route_spi_pin(pin, role) (the
+  SPI analogue of Chip::route_advanced_pwm_pin), one call per pin, mirroring how the
+  TIMER0 gate vector reaches its AF config through a public Chip routing method.
+
+  runtime-hal: route_spi_pin(PA5, SpiAfPushPull), route_spi_pin(PA6, SpiInput),
+  route_spi_pin(PA7, SpiAfPushPull).
+  GD SPL: gpio_mode_set(AF, NONE) + gpio_af_set(AF_0) for all three +
+  gpio_output_options_set(OTYPE_PP, 50MHZ) for SCK | MOSI.
+
+# Mode rationale: final_state (multi-pin, register-at-a-time SPL vs pin-at-a-time
+# runtime-hal). End state:
+#   CTL    +0x00 : AF (2) at pins 5,6,7 -> (2<<10)|(2<<12)|(2<<14)
+#   PUD    +0x0C : no pull -> 0
+#   AFSEL0 +0x20 : AF0 -> 0 (both oracles write 0; CTL=AF does the routing)
+#   OMODE  +0x04 : push-pull -> 0
+#   OSPD   +0x08 : 50MHz (3) at pins 5,7 only (MISO is input) -> (3<<10)|(3<<14)
+# AFSEL1 is the SPL's no-op rewrite (both leave it 0); ignored.
+mode: final_state
+
+ignore:
+  - "<RCU_BASE>"          # route_spi_pin enables the GPIOA port clock (AHBEN); the SPL body omits it
+  - "<GPIOA_BASE>+0x24"   # AFSEL1: SPL no-op rewrite; runtime-hal skips it (both leave it 0)
+
+implementations:
+  gd-spl/gd32f1x0:
+    includes: [gd32f1x0.h, gd32f1x0_gpio.h]
+    body: |
+      gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7);
+      gpio_af_set(GPIOA, GPIO_AF_0, GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7);
+      gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_5 | GPIO_PIN_7);
+
+  runtime-hal/gd32f1x0:
+    body: |
+      use runtime_hal::{AddrTable, AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize, PeriphLabel};
+      use runtime_hal::Chip;
+      use runtime_hal::gpio::PinRole;
+
+      pub fn body() {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+          addrs.set(PeriphLabel::Gpioa, 0x4800_0000);
+          let chip = Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::AhbCtlAfsel,
+              clock: ClockPath::F1x0Rcu,
+              adc: AdcPath::Single,
+              irq: IrqLayout::F1x0Grouped,
+              addrs,
+              flash_page: PageSize::K1,
+              adv_timers: 1,
+              adc_count: 1,
+          });
+          // SCK = PA5, MISO = PA6, MOSI = PA7.
+          let _ = chip.route_spi_pin(0x05, PinRole::SpiAfPushPull); // SCK
+          let _ = chip.route_spi_pin(0x06, PinRole::SpiInput);      // MISO
+          let _ = chip.route_spi_pin(0x07, PinRole::SpiAfPushPull); // MOSI
+      }

@@ -385,6 +385,31 @@ impl Chip {
         gpio::configure_af(port_base, self.desc.gpio, pin, gpio::PinRole::TimerAfPushPull);
         Ok(())
     }
+
+    /// Route `pin` to the SPI alternate function, family-internal, for one of the SPI pin roles:
+    /// [`gpio::PinRole::SpiAfPushPull`] (SCK / MOSI, AF push-pull 50 MHz) or
+    /// [`gpio::PinRole::SpiInput`] (MISO, input). [`Spi::bring_up`](crate::spi::Spi::bring_up)
+    /// configures only the SPI peripheral registers and does NOT touch GPIO, so this is the public
+    /// path an application calls per SPI pin to set the AF mux (the SPI analogue of
+    /// [`Chip::route_advanced_pwm_pin`]). SPI0 is on **AF0** for the F1x0 (the role carries the AF
+    /// number); on the F10x the AF is implied by the AF-push-pull / floating-input nibble.
+    ///
+    /// Does the per-family AF write (F1x0: per-pin AFSEL = AF0; F10x: CRL/CRH nibble) plus the
+    /// pin's port-clock enable. Rejects any non-SPI [`gpio::PinRole`] with
+    /// [`DescriptorError::Unsupported`] so the SPI routing path only ever drives SPI pin config.
+    /// Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU) is not in the
+    /// descriptor.
+    pub fn route_spi_pin(&self, pin: u8, role: gpio::PinRole) -> Result<(), DescriptorError> {
+        if !matches!(role, gpio::PinRole::SpiAfPushPull | gpio::PinRole::SpiInput) {
+            return Err(DescriptorError::UnsupportedRole);
+        }
+        let port = gpio_port_label(pin)?;
+        let port_base = self.base(port)?;
+        let rcu = self.rcu_base()?;
+        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
+        gpio::configure_af(port_base, self.desc.gpio, pin, role);
+        Ok(())
+    }
 }
 
 /// Map a logical pin byte (`port << 4 | pin`) to its GPIO port label. The high nibble is the port
@@ -581,6 +606,73 @@ mod tests {
         assert_eq!(Reg32::new(AFIO_PCF0, 0).read() & (0b11 << 8), 0b01 << 8);
         // PB3 CRL nibble [15:12] = AF push-pull 50 MHz = 0xB.
         assert_eq!(Reg32::new(F10X_GPIOB_BASE, 0x00).read() & (0xF << 12), 0xB << 12);
+    }
+
+    // route_spi_pin is the public SPI analogue of route_advanced_pwm_pin: Spi::bring_up writes no
+    // GPIO, so this is the only public path that sets a SPI pin's AF. SCK/MOSI = SpiAfPushPull,
+    // MISO = SpiInput. PA5 = SCK, PA6 = MISO, PA7 = MOSI (the representative SPI0 pinout).
+    const PA5: u8 = 5;
+    const PA6: u8 = 6;
+    const F10X_GPIOA_BASE: u32 = 0x4001_0800;
+    const F1X0_GPIOA_BASE: u32 = 0x4800_0000;
+
+    #[test]
+    fn route_spi_pin_f1x0_sck_sets_af_mode_af0_pp() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f130());
+        assert_eq!(chip.route_spi_pin(PA5, gpio::PinRole::SpiAfPushPull), Ok(()));
+        // F1x0: PA5 CTL [11:10] = AF mode (2); AFSEL0 nibble [23:20] = AF0 (0); OSPD [11:10] = 50MHz (3).
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x00).read() & (0x3 << 10), 2 << 10);
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x20).read() & (0xF << 20), 0);
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x08).read() & (0x3 << 10), 3 << 10);
+    }
+
+    #[test]
+    fn route_spi_pin_f1x0_miso_is_input_no_ospd() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f130());
+        assert_eq!(chip.route_spi_pin(PA6, gpio::PinRole::SpiInput), Ok(()));
+        // MISO is an AF input: CTL = AF mode (2), but no output speed (OSPD nibble stays 0).
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x00).read() & (0x3 << 12), 2 << 12);
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x08).read() & (0x3 << 12), 0);
+    }
+
+    #[test]
+    fn route_spi_pin_f10x_sck_sets_af_pp_nibble() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f103());
+        assert_eq!(chip.route_spi_pin(PA5, gpio::PinRole::SpiAfPushPull), Ok(()));
+        // F10x: PA5 CTL0 nibble [23:20] = AF push-pull 50 MHz = 0xB (over the 0x4 reset nibble).
+        assert_eq!(Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 20), 0xB << 20);
+    }
+
+    #[test]
+    fn route_spi_pin_f10x_miso_is_floating_input_nibble() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f103());
+        assert_eq!(chip.route_spi_pin(PA6, gpio::PinRole::SpiInput), Ok(()));
+        // F10x: PA6 (MISO) CTL0 nibble [27:24] = floating input = 0x4 (== the reset nibble).
+        assert_eq!(Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 24), 0x4 << 24);
+    }
+
+    #[test]
+    fn route_spi_pin_rejects_non_spi_role() {
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f130());
+        // Only the two SPI roles are accepted; a timer/usart role is an UnsupportedRole error.
+        assert_eq!(
+            chip.route_spi_pin(PA5, gpio::PinRole::TimerAfPushPull),
+            Err(DescriptorError::UnsupportedRole)
+        );
+        assert_eq!(
+            chip.route_spi_pin(PA5, gpio::PinRole::Tx),
+            Err(DescriptorError::UnsupportedRole)
+        );
     }
 
     #[test]

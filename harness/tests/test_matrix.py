@@ -142,9 +142,8 @@ def test_clock_tree_polling_against_golden(vector_id, family):
 # --- M2 T4/T5: bus + ADC clock enables, bus-pin gpio AF (both families) -----------------------
 
 # T4: enable I2C0 + GPIOB, SPI0 + its port, ADC0 (with prescaler). T5: I2C0 PB6/PB7 AF open-drain
-# pull-up. (SPI pin-AF coverage was dropped: no public API routes SPI pins post-refactor.) Each
-# runtime-hal trace compares clean both against the GD SPL (two-oracle) and against its committed
-# GD SPL golden (--against-trace).
+# pull-up, plus the SPI0 SCK/MISO/MOSI AF pins. Each runtime-hal trace compares clean both against
+# the GD SPL (two-oracle) and against its committed GD SPL golden (--against-trace).
 M2_BUS_MATRIX = [
     ("clock_enable_i2c0_gpiob_f1x0", "gd32f1x0"),
     ("clock_enable_i2c0_gpiob_f10x", "gd32f10x"),
@@ -154,9 +153,11 @@ M2_BUS_MATRIX = [
     ("clock_enable_adc0_f10x", "gd32f10x"),
     ("gpio_af_i2c0_scl_sda_f1x0", "gd32f1x0"),
     ("gpio_af_i2c0_scl_sda_f10x", "gd32f10x"),
-    # SPI pin-AF vectors removed: after the runtime-hal refactor there is no public API to route
-    # SPI pins to their alternate function (Spi::bring_up writes no GPIO, and there is no Spi::new),
-    # so the SPI-pin AF golden is unrepresentable through the public surface.
+    # SPI pin-AF vectors restored: Spi::bring_up writes no GPIO and there is no Spi::new, so the SPI
+    # pin AF had no public entry point after the refactor. Chip::route_spi_pin(pin, role) (the SPI
+    # analogue of route_advanced_pwm_pin) now exposes it, so these route the SCK/MISO/MOSI AF.
+    ("gpio_af_spi0_pins_f1x0", "gd32f1x0"),
+    ("gpio_af_spi0_pins_f10x", "gd32f10x"),
 ]
 
 

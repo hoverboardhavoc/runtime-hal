@@ -26,6 +26,9 @@ pub enum DescriptorError {
     MissingBase(PeriphLabel),
     /// A USART wiring record failed validation.
     UsartConfig,
+    /// A routing entry point was handed a pin role it does not handle (e.g. a non-SPI
+    /// [`crate::gpio::PinRole`] passed to [`crate::Chip::route_spi_pin`]).
+    UnsupportedRole,
 }
 
 /// The runtime-detection boot entry's failure surface.
