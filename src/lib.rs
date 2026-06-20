@@ -72,9 +72,13 @@ pub use descriptor::{
     MAX_TIMERS, MAX_USARTS,
 };
 pub use detect::{
-    descriptor_f103, descriptor_f130, detect_chip, synthesize, Family, F10X_K2_THRESHOLD_KIB,
-    FLASH_DENSITY_ADDR,
+    descriptor_f103, descriptor_f130, detect_chip, F10X_K2_THRESHOLD_KIB, FLASH_DENSITY_ADDR,
 };
+// `Family` / `synthesize` are detection internals: the default public API never names a chip family
+// (silicon purity). They are re-exported at the crate root ONLY behind the `detect-internals`
+// feature, for the in-tree detection-acceptance bench firmware that must introspect detection.
+#[cfg(feature = "detect-internals")]
+pub use detect::{synthesize, Family};
 pub use error::{
     AdcError, BringUpError, ClockError, DescriptorError, DetectError, I2cError, PwmError, SpiError,
     UsartError, WatchdogError,

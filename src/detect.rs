@@ -49,19 +49,71 @@ pub mod bringup;
 ///
 /// The detection-internal discriminator that drives descriptor synthesis. Application code never
 /// needs this (the silicon-purity principle: the HAL hands back a [`Chip`] / capability fruits, and
-/// an app derives any family-shaped fact from those, e.g. `chip.clock()`). It is public ONLY for the
-/// in-tree detection-acceptance bench firmware (`bench-fw/detect`, `bench-fw/probe`), which is THE
-/// on-silicon test of the detection path and must name the family it resolved to record the probe
-/// outcome for the human reader.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    /// GD32F1x0 (e.g. F130): GPIO on AHB2 at `0x4800_0000`, the `RCU_AHBEN` GPIO clock enable.
-    /// Wire code 1 (matches the `bench-fw-detect` `detected_family` sentinel).
-    F1x0 = 1,
-    /// GD32F10x (e.g. F103): GPIO on APB2 at `0x4001_0800`, the `RCU_APB2EN` GPIO clock enable.
-    /// Wire code 2.
-    F10x = 2,
+/// an app derives any family-shaped fact from those, e.g. `chip.clock()`).
+///
+/// VISIBILITY: this is a detection internal. It is NOT reachable from outside the crate in the
+/// default build (the silicon-purity public API never names a chip family). It is re-exported at the
+/// crate root ONLY behind the `detect-internals` Cargo feature, for the in-tree detection-acceptance
+/// bench firmware (`bench-fw/detect`, `bench-fw/probe`), which is THE on-silicon test of the
+/// detection path and must name the family it resolved to record the probe outcome for the human
+/// reader. The `synth` inner module holds the definition; the cfg'd re-exports below set the
+/// reachable visibility (Rust cannot cfg the `pub` / `pub(crate)` keyword directly).
+#[cfg(feature = "detect-internals")]
+pub use synth::{synthesize, Family};
+#[cfg(not(feature = "detect-internals"))]
+pub(crate) use synth::{synthesize, Family};
+
+/// The family discriminator + family -> descriptor synthesis. Defined in a child module so the
+/// re-export above can set the family-internal visibility per the `detect-internals` feature without
+/// the items being reachable through the (public) `detect` module by default.
+mod synth {
+    use super::{descriptor_f103, descriptor_f130, McuDescriptor, PageSize, F10X_K2_THRESHOLD_KIB};
+
+    /// The MCU family the probe resolves. A single family determination fixes all four
+    /// register-model selectors, the base-address table, and the family-default timer/ADC capability
+    /// counts (which the peripheral-presence measurement then refines).
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Family {
+        /// GD32F1x0 (e.g. F130): GPIO on AHB2 at `0x4800_0000`, the `RCU_AHBEN` GPIO clock enable.
+        /// Wire code 1 (matches the `bench-fw-detect` `detected_family` sentinel).
+        F1x0 = 1,
+        /// GD32F10x (e.g. F103): GPIO on APB2 at `0x4001_0800`, the `RCU_APB2EN` GPIO clock enable.
+        /// Wire code 2.
+        F10x = 2,
+    }
+
+    /// Synthesize the per-family chip [`McuDescriptor`] from the detected `family` and the
+    /// density-register read `flash_kib`.
+    ///
+    /// The selectors and the address table are CONSTANT per family ([`descriptor_f103`] /
+    /// [`descriptor_f130`]). `flash_page` is the one per-part input:
+    /// - **F1x0**: constant `K1` (always 1 KiB pages); `flash_kib` is ignored.
+    /// - **F10x**: density-dependent. `flash_kib > 128` => `K2` (high/extra density), else `K1`
+    ///   (medium density).
+    ///
+    /// The `adv_timers` / `adc_count` fields carry the family DEFAULT; [`super::detect_chip`]
+    /// overwrites them with the MEASURED per-instance counts. The result passes
+    /// `addrs.check_ranges(gpio, clock)` by construction (it reuses the family-correct bases).
+    ///
+    /// It takes the [`Family`] discriminator and returns an [`McuDescriptor`], a detection-internal
+    /// step on the way to [`super::detect_chip`]. Reachable outside the crate ONLY behind the
+    /// `detect-internals` feature, for the in-tree detection acceptance firmware, which decomposes
+    /// detect-then-synthesize to record each intermediate result.
+    pub fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
+        match family {
+            Family::F1x0 => descriptor_f130(), // flash_page is the family constant K1; density unused.
+            Family::F10x => {
+                let mut desc = descriptor_f103();
+                desc.flash_page = if flash_kib > F10X_K2_THRESHOLD_KIB {
+                    PageSize::K2
+                } else {
+                    PageSize::K1
+                };
+                desc
+            }
+        }
+    }
 }
 
 /// TIM8 (TIMER7) base on the F10x high-density parts (APB2 advanced-timer window). Added to the
@@ -159,36 +211,8 @@ pub const FLASH_DENSITY_ADDR: u32 = 0x1FFF_F7E0;
 /// is medium-density with 1 KiB pages (`K1`): "if flash size > 128 KiB ... K2".
 pub const F10X_K2_THRESHOLD_KIB: u16 = 128;
 
-/// Synthesize the per-family chip [`McuDescriptor`] from the detected `family` and the
-/// density-register read `flash_kib`.
-///
-/// The selectors and the address table are CONSTANT per family ([`descriptor_f103`] /
-/// [`descriptor_f130`]). `flash_page` is the one per-part input:
-/// - **F1x0**: constant `K1` (always 1 KiB pages); `flash_kib` is ignored.
-/// - **F10x**: density-dependent. `flash_kib > 128` => `K2` (high/extra density), else `K1`
-///   (medium density).
-///
-/// The `adv_timers` / `adc_count` fields carry the family DEFAULT; [`detect_chip`] overwrites them
-/// with the MEASURED per-instance counts. The result passes `addrs.check_ranges(gpio, clock)` by
-/// construction (it reuses the family-correct bases).
-///
-/// It takes the [`Family`] discriminator and returns an [`McuDescriptor`], a detection-internal step
-/// on the way to [`detect_chip`]. Public for the same reason as [`Family`]: the in-tree detection
-/// acceptance firmware decomposes detect-then-synthesize to record each intermediate result.
-pub fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
-    match family {
-        Family::F1x0 => descriptor_f130(), // flash_page is the family constant K1; density unused.
-        Family::F10x => {
-            let mut d = descriptor_f103();
-            d.flash_page = if flash_kib > F10X_K2_THRESHOLD_KIB {
-                PageSize::K2
-            } else {
-                PageSize::K1
-            };
-            d
-        }
-    }
-}
+// `synthesize` and the `Family` discriminator live in the private `synth` child module above; the
+// cfg'd re-exports there set their reachable visibility per the `detect-internals` feature.
 
 // --- the boot-flow entry ----------------------------------------------------------------------
 

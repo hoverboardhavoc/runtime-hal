@@ -31,3 +31,11 @@ proptest = "1"
 # bus-fault probe is hardware-only and is simply not exercised under `mock` (no host/emulator raises
 # the reserved-region bus fault it relies on).
 mock = []
+
+# `detect-internals` is OPT-IN (default OFF) and exposes the detection internals (`Family`,
+# `synthesize`) at the crate root for the in-tree on-silicon detection-acceptance firmware
+# (bench-fw/detect, bench-fw/probe), which legitimately must introspect the detection path. With the
+# feature OFF these are NOT reachable from outside the crate: the default public API never names a
+# chip family (silicon purity). This feature does NOT gate a family path; detection is always
+# compiled in. It only widens the visibility of two already-present detection symbols.
+detect-internals = []

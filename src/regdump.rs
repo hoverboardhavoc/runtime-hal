@@ -144,8 +144,9 @@ impl RegDumpConfig {
     /// timer) and `adc_base` (the injected ADC) into a snapshot. Pure reads, no writes, no MOE: safe
     /// to call at any time (the M3 SAFETY rules: reading with MOE off and no drain supply is harmless).
     ///
-    /// The bases are the ones the application already resolved once (e.g. `chip.base(cfg.timer)?` /
-    /// `chip.base(cfg.adc)?`), matching the resolve-once handle pattern (DECISIONS.md #4).
+    /// The bases are HAL-internal; application code calls [`crate::chip::Chip::dump_config`], which
+    /// resolves the timer + ADC labels from the descriptor and calls this, matching the resolve-once
+    /// handle pattern (DECISIONS.md #4) so a caller never holds a raw base.
     #[must_use]
     pub fn dump(timer_base: u32, adc_base: u32) -> RegDumpConfig {
         RegDumpConfig {

@@ -47,15 +47,34 @@ impl Chip {
 
     /// Resolve a label to its base address ([`DescriptorError::MissingBase`] if absent).
     ///
-    /// Resolve a peripheral base address from the descriptor. Prefer the chip-based builders (e.g.
-    /// [`Chip::output_pin`], [`Chip::input_group`], [`Chip::adc`], [`crate::timer::PwmTimer::configure`],
-    /// [`crate::watchdog::FreeWatchdog::start`]), which resolve the base internally and hand back a
-    /// handle so application code never holds a raw base. This raw resolver is public for the cases
-    /// that genuinely take a base (e.g. [`crate::regdump::RegDumpConfig::dump`], whose doc names
-    /// `chip.base(cfg.timer)?` as its source) and for the in-tree bench validators.
+    /// HAL-internal (`pub(crate)`): the general raw-base escape, used heavily in-crate to source a
+    /// peripheral base from the descriptor. It is NOT public, so a caller never holds a raw base; the
+    /// chip-based builders (e.g. [`Chip::output_pin`], [`Chip::input_group`], [`Chip::adc`],
+    /// [`crate::timer::PwmTimer::configure`], [`crate::watchdog::FreeWatchdog::start`]) resolve the
+    /// base internally and hand back a handle. If an external consumer needs a base, that is a signal
+    /// to add the missing chip-based builder, not to re-expose this.
     #[inline]
-    pub fn base(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
+    pub(crate) fn base(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
         self.desc.addrs.resolve(label)
+    }
+
+    /// Read the per-cycle-path configuration registers back into a snapshot, resolving the advanced
+    /// timer and injected-ADC bases from the descriptor internally.
+    ///
+    /// This is the chip-based builder for the read-only verification dump: it resolves `timer` and
+    /// `adc` to their bases (so the caller never holds a raw base) and hands back the
+    /// [`crate::regdump::RegDumpConfig`] snapshot. Pure reads, no writes, never an MOE write, so it is
+    /// safe to call at any time. Returns [`DescriptorError::MissingBase`] if either label is absent
+    /// from this part's descriptor.
+    #[inline]
+    pub fn dump_config(
+        &self,
+        timer: PeriphLabel,
+        adc: PeriphLabel,
+    ) -> Result<crate::regdump::RegDumpConfig, DescriptorError> {
+        let timer_base = self.base(timer)?;
+        let adc_base = self.base(adc)?;
+        Ok(crate::regdump::RegDumpConfig::dump(timer_base, adc_base))
     }
 
     /// The GPIO register-model path selector.

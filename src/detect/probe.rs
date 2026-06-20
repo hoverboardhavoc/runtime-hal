@@ -295,8 +295,9 @@ static FAULTED: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detected {
     /// The family the GPIO+RCU probe resolved, the detection-internal discriminator that drives
-    /// [`super::synthesize`]. Public for the in-tree detection acceptance firmware (see
-    /// [`super::Family`]); application code derives family-shaped facts from the [`crate::Chip`] instead.
+    /// `synthesize`. Reachable outside the crate only behind the `detect-internals` feature, for the
+    /// in-tree detection acceptance firmware; application code derives family-shaped facts from the
+    /// [`crate::Chip`] instead.
     pub family: Family,
     /// `FLASH_DENSITY[15:0]` (KiB of flash), read from `0x1FFF_F7E0`. Corroboration + the F10x
     /// `flash_page` input (spec section 4.3 / 5.2). Read after the family decision; advisory for
