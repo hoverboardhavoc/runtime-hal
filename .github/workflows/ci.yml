@@ -16,33 +16,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7m-none-eabi
-          components: rustfmt, clippy
+          components: rustfmt, clippy, llvm-tools
       - name: rustfmt
         run: cargo fmt --all --check
       - name: clippy (firmware target)
         run: cargo clippy --target thumbv7m-none-eabi -- -D warnings
       - name: build (firmware target)
         run: cargo build --target thumbv7m-none-eabi
-      # The firmware bin crates are built explicitly here. There is no workspace, so each is built by
-      # --manifest-path. firmware/ is ONE source (the chip is detected at runtime); the f103 / f130
-      # feature now selects only the linker memory.x (RAM size), so both link variants are built (the
-      # f130 build needs --no-default-features to turn the default f103 off). The bench-fw/ crates are
-      # the on-silicon validators: bench-fw/coldpath (cold-path peripheral bring-up), bench-fw/detect
-      # (family detection acceptance), bench-fw/probe (peripheral-presence measurement), and
-      # bench-fw/motor-verify (hot-path configure-then-read-back, MOE never armed). All are no_std
-      # thumbv7m-none-eabi images.
-      - name: build firmware (f103 memory layout)
-        run: cargo build --manifest-path firmware/Cargo.toml --target thumbv7m-none-eabi --features f103
-      - name: build firmware (f130 memory layout, no-default)
-        run: cargo build --manifest-path firmware/Cargo.toml --target thumbv7m-none-eabi --no-default-features --features f130
-      - name: build bench-fw/coldpath
-        run: cargo build --manifest-path bench-fw/coldpath/Cargo.toml --target thumbv7m-none-eabi
-      - name: build bench-fw/detect
-        run: cargo build --manifest-path bench-fw/detect/Cargo.toml --target thumbv7m-none-eabi
-      - name: build bench-fw/probe
-        run: cargo build --manifest-path bench-fw/probe/Cargo.toml --target thumbv7m-none-eabi
-      - name: build bench-fw/motor-verify
-        run: cargo build --manifest-path bench-fw/motor-verify/Cargo.toml --target thumbv7m-none-eabi
+      # The embedded bin crates (firmware + the bench-fw validators) MUST be built from INSIDE their
+      # own crate directory. Each carries the cortex-m-rt linker script via its `.cargo/config.toml`
+      # (`-C link-arg=-Tlink.x`), and cargo discovers `.cargo/config.toml` from the CURRENT DIRECTORY,
+      # NOT from `--manifest-path`. Built with `--manifest-path` from the repo root, link.x is silently
+      # dropped, the linker garbage-collects every code section, and the build "succeeds" with an EMPTY
+      # image (all sections at VMA 0, a 0-byte objcopy). So `cd` into each crate, then ASSERT the image
+      # has loadable content, which fails CI loudly if link.x ever stops being applied.
+      #
+      # firmware/ is ONE source (the chip is detected at runtime); the f103 / f130 feature selects only
+      # the linker memory.x (RAM size), so both link variants are built (f130 needs --no-default-features
+      # to turn the default f103 off). bench-fw/: coldpath (cold-path peripheral bring-up), detect
+      # (family detection acceptance), probe (peripheral-presence measurement), motor-verify (hot-path
+      # configure-then-read-back, MOE never armed). All are no_std thumbv7m-none-eabi images.
+      - name: build embedded firmware + bench-fw (verified non-empty)
+        run: |
+          set -euo pipefail
+          objcopy="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/llvm-objcopy"
+          check() { # <elf>: fail if the image has no loadable content (link.x not applied)
+            local bin sz
+            bin="$(mktemp)"
+            "$objcopy" -O binary "$1" "$bin"
+            sz="$(wc -c < "$bin")"; rm -f "$bin"
+            echo "  $1 -> $sz bytes"
+            [ "$sz" -gt 0 ] || { echo "::error::empty image $1 (link.x not applied; build from the crate dir)"; exit 1; }
+          }
+          ( cd firmware && cargo build --release --features f103 )
+          check firmware/target/thumbv7m-none-eabi/release/bench
+          ( cd firmware && cargo build --release --no-default-features --features f130 )
+          check firmware/target/thumbv7m-none-eabi/release/bench
+          for c in detect probe coldpath motor-verify; do
+            ( cd "bench-fw/$c" && cargo build --release )
+            check "bench-fw/$c/target/thumbv7m-none-eabi/release/bench-fw-$c"
+          done
       # G1 (descriptor-rework DR-T8): the host tests need --features mock. The src/*/tests.rs
       # modules use crate::reg::mock + std (the host-only mock register space), which are gated
       # behind the `mock` feature, so a bare `cargo test` fails to compile them. The modules are
