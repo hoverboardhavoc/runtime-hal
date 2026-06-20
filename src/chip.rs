@@ -86,34 +86,37 @@ impl Chip {
     /// Configure a pin as a general-purpose push-pull output and return a standard
     /// [`embedded_hal::digital::OutputPin`] handle for it.
     ///
-    /// Resolves `port` to its base from the chip's address table, configures `pin` as a 50 MHz
-    /// push-pull output through `configure_output` (which owns the F10x/F1x0
-    /// register-model branch internally), and returns the [`GpioOutput`] handle. Application code
-    /// then drives the pin through the `embedded-hal` trait, never seeing the [`GpioPath`] split or
-    /// a raw base. `pin` is the pin number (0..15) within the port. Returns
-    /// [`DescriptorError::MissingBase`] if the port is not in the address table.
+    /// Resolves `port` to its base from the chip's address table, **enables the port's peripheral
+    /// clock** (a GPIO write only takes once the clock is on), configures `pin` as a 50 MHz push-pull
+    /// output through `configure_output` (which owns the F10x/F1x0 register-model branch internally),
+    /// and returns the [`GpioOutput`] handle. Application code then drives the pin through the
+    /// `embedded-hal` trait, never seeing the [`GpioPath`] split or a raw base. `pin` is the pin
+    /// number (0..15) within the port. Returns [`DescriptorError::MissingBase`] if the port or RCU
+    /// base is absent from the descriptor.
     #[inline]
     pub fn output_pin(&self, port: PeriphLabel, pin: u8) -> Result<GpioOutput, DescriptorError> {
         let base = self.base(port)?;
+        let rcu = self.rcu_base()?;
+        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
         gpio::configure_output(base, self.desc.gpio, pin);
         Ok(GpioOutput::new(base, self.desc.gpio, pin))
     }
 
     /// Configure a pin as an analog input so the ADC mux samples its true voltage.
     ///
-    /// Resolves `port` to its base from the chip's address table and configures `pin` as analog
-    /// through `configure_analog` (which owns the F10x/F1x0 register-model branch internally). The
-    /// reset state of a pin is a *digital* input on BOTH families (not analog), so an ADC input pin
-    /// must be set to analog explicitly or the ADC samples through an active digital input buffer and
-    /// reads a clamped / stuck value. There is no handle to return: an analog pin is owned by the ADC,
-    /// not driven or read as GPIO. `pin` is the pin number (0..15) within the port. Returns
-    /// [`DescriptorError::MissingBase`] if the port is not in the address table.
-    ///
-    /// The caller is expected to have enabled the port clock (e.g. via [`Chip::gpioa`]); this only
-    /// writes the pin's mode bits.
+    /// Resolves `port` to its base from the chip's address table, **enables the port's peripheral
+    /// clock**, and configures `pin` as analog through `configure_analog` (which owns the F10x/F1x0
+    /// register-model branch internally). The reset state of a pin is a *digital* input on BOTH
+    /// families (not analog), so an ADC input pin must be set to analog explicitly or the ADC samples
+    /// through an active digital input buffer and reads a clamped / stuck value. There is no handle to
+    /// return: an analog pin is owned by the ADC, not driven or read as GPIO. `pin` is the pin number
+    /// (0..15) within the port. Returns [`DescriptorError::MissingBase`] if the port or RCU base is
+    /// absent from the descriptor.
     #[inline]
     pub fn analog_pin(&self, port: PeriphLabel, pin: u8) -> Result<(), DescriptorError> {
         let base = self.base(port)?;
+        let rcu = self.rcu_base()?;
+        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
         gpio::configure_analog(base, self.desc.gpio, pin);
         Ok(())
     }
