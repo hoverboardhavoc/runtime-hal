@@ -64,7 +64,9 @@ use cortex_m_rt::entry;
 use panic_halt as _;
 
 use runtime_hal::detect::probe::{self, RCU_APB2EN_OFFSET};
-use runtime_hal::detect::synthesize;
+// `synthesize` comes from the crate-root re-export gated behind the `detect-internals` feature
+// (enabled in this crate's Cargo.toml), not the `detect` module path.
+use runtime_hal::synthesize;
 
 /// The magic value written last once the whole run completed (distinct from bench-fw-detect's).
 const MAGIC: u32 = 0x4DF7_9505;

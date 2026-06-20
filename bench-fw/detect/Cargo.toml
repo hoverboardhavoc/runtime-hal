@@ -8,7 +8,9 @@ description = "On-silicon acceptance firmware for runtime family detection: runs
 [dependencies]
 # runtime-hal in its normal real-MMIO no_std build. NOT the `mock` feature (the probe relies on a
 # REAL bus fault, which no host/emulator raises). Runtime detection is always compiled in now.
-runtime-hal = { path = "../..", default-features = false }
+# `detect-internals` exposes the detection internals (Family, synthesize) this acceptance firmware
+# decomposes detect-then-synthesize against; the default public API keeps them crate-internal.
+runtime-hal = { path = "../..", default-features = false, features = ["detect-internals"] }
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"

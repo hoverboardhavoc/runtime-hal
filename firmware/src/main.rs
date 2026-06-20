@@ -49,7 +49,7 @@ use runtime_hal::{
     detect_chip,
     gpio::PinRole,
     usart::Usart,
-    Chip, Family, GpioOutput, PeriphLabel,
+    Chip, ClockPath, GpioOutput, PeriphLabel,
 };
 
 /// The code-level clock tree for the M1 bench firmware: the reset-default HSI 8 MHz, AHB/APB /1, no
@@ -76,10 +76,6 @@ fn main() -> ! {
     // 1. Detect the chip at runtime (family probe + peripheral measurement -> synthesized Chip). A
     //    part that matches neither family halts (fail-loud) rather than misconfiguring.
     let chip: Chip = detect_chip().unwrap_or_else(|_| halt());
-    let family = match chip.clock() {
-        runtime_hal::ClockPath::F1x0Rcu => Family::F1x0,
-        runtime_hal::ClockPath::F10xRcc => Family::F10x,
-    };
 
     // 2. The USART config, constructed IN CODE: USART1, PA2/PA3, 115200, 8N1, /16. The chip resolves
     //    USART1 to its base; this supplies the behavior.
@@ -121,10 +117,11 @@ fn main() -> ! {
     //    already routed in step 4 (`route_usart_pin`); `bring_up` programs only the USART registers.
     let usart = Usart::bring_up(&chip, &M1_CLOCK, &usart_cfg).unwrap_or_else(|_| halt());
 
-    // Run the role chosen by the detected family: F10x (F103) = master, F1x0 (F130) = slave.
-    match family {
-        Family::F10x => run_master(usart, buzzer),
-        Family::F1x0 => run_slave(usart, buzzer),
+    // Run the role chosen by the detected family, matching the PUBLIC clock-path capability directly
+    // (no family discriminator): F10x (F103) = master, F1x0 (F130) = slave.
+    match chip.clock() {
+        ClockPath::F10xRcc => run_master(usart, buzzer),
+        ClockPath::F1x0Rcu => run_slave(usart, buzzer),
     }
 }
 

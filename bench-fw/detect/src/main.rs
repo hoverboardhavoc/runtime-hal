@@ -46,8 +46,9 @@ use cortex_m_rt::entry;
 use panic_halt as _;
 
 use runtime_hal::detect::probe::{self, F10X_GPIOA_BASE, F1X0_GPIOA_BASE};
-use runtime_hal::detect::{synthesize, Family};
-use runtime_hal::{Chip, ClockPath, GpioPath, PageSize};
+// `Family` / `synthesize` come from the crate-root re-export gated behind the `detect-internals`
+// feature (enabled in this crate's Cargo.toml), not the `detect` module path.
+use runtime_hal::{synthesize, Chip, ClockPath, Family, GpioPath, PageSize};
 
 /// The probe-record sentinels for a per-candidate probe field (`f1x0_probe` / `f10x_probe`).
 mod probe_code {

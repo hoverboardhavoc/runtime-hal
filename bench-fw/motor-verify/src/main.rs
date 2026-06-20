@@ -7,12 +7,12 @@
 //!
 //! # What it does
 //!
-//! 1. Detects the chip and resolves the advanced-timer (TIMER0) base.
+//! 1. Detects the chip.
 //! 2. Runs the advanced-timer complementary-PWM bring-up (`PwmController::configure`) from a
 //!    reference `PwmConfig`. This is CONFIG-ONLY: it programs the time base, the three complementary
 //!    channel pairs, dead-time and the break/off-state word, and leaves MOE (the main-output-enable
 //!    arming gate) OFF. The bridge is configured but DISARMED, so no current can flow.
-//! 3. Reads the configured registers back with `RegDumpConfig::dump(timer_base, adc_base)` (pure
+//! 3. Reads the configured registers back with `chip.dump_config(timer, adc)` (pure
 //!    reads, no writes, never an MOE write) and checks them against what was configured:
 //!    - the period (CAR) and prescaler (PSC) match the config,
 //!    - the dead-time field in CCHP matches,
@@ -24,7 +24,7 @@
 //!
 //! # Why this is electrically safe to run on a board
 //!
-//! Nothing here arms the bridge: `PwmController::configure` leaves MOE off, and `RegDumpConfig::dump`
+//! Nothing here arms the bridge: `PwmController::configure` leaves MOE off, and `Chip::dump_config`
 //! only READS registers. With MOE clear the timer counts and the compare events toggle the internal
 //! channels, but the gate driver outputs stay at their idle state, so no phase current flows. This
 //! is the disarmed-but-configured state the M3 SAFETY section calls electrically safe to scope. The
@@ -51,8 +51,8 @@ use panic_halt as _;
 
 use runtime_hal::config::TrgoSource;
 use runtime_hal::{
-    detect_chip, BreakConfig, ClockDiv, ComplementaryPwm, RegDumpConfig, OcMode, PeriphLabel,
-    PwmAlign, PwmChannelConfig, PwmConfig, PwmController,
+    detect_chip, BreakConfig, ClockDiv, ComplementaryPwm, OcMode, PeriphLabel, PwmAlign,
+    PwmChannelConfig, PwmConfig, PwmController,
 };
 
 /// The reference PWM period (TIMER0 CAR): the stock board's 16 kHz center-aligned value.
@@ -125,19 +125,19 @@ fn main() -> ! {
     let mut led = gpiob.pb3.into_push_pull_output();
     let _ = led.set_low();
 
-    // Resolve the advanced-timer (TIMER0) base, and use it for the ADC base too: this example does
-    // not bring up the injected ADC, so the ADC half of the dump is read from a harmless base (the
-    // verdict only checks the timer half). A full verify example would resolve the real ADC base.
-    let timer_base = chip.base(PeriphLabel::Timer0).unwrap();
-
     // CONFIG-ONLY bring-up: programs the timer, leaves MOE OFF (the bridge stays disarmed). We hold
     // only the per-cycle handle; arming is a separate ArmGate call this example never makes.
     let cfg = reference_config();
     let verified = match PwmController::new().configure(&chip, &cfg) {
         Ok(_handle) => {
-            // Read the configured registers back (pure reads, no MOE write) and check them.
-            let snap = RegDumpConfig::dump(timer_base, timer_base);
-            verify(&snap.timer)
+            // Read the configured registers back through the chip-based dump builder (pure reads, no
+            // MOE write), which resolves the bases internally. This example does not bring up the
+            // injected ADC, so TIMER0 is passed for the ADC base too: the verdict only checks the
+            // timer half. A full verify example would pass the real injected-ADC label.
+            match chip.dump_config(PeriphLabel::Timer0, PeriphLabel::Timer0) {
+                Ok(snap) => verify(&snap.timer),
+                Err(_) => false,
+            }
         }
         // A config failure (e.g. the timer base did not resolve) is itself a verification failure.
         Err(_) => false,
