@@ -12,7 +12,7 @@
 //! resolves a base once via `Chip`, constructs the handle, and the per-cycle path holds raw bases.
 
 use crate::addr::PeriphLabel;
-use crate::adc::{Adc, AdcCapability};
+use crate::adc::{Adc, AdcCapability, DualAdc};
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
 use crate::error::DescriptorError;
 use crate::gpio::gpio_in::INPUT_GROUP_LINES;
@@ -252,7 +252,7 @@ impl Chip {
         let primary = Adc::at(self.base(PeriphLabel::Adc0)?);
         if self.adc_count() >= 2 {
             let secondary = Adc::at(self.base(PeriphLabel::Adc1)?);
-            Ok(AdcCapability::Dual { primary, secondary })
+            Ok(AdcCapability::Dual(DualAdc::new(primary, secondary)))
         } else {
             Ok(AdcCapability::Single(primary))
         }
@@ -390,7 +390,7 @@ mod tests {
         d.adc_count = 2;
         d.addrs.set(PeriphLabel::Adc1, 0x4001_2800);
         let dual = Chip::from_descriptor(d);
-        assert!(matches!(dual.adc(), Ok(AdcCapability::Dual { .. })));
+        assert!(matches!(dual.adc(), Ok(AdcCapability::Dual(_))));
 
         // A part that claims 2 ADCs but is missing the ADC1 base fails loud (no fake handle).
         let mut bad = descriptor_f103();

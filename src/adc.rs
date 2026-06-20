@@ -113,6 +113,15 @@ const STAT_EOIC: u32 = 1 << 2;
 // CTL0 bits.
 /// Scan mode (`ADC_CTL0_SM`); left clear for single conversion.
 const CTL0_SM: u32 = 1 << 8;
+/// Sync-mode selection field (`ADC_CTL0_SYNCM`, `bits[19:16]`). F10x dual-ADC only. The register-bit
+/// table (GD32F10x User Manual Rev2.6, section 11.6 ADC_CTL0) is explicit: "These bits are only used
+/// in ADC0", so the SYNCM field is programmed on ADC0 (the master), matching the SPL
+/// `adc_mode_config` which writes `ADC_CTL0(ADC0)`. (The section-11.5 prose says "ADC1_CTL0"; the
+/// register table + the SPL agree it is ADC0, so the prose is a manual typo and we follow the table.)
+const CTL0_SYNCM: u32 = 0xF << 16;
+/// SYNCM code 6 = "routine parallel mode" (regular simultaneous): ADC0 + ADC1 convert their regular
+/// sequences at the same instant (GD32F10x User Manual Table 11-5 / SPL `ADC_DAUL_REGULAL_PARALLEL`).
+const SYNCM_REGULAR_PARALLEL: u32 = 6 << 16;
 
 // CTL1 bits.
 const CTL1_ADCON: u32 = 1 << 0;
@@ -520,10 +529,11 @@ impl Adc {
 /// SHAPE, never on the MCU family. Returned by [`crate::Chip::adc`].
 ///
 /// - [`AdcCapability::Single`]: one ADC (the F1x0 baseline). Sample channels in sequence.
-/// - [`AdcCapability::Dual`]: two ADCs (the F10x dual-ADC parts), handed back as `primary` +
-///   `secondary`. The pair can be driven for at-the-same-instant simultaneous sampling; this fruit
-///   hands back BOTH handles so each is usable today. (The hardware regular-simultaneous trigger
-///   coupling is a future bring-up; the two handles are independently usable now.)
+/// - [`AdcCapability::Dual`]: two ADCs (the F10x dual-ADC parts), as a [`DualAdc`] token. Its
+///   `primary` (ADC0) / `secondary` (ADC1) handles are each usable independently, AND the token
+///   carries the regular-simultaneous bring-up + paired read ([`DualAdc::bring_up_simultaneous`] /
+///   [`DualAdc::read_simultaneous`]), which exist ONLY here, so they are unreachable on a
+///   single-ADC part (the capability-token property).
 ///
 /// Because a caller `match`es this exhaustively, firmware that uses the ADC handles BOTH shapes and so
 /// runs on either family by construction, with no family test.
@@ -531,13 +541,129 @@ impl Adc {
 pub enum AdcCapability {
     /// A single ADC.
     Single(Adc),
-    /// Two ADCs (F10x dual-ADC parts): the primary (ADC0) and secondary (ADC1).
-    Dual {
-        /// The primary ADC (ADC0).
-        primary: Adc,
-        /// The secondary ADC (ADC1).
-        secondary: Adc,
-    },
+    /// Two ADCs (F10x dual-ADC parts): the simultaneous-capable [`DualAdc`] token (ADC0 = master,
+    /// ADC1 = slave).
+    Dual(DualAdc),
+}
+
+/// The F10x dual-ADC capability token (ADC0 master + ADC1 slave). Obtained ONLY from
+/// [`AdcCapability::Dual`], so the simultaneous-sampling methods on it cannot be called on a
+/// single-ADC part. The two handles are also usable independently via [`DualAdc::primary`] /
+/// [`DualAdc::secondary`].
+///
+/// # Regular-simultaneous ("routine parallel") mode
+///
+/// GD32F10x User Manual Rev2.6 section 11.5.2 + Table 11-5, cross-checked against the GD SPL
+/// (`gd32f10x_adc.c` `adc_mode_config` / `adc_sync_mode_convert_value_read`). ADC0 is the master, ADC1
+/// the slave; both convert their regular sequences at the same instant. The `SYNCM[3:0]` field
+/// (`ADC_CTL0_SYNCM`, `bits[19:16]`) is programmed on ADC0 only (the register-bit table: "These bits are
+/// only used in ADC0"); the routine-parallel code is `0b0110` (6). The master takes the external
+/// trigger; the slave is software-triggered (here both run from the regular software trigger, the M2
+/// single-conversion default this builds on).
+///
+/// The paired result is read from ADC0's 32-bit `ADC_RDATA`: `[15:0]` = ADC0's conversion,
+/// `[31:16]` = ADC1's (the `ADC1RDTR` half), per the User Manual ADC_RDATA field table and SPL
+/// `adc_sync_mode_convert_value_read`, which reads `ADC_RDATA(ADC0)`.
+///
+/// # Validation (Limitations)
+///
+/// This is UNVALIDATABLE on the bench: the only part we own with two ADCs is the DUMP-ONLY 12-FET
+/// (GD32F103RCT6, RDP-1, not powered, needs the unlock/flash path). Until that board is powered, the
+/// gate is the host register-diff tests + the SPL recipe above; the path is flagged for on-silicon
+/// validation.
+///
+/// Documented gap: the User Manual (section 11.5) states "the DMA bit must be set even if it is not
+/// used" for sync mode. The SPL paired-read helper (`adc_sync_mode_convert_value_read`) reads
+/// `ADC_RDATA(ADC0)` directly with no DMA, and [`DualAdc::read_simultaneous`] follows that helper
+/// (direct register read, no DMA), so DMA is NOT set here. A DMA-based streaming path (which the
+/// blanket statement is about) is out of scope for this bring-up.
+#[derive(Debug, Clone, Copy)]
+pub struct DualAdc {
+    primary: Adc,
+    secondary: Adc,
+}
+
+impl DualAdc {
+    /// The primary ADC (ADC0, the sync-mode master). Usable independently for single conversions.
+    #[inline]
+    pub const fn primary(&self) -> Adc {
+        self.primary
+    }
+
+    /// The secondary ADC (ADC1, the sync-mode slave). Usable independently for single conversions.
+    #[inline]
+    pub const fn secondary(&self) -> Adc {
+        self.secondary
+    }
+
+    /// HAL-internal ctor (the chip-based [`crate::Chip::adc`] resolves both bases from the descriptor
+    /// and pairs them here); a caller never supplies raw ADC bases.
+    #[inline]
+    pub(crate) const fn new(primary: Adc, secondary: Adc) -> Self {
+        Self { primary, secondary }
+    }
+
+    /// Bring up regular-simultaneous ("routine parallel") sampling of one channel per ADC: ADC0
+    /// converts `primary_channel`, ADC1 converts `secondary_channel`, at the same instant, both at
+    /// `sample_time` (the `ADC_SAMPLETIME_*` code 0..=7).
+    ///
+    /// Reproduces the SPL recipe (see the type docs): bring up each ADC for its single regular
+    /// channel (the existing [`Adc::bring_up`] single-conversion path, incl. calibration), then set
+    /// the routine-parallel SYNCM code on ADC0 (the master). The User Manual note "Two channels
+    /// sampled by two ADCs at the same time should be configured with the same sampling time" is why
+    /// one `sample_time` is shared.
+    ///
+    /// Returns [`AdcError::Timeout`] if either ADC's calibration does not complete within
+    /// [`ADC_TIMEOUT`].
+    pub fn bring_up_simultaneous(
+        &self,
+        primary_channel: u8,
+        secondary_channel: u8,
+        sample_time: u8,
+    ) -> Result<(), AdcError> {
+        // Pure config writes (incl. the SYNCM routine-parallel mode on the master), then the
+        // calibration poll on each ADC (the shared M2 hang-if-done-wrong sequence). The split mirrors
+        // Adc::configure_single (writes) vs Adc::bring_up (writes + calibrate).
+        self.configure_simultaneous(primary_channel, secondary_channel, sample_time);
+        self.primary.calibrate()?;
+        self.secondary.calibrate()
+    }
+
+    /// Program the regular-simultaneous configuration (everything BEFORE calibration) and return.
+    /// Pure writes / RMWs, **no polling**: each ADC's single regular-channel config
+    /// ([`Adc::configure_single`]) plus the routine-parallel SYNCM code on ADC0 (the master). This is
+    /// what the host register-diff tests assert; [`DualAdc::bring_up_simultaneous`] is this then the
+    /// per-ADC [`Adc::calibrate`].
+    pub fn configure_simultaneous(
+        &self,
+        primary_channel: u8,
+        secondary_channel: u8,
+        sample_time: u8,
+    ) {
+        self.primary.configure_single(primary_channel, sample_time);
+        self.secondary.configure_single(secondary_channel, sample_time);
+        // adc_mode_config(ADC_DAUL_REGULAL_PARALLEL): set SYNCM = routine-parallel on ADC0 (master).
+        // Clear-then-set the 4-bit field, exactly as the SPL RMW does.
+        self.primary
+            .ctl0()
+            .modify(CTL0_SYNCM, SYNCM_REGULAR_PARALLEL);
+    }
+
+    /// Trigger one regular-simultaneous conversion (software-trigger the master, ADC0) and read the
+    /// paired result, returning `(primary, secondary)` = (ADC0 value, ADC1 value).
+    ///
+    /// In routine-parallel mode the master's software trigger starts BOTH conversions; the paired
+    /// 12-bit results are read from ADC0's 32-bit `ADC_RDATA` (`[15:0]` = ADC0, `[31:16]` = ADC1),
+    /// per the SPL `adc_sync_mode_convert_value_read`. Polls ADC0's EOC (bounded by [`ADC_TIMEOUT`])
+    /// before reading; exhaustion is [`AdcError::Timeout`].
+    pub fn read_simultaneous(&self) -> Result<(u16, u16), AdcError> {
+        self.primary.software_trigger();
+        self.primary.wait_eoc()?;
+        let paired = self.primary.rdata().read();
+        let p = (paired & 0xFFFF) as u16;
+        let s = ((paired >> 16) & 0xFFFF) as u16;
+        Ok((p, s))
+    }
 }
 
 // --- timer-triggered injected ADC (the per-cycle path) ----------------------------------------

@@ -488,3 +488,89 @@ mod injected {
         ));
     }
 }
+
+/// Host tests for the F10x dual-ADC regular-simultaneous ("routine parallel") datapath: the SYNCM
+/// mode write on the master + the paired RDATA read. Register writes are diffed against the GD SPL
+/// recipe (`gd32f10x_adc.c` `adc_mode_config(ADC_DAUL_REGULAL_PARALLEL)` /
+/// `adc_sync_mode_convert_value_read`) + the GD32F10x User Manual section 11.5.2 / Table 11-5 / the
+/// ADC_CTL0 SYNCM and ADC_RDATA field tables. This is UNVALIDATABLE on the bench (the only dual-ADC
+/// part we own is the dump-only 12-FET); the host register diff + the SPL recipe are the gate.
+mod dual {
+    use super::*;
+    use crate::adc::DualAdc;
+
+    /// ADC0 (master) + ADC1 (slave) bases (the mock window wraps modulo its size; the two differ in
+    /// their low 16 bits by 0x400, well above the 0x4C-max register offset, so they do not alias).
+    const ADC0: u32 = 0x4001_2400;
+    const ADC1: u32 = 0x4001_2800;
+
+    fn dual() -> DualAdc {
+        DualAdc::new(Adc::at(ADC0), Adc::at(ADC1))
+    }
+
+    fn r0(off: u32) -> u32 {
+        Reg32::new(ADC0, off).read()
+    }
+    fn r1(off: u32) -> u32 {
+        Reg32::new(ADC1, off).read()
+    }
+
+    /// `configure_simultaneous` configures each ADC's regular single channel AND sets SYNCM = routine
+    /// parallel (code 6) on ADC0 (the master). The User Manual ADC_CTL0 table is explicit that SYNCM
+    /// lives only in ADC0, so ADC1's CTL0 must NOT carry it.
+    #[test]
+    fn configure_simultaneous_sets_syncm_on_master_only_and_configs_each_adc() {
+        let _g = seed_reset();
+        // ADC0 reads channel 4, ADC1 reads channel 5, both at 7.5 cycles (code 1).
+        dual().configure_simultaneous(4, 5, 1);
+
+        // SYNCM[19:16] = 6 (routine parallel) on ADC0's CTL0.
+        assert_eq!(
+            (r0(CTL0) >> 16) & 0xF,
+            6,
+            "ADC0 SYNCM = routine parallel (code 6)"
+        );
+        // SYNCM is ADC0-only: ADC1's CTL0 SYNCM field stays 0.
+        assert_eq!((r1(CTL0) >> 16) & 0xF, 0, "ADC1 carries no SYNCM");
+
+        // Each ADC got its single-channel config: ADCON set, rank 0 = its channel.
+        assert_ne!(r0(CTL1) & CTL1_ADCON, 0, "ADC0 enabled");
+        assert_ne!(r1(CTL1) & CTL1_ADCON, 0, "ADC1 enabled");
+        assert_eq!(r0(RSQ2) & RSQ_FIELD, 4, "ADC0 rank 0 = channel 4");
+        assert_eq!(r1(RSQ2) & RSQ_FIELD, 5, "ADC1 rank 0 = channel 5");
+    }
+
+    /// `read_simultaneous` software-triggers the master and reads the paired result from ADC0's
+    /// 32-bit RDATA: `[15:0]` = ADC0, `[31:16]` = ADC1 (the ADC1RDTR half), per the User Manual
+    /// ADC_RDATA field table + SPL `adc_sync_mode_convert_value_read`.
+    #[test]
+    fn read_simultaneous_unpacks_paired_rdata_halves() {
+        let _g = seed_reset();
+        // Seed EOC set on the master and a packed paired result: ADC1 (0x0ABC) in [31:16], ADC0
+        // (0x0123) in [15:0].
+        Reg32::new(ADC0, STAT).write(STAT_EOC);
+        Reg32::new(ADC0, RDATA).write((0x0ABC << 16) | 0x0123);
+
+        let (p, s) = dual().read_simultaneous().unwrap();
+        assert_eq!(p, 0x0123, "primary (ADC0) from RDATA[15:0]");
+        assert_eq!(s, 0x0ABC, "secondary (ADC1) from RDATA[31:16]");
+        // The master was software-triggered (SWRCST set).
+        assert_ne!(r0(CTL1) & CTL1_SWRCST, 0, "master software-triggered");
+    }
+
+    /// The paired-read EOC poll is bounded: if the master's EOC never sets, it times out (not a hang).
+    #[test]
+    fn read_simultaneous_times_out_when_eoc_never_sets() {
+        let _g = seed_reset();
+        let e = dual().read_simultaneous().unwrap_err();
+        assert_eq!(e, AdcError::Timeout);
+    }
+
+    /// The two independent handles are reachable from the token (each usable for single conversions).
+    #[test]
+    fn dual_exposes_both_handles() {
+        let d = dual();
+        assert_eq!(d.primary().base(), ADC0);
+        assert_eq!(d.secondary().base(), ADC1);
+    }
+}

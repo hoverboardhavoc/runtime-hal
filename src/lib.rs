@@ -50,7 +50,8 @@ pub mod usart;
 pub mod watchdog;
 
 pub use adc::{
-    is_internal_channel, Adc, AdcCapability, InjectedAdcController, InjectedHandle, TriggeredAdc,
+    is_internal_channel, Adc, AdcCapability, DualAdc, InjectedAdcController, InjectedHandle,
+    TriggeredAdc,
 };
 pub use addr::{AddrTable, PeriphLabel};
 pub use chip::Chip;
