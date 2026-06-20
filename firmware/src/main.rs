@@ -46,10 +46,10 @@ use runtime_hal::{
     clock,
     clock::{ClockConfig, ClockSource},
     config::{Oversampling, UsartConfig, UsartFrame},
-    detect_chip, gpio,
+    detect_chip,
     gpio::PinRole,
     usart::Usart,
-    Chip, Family, GpioOutput, PeriphLabel, UsartSerial,
+    Chip, Family, GpioOutput, PeriphLabel,
 };
 
 /// The code-level clock tree for the M1 bench firmware: the reset-default HSI 8 MHz, AHB/APB /1, no
@@ -101,11 +101,12 @@ fn main() -> ! {
     clock::enable_gpio_port(rcu, clk, PeriphLabel::Gpioa).unwrap_or_else(|_| halt());
     clock::enable_gpio_port(rcu, clk, PeriphLabel::Gpiob).unwrap_or_else(|_| halt());
 
-    // 4. Configure TX/RX alternate-function through runtime-hal's gpio path (the chip's gpio
-    //    selector). Only the pin's low nibble is used; the port is GPIOA.
-    let gpioa = chip.base(PeriphLabel::Gpioa).unwrap_or_else(|_| halt());
-    gpio::configure_af(gpioa, chip.gpio(), usart_cfg.tx, PinRole::Tx);
-    gpio::configure_af(gpioa, chip.gpio(), usart_cfg.rx, PinRole::Rx);
+    // 4. Configure TX/RX alternate-function through runtime-hal's public USART routing (the chip
+    //    resolves the pin's port + family AF mux internally). The pin bytes are `(port << 4) | pin`.
+    chip.route_usart_pin(usart_cfg.tx, PinRole::Tx)
+        .unwrap_or_else(|_| halt());
+    chip.route_usart_pin(usart_cfg.rx, PinRole::Rx)
+        .unwrap_or_else(|_| halt());
 
     // Configure PB9 as a plain push-pull output indicator through runtime-hal's gpio output API.
     // `Chip::output_pin` resolves GPIOB from the chip's address table, configures the pin in the
@@ -116,23 +117,21 @@ fn main() -> ! {
         .output_pin(PeriphLabel::Gpiob, BUZZER_PIN)
         .unwrap_or_else(|_| halt());
 
-    // 5. Bring up the USART from the code-level ClockConfig + UsartConfig, wrap in the embedded-io
-    //    serial seam.
+    // 5. Bring up the USART peripheral from the code-level ClockConfig + UsartConfig. The AF pins were
+    //    already routed in step 4 (`route_usart_pin`); `bring_up` programs only the USART registers.
     let usart = Usart::bring_up(&chip, &M1_CLOCK, &usart_cfg).unwrap_or_else(|_| halt());
-    let serial = UsartSerial::new(usart);
 
     // Run the role chosen by the detected family: F10x (F103) = master, F1x0 (F130) = slave.
     match family {
-        Family::F10x => run_master(serial, buzzer),
-        Family::F1x0 => run_slave(serial, buzzer),
+        Family::F10x => run_master(usart, buzzer),
+        Family::F1x0 => run_slave(usart, buzzer),
     }
 }
 
 // --- handshake roles --------------------------------------------------------------------------
 
 /// Master: send 0x5A periodically; pulse PB9 on a correct 0x5A echo.
-fn run_master(serial: UsartSerial, mut buzzer: GpioOutput) -> ! {
-    let usart = serial.usart();
+fn run_master(usart: Usart, mut buzzer: GpioOutput) -> ! {
     loop {
         // Send the probe byte (polled TBE/TC inside write_byte).
         usart.write_byte(PROBE);
@@ -157,8 +156,7 @@ fn run_master(serial: UsartSerial, mut buzzer: GpioOutput) -> ! {
 }
 
 /// Slave: echo each received 0x5A; pulse PB9 on each valid byte.
-fn run_slave(serial: UsartSerial, mut buzzer: GpioOutput) -> ! {
-    let usart = serial.usart();
+fn run_slave(usart: Usart, mut buzzer: GpioOutput) -> ! {
     loop {
         match usart.try_read_byte() {
             Ok(Some(b)) => {

@@ -11,8 +11,8 @@
 //! inputs through it. This preserves the resolve-once intent (DECISIONS.md #4): the application
 //! resolves a base once via `Chip`, constructs the handle, and the per-cycle path holds raw bases.
 
-use crate::addr::PeriphLabel;
 use crate::adc::{Adc, AdcCapability, DualAdc};
+use crate::addr::PeriphLabel;
 use crate::descriptor::{
     AdcPath, ClockPath, CounterWidth, GpioPath, IrqLayout, McuDescriptor, PageSize,
 };
@@ -47,14 +47,14 @@ impl Chip {
 
     /// Resolve a label to its base address ([`DescriptorError::MissingBase`] if absent).
     ///
-    /// HAL-internal (`pub(crate)`): the general raw-base escape, used heavily in-crate to source a
-    /// peripheral base from the descriptor. It is NOT public, so a caller never holds a raw base; the
-    /// chip-based builders (e.g. [`Chip::output_pin`], [`Chip::input_group`], [`Chip::adc`],
-    /// [`crate::timer::PwmTimer::configure`], [`crate::watchdog::FreeWatchdog::start`]) resolve the
-    /// base internally and hand back a handle. If an external consumer needs a base, that is a signal
-    /// to add the missing chip-based builder, not to re-expose this.
+    /// Resolve a peripheral base address from the descriptor. Prefer the chip-based builders (e.g.
+    /// [`Chip::output_pin`], [`Chip::input_group`], [`Chip::adc`], [`crate::timer::PwmTimer::configure`],
+    /// [`crate::watchdog::FreeWatchdog::start`]), which resolve the base internally and hand back a
+    /// handle so application code never holds a raw base. This raw resolver is public for the cases
+    /// that genuinely take a base (e.g. [`crate::regdump::RegDumpConfig::dump`], whose doc names
+    /// `chip.base(cfg.timer)?` as its source) and for the in-tree bench validators.
     #[inline]
-    pub(crate) fn base(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
+    pub fn base(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
         self.desc.addrs.resolve(label)
     }
 
@@ -382,7 +382,12 @@ impl Chip {
         let port_base = self.base(port)?;
         let rcu = self.rcu_base()?;
         crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
-        gpio::configure_af(port_base, self.desc.gpio, pin, gpio::PinRole::TimerAfPushPull);
+        gpio::configure_af(
+            port_base,
+            self.desc.gpio,
+            pin,
+            gpio::PinRole::TimerAfPushPull,
+        );
         Ok(())
     }
 
@@ -401,6 +406,29 @@ impl Chip {
     /// descriptor.
     pub fn route_spi_pin(&self, pin: u8, role: gpio::PinRole) -> Result<(), DescriptorError> {
         if !matches!(role, gpio::PinRole::SpiAfPushPull | gpio::PinRole::SpiInput) {
+            return Err(DescriptorError::UnsupportedRole);
+        }
+        let port = gpio_port_label(pin)?;
+        let port_base = self.base(port)?;
+        let rcu = self.rcu_base()?;
+        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
+        gpio::configure_af(port_base, self.desc.gpio, pin, role);
+        Ok(())
+    }
+
+    /// Route `pin` to the USART alternate function, family-internal, for one of the USART pin roles:
+    /// [`gpio::PinRole::Tx`] (transmit, AF push-pull) or [`gpio::PinRole::Rx`] (receive, input).
+    /// [`Usart::bring_up`](crate::usart::Usart::bring_up) configures only the USART peripheral
+    /// registers and does NOT touch GPIO, so this is the public path an application calls per USART pin
+    /// to set the AF mux (the USART analogue of [`Chip::route_spi_pin`]).
+    ///
+    /// Does the per-family AF write (F1x0: per-pin AFSEL = AF1; F10x: CRL/CRH nibble) plus the pin's
+    /// port-clock enable. Rejects any non-USART [`gpio::PinRole`] with
+    /// [`DescriptorError::UnsupportedRole`] so the USART routing path only ever drives USART pin
+    /// config. Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU) is not in the
+    /// descriptor.
+    pub fn route_usart_pin(&self, pin: u8, role: gpio::PinRole) -> Result<(), DescriptorError> {
+        if !matches!(role, gpio::PinRole::Tx | gpio::PinRole::Rx) {
             return Err(DescriptorError::UnsupportedRole);
         }
         let port = gpio_port_label(pin)?;
@@ -444,8 +472,14 @@ mod tests {
     fn gpio_selector_matches_the_descriptor() {
         // The register-model selector is the single source of truth; it must match the descriptor.
         // (The HAL no longer exposes a family() tag: the caller never branches on family.)
-        assert_eq!(Chip::from_descriptor(descriptor_f103()).gpio(), GpioPath::ApbCrlCrh);
-        assert_eq!(Chip::from_descriptor(descriptor_f130()).gpio(), GpioPath::AhbCtlAfsel);
+        assert_eq!(
+            Chip::from_descriptor(descriptor_f103()).gpio(),
+            GpioPath::ApbCrlCrh
+        );
+        assert_eq!(
+            Chip::from_descriptor(descriptor_f130()).gpio(),
+            GpioPath::AhbCtlAfsel
+        );
     }
 
     #[test]
@@ -473,14 +507,29 @@ mod tests {
         use crate::descriptor::CounterWidth;
         // F1x0: the general TIMER1 is 32-bit (User Manual: "32bit (TIMER1)"); advanced timers 16-bit.
         let f130 = Chip::from_descriptor(descriptor_f130());
-        assert_eq!(f130.counter_width(PeriphLabel::Timer1), CounterWidth::ThirtyTwo);
-        assert_eq!(f130.counter_width(PeriphLabel::Timer0), CounterWidth::Sixteen);
-        assert_eq!(f130.counter_width(PeriphLabel::Timer7), CounterWidth::Sixteen);
+        assert_eq!(
+            f130.counter_width(PeriphLabel::Timer1),
+            CounterWidth::ThirtyTwo
+        );
+        assert_eq!(
+            f130.counter_width(PeriphLabel::Timer0),
+            CounterWidth::Sixteen
+        );
+        assert_eq!(
+            f130.counter_width(PeriphLabel::Timer7),
+            CounterWidth::Sixteen
+        );
 
         // F10x: every general level0 timer is 16-bit, TIMER1 included.
         let f103 = Chip::from_descriptor(descriptor_f103());
-        assert_eq!(f103.counter_width(PeriphLabel::Timer1), CounterWidth::Sixteen);
-        assert_eq!(f103.counter_width(PeriphLabel::Timer0), CounterWidth::Sixteen);
+        assert_eq!(
+            f103.counter_width(PeriphLabel::Timer1),
+            CounterWidth::Sixteen
+        );
+        assert_eq!(
+            f103.counter_width(PeriphLabel::Timer0),
+            CounterWidth::Sixteen
+        );
 
         // The typed value carries the max count the width can express.
         assert_eq!(CounterWidth::Sixteen.max_count(), 0xFFFF);
@@ -591,8 +640,14 @@ mod tests {
         let chip = Chip::from_descriptor(descriptor_f130());
         assert_eq!(chip.route_general_pwm_pin(PB3), Ok(()));
         // F1x0: PB3 CTL [7:6] = AF mode (2); AFSEL0 nibble [15:12] = AF2 (TIMER1_CH1). No AFIO.
-        assert_eq!(Reg32::new(F1X0_GPIOB_BASE, 0x00).read() & (0x3 << 6), 2 << 6);
-        assert_eq!(Reg32::new(F1X0_GPIOB_BASE, 0x20).read() & (0xF << 12), 2 << 12);
+        assert_eq!(
+            Reg32::new(F1X0_GPIOB_BASE, 0x00).read() & (0x3 << 6),
+            2 << 6
+        );
+        assert_eq!(
+            Reg32::new(F1X0_GPIOB_BASE, 0x20).read() & (0xF << 12),
+            2 << 12
+        );
     }
 
     #[test]
@@ -605,7 +660,10 @@ mod tests {
         // PB3).
         assert_eq!(Reg32::new(AFIO_PCF0, 0).read() & (0b11 << 8), 0b01 << 8);
         // PB3 CRL nibble [15:12] = AF push-pull 50 MHz = 0xB.
-        assert_eq!(Reg32::new(F10X_GPIOB_BASE, 0x00).read() & (0xF << 12), 0xB << 12);
+        assert_eq!(
+            Reg32::new(F10X_GPIOB_BASE, 0x00).read() & (0xF << 12),
+            0xB << 12
+        );
     }
 
     // route_spi_pin is the public SPI analogue of route_advanced_pwm_pin: Spi::bring_up writes no
@@ -621,11 +679,20 @@ mod tests {
         let _g = mock::lock();
         mock::reset();
         let chip = Chip::from_descriptor(descriptor_f130());
-        assert_eq!(chip.route_spi_pin(PA5, gpio::PinRole::SpiAfPushPull), Ok(()));
+        assert_eq!(
+            chip.route_spi_pin(PA5, gpio::PinRole::SpiAfPushPull),
+            Ok(())
+        );
         // F1x0: PA5 CTL [11:10] = AF mode (2); AFSEL0 nibble [23:20] = AF0 (0); OSPD [11:10] = 50MHz (3).
-        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x00).read() & (0x3 << 10), 2 << 10);
+        assert_eq!(
+            Reg32::new(F1X0_GPIOA_BASE, 0x00).read() & (0x3 << 10),
+            2 << 10
+        );
         assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x20).read() & (0xF << 20), 0);
-        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x08).read() & (0x3 << 10), 3 << 10);
+        assert_eq!(
+            Reg32::new(F1X0_GPIOA_BASE, 0x08).read() & (0x3 << 10),
+            3 << 10
+        );
     }
 
     #[test]
@@ -635,7 +702,10 @@ mod tests {
         let chip = Chip::from_descriptor(descriptor_f130());
         assert_eq!(chip.route_spi_pin(PA6, gpio::PinRole::SpiInput), Ok(()));
         // MISO is an AF input: CTL = AF mode (2), but no output speed (OSPD nibble stays 0).
-        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x00).read() & (0x3 << 12), 2 << 12);
+        assert_eq!(
+            Reg32::new(F1X0_GPIOA_BASE, 0x00).read() & (0x3 << 12),
+            2 << 12
+        );
         assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x08).read() & (0x3 << 12), 0);
     }
 
@@ -644,9 +714,15 @@ mod tests {
         let _g = mock::lock();
         mock::reset();
         let chip = Chip::from_descriptor(descriptor_f103());
-        assert_eq!(chip.route_spi_pin(PA5, gpio::PinRole::SpiAfPushPull), Ok(()));
+        assert_eq!(
+            chip.route_spi_pin(PA5, gpio::PinRole::SpiAfPushPull),
+            Ok(())
+        );
         // F10x: PA5 CTL0 nibble [23:20] = AF push-pull 50 MHz = 0xB (over the 0x4 reset nibble).
-        assert_eq!(Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 20), 0xB << 20);
+        assert_eq!(
+            Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 20),
+            0xB << 20
+        );
     }
 
     #[test]
@@ -656,7 +732,10 @@ mod tests {
         let chip = Chip::from_descriptor(descriptor_f103());
         assert_eq!(chip.route_spi_pin(PA6, gpio::PinRole::SpiInput), Ok(()));
         // F10x: PA6 (MISO) CTL0 nibble [27:24] = floating input = 0x4 (== the reset nibble).
-        assert_eq!(Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 24), 0x4 << 24);
+        assert_eq!(
+            Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 24),
+            0x4 << 24
+        );
     }
 
     #[test]

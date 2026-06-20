@@ -2,7 +2,7 @@
 //!
 //! ONE binary, flashed unchanged to a GD32F103C8T6 (F10x family) or a GD32F130C8T6 (F1x0 family);
 //! `detect_chip()` picks the register model at boot. It exercises the HAL's read-only hot-path
-//! register-dump surface (`runtime_hal::HotpathConfig`): the "configure then confirm" self-check that
+//! register-dump surface (`runtime_hal::RegDumpConfig`): the "configure then confirm" self-check that
 //! a shipping firmware runs before it ever arms the bridge.
 //!
 //! # What it does
@@ -12,7 +12,7 @@
 //!    reference `PwmConfig`. This is CONFIG-ONLY: it programs the time base, the three complementary
 //!    channel pairs, dead-time and the break/off-state word, and leaves MOE (the main-output-enable
 //!    arming gate) OFF. The bridge is configured but DISARMED, so no current can flow.
-//! 3. Reads the configured registers back with `HotpathConfig::dump(timer_base, adc_base)` (pure
+//! 3. Reads the configured registers back with `RegDumpConfig::dump(timer_base, adc_base)` (pure
 //!    reads, no writes, never an MOE write) and checks them against what was configured:
 //!    - the period (CAR) and prescaler (PSC) match the config,
 //!    - the dead-time field in CCHP matches,
@@ -24,7 +24,7 @@
 //!
 //! # Why this is electrically safe to run on a board
 //!
-//! Nothing here arms the bridge: `PwmController::configure` leaves MOE off, and `HotpathConfig::dump`
+//! Nothing here arms the bridge: `PwmController::configure` leaves MOE off, and `RegDumpConfig::dump`
 //! only READS registers. With MOE clear the timer counts and the compare events toggle the internal
 //! channels, but the gate driver outputs stay at their idle state, so no phase current flows. This
 //! is the disarmed-but-configured state the M3 SAFETY section calls electrically safe to scope. The
@@ -51,7 +51,7 @@ use panic_halt as _;
 
 use runtime_hal::config::TrgoSource;
 use runtime_hal::{
-    detect_chip, BreakConfig, ClockDiv, ComplementaryPwm, HotpathConfig, OcMode, PeriphLabel,
+    detect_chip, BreakConfig, ClockDiv, ComplementaryPwm, RegDumpConfig, OcMode, PeriphLabel,
     PwmAlign, PwmChannelConfig, PwmConfig, PwmController,
 };
 
@@ -136,7 +136,7 @@ fn main() -> ! {
     let verified = match PwmController::new().configure(&chip, &cfg) {
         Ok(_handle) => {
             // Read the configured registers back (pure reads, no MOE write) and check them.
-            let snap = HotpathConfig::dump(timer_base, timer_base);
+            let snap = RegDumpConfig::dump(timer_base, timer_base);
             verify(&snap.timer)
         }
         // A config failure (e.g. the timer base did not resolve) is itself a verification failure.

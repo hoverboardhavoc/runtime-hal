@@ -42,12 +42,13 @@ use heapless::Vec;
 use runtime_hal::{
     clock,
     clock::ClockConfig,
-    config::{decode_pin, AdcChannel, AdcClockDiv, AdcConfig, NssMode, SpiConfig},
-    detect_chip, gpio,
+    adc::AdcCapability,
+    config::{AdcChannel, AdcClockDiv, AdcConfig, NssMode, SpiConfig},
+    detect_chip,
     gpio::PinRole,
     i2c::{I2c, I2cMode},
     spi::Spi,
-    Adc, Chip, PeriphLabel,
+    Chip, PeriphLabel,
 };
 
 // --- hardware facts (the bench F130 board) ----------------------------------------------------
@@ -257,24 +258,26 @@ fn run_adc(chip: &Chip, rcu: u32) {
         clock_div: AdcClockDiv::Div6,
     };
 
-    let adc_base = match chip.base(cfg.adc) {
-        Ok(b) => b,
-        Err(_) => {
-            set_adc_err(2);
-            return;
-        }
-    };
-
     // ADC peripheral clock + prescaler (chip's clock path).
     if clock::enable_adc(rcu, chip.clock(), cfg.adc).is_err() {
         set_adc_err(3);
         return;
     }
 
+    // Resolve the ADC handle from the chip (base hidden in the descriptor). This part is single-ADC
+    // on the bench; a dual part would still expose ADC0 as the primary of the pair.
+    let adc = match chip.adc() {
+        Ok(AdcCapability::Single(adc)) => adc,
+        Ok(AdcCapability::Dual(dual)) => dual.primary(),
+        Err(_) => {
+            set_adc_err(2);
+            return;
+        }
+    };
+
     // Bring up ADC0 on rank 0 = the first sequence channel (VREFINT, sample time from the config).
-    // bring_up runs the calibration sequence (bounded polls inside). The ADC bring-up API takes a
-    // base + channel + sample time directly (the register-level sequence is unchanged by the
-    // rework); the AdcConfig is the code-level source those values come from.
+    // bring_up runs the calibration sequence (bounded polls inside). The AdcConfig is the code-level
+    // source those values come from.
     let first = match cfg.channels.first() {
         Some(c) => *c,
         None => {
@@ -282,13 +285,10 @@ fn run_adc(chip: &Chip, rcu: u32) {
             return;
         }
     };
-    let adc = match Adc::bring_up(adc_base, first.channel, first.sample_time) {
-        Ok(a) => a,
-        Err(_) => {
-            set_adc_err(5);
-            return;
-        }
-    };
+    if adc.bring_up(first.channel, first.sample_time).is_err() {
+        set_adc_err(5);
+        return;
+    }
 
     // Make sure each internal channel has its sample time programmed, then read it. The sequence
     // carries channel 17 (VREFINT) then 16 (temperature), both at sample-time code 7.
@@ -296,7 +296,7 @@ fn run_adc(chip: &Chip, rcu: u32) {
     for c in cfg.channels.iter() {
         // configure_single re-programs the sample-time field for the channel (no calibration), so a
         // channel other than the bring-up one still has a valid sample time before we read it.
-        let _ = Adc::configure_single(adc_base, c.channel, c.sample_time);
+        adc.configure_single(c.channel, c.sample_time);
         match adc.read_channel(c.channel) {
             Ok(raw) => {
                 if c.channel == 17 {
@@ -349,19 +349,12 @@ fn run_spi(chip: &Chip, rcu: u32) {
         (cfg.nss, PinRole::SpiAfPushPull),
     ];
     for (pin, role) in pins {
-        let (port, n) = decode_pin(pin);
-        let base = match resolve_port(chip, port) {
-            Some(b) => b,
-            None => {
-                set_spi_err(4);
-                return;
-            }
-        };
-        if clock::enable_gpio_port(rcu, chip.clock(), port_label(port)).is_err() {
-            set_spi_err(5);
+        // route_spi_pin resolves the pin's port base, enables its GPIO clock, and writes the family
+        // SPI AF mux internally (the public per-pin SPI routing path).
+        if chip.route_spi_pin(pin, role).is_err() {
+            set_spi_err(4);
             return;
         }
-        gpio::configure_af(base, chip.gpio(), n, role);
     }
 
     // Bring up the SPI master from the chip context + the code-level ClockConfig + SpiConfig.
@@ -384,30 +377,6 @@ fn run_spi(chip: &Chip, rcu: u32) {
         }
         Err(_) => set_spi_err(0x10),
     }
-}
-
-// --- logical-pin / port helpers ---------------------------------------------------------------
-//
-// `decode_pin` is the HAL's `config::decode_pin` (a logical pin `(port << 4) | pin` ->
-// `(port_index, pin_number)`), imported above; the firmware does not redefine it.
-
-/// Map a port index (0=A..5=F) to its `PeriphLabel`.
-#[inline]
-fn port_label(port: u8) -> PeriphLabel {
-    match port {
-        0 => PeriphLabel::Gpioa,
-        1 => PeriphLabel::Gpiob,
-        2 => PeriphLabel::Gpioc,
-        3 => PeriphLabel::Gpiod,
-        4 => PeriphLabel::Gpioe,
-        _ => PeriphLabel::Gpiof,
-    }
-}
-
-/// Resolve a port index to its base address via the chip's address table.
-#[inline]
-fn resolve_port(chip: &Chip, port: u8) -> Option<u32> {
-    chip.base(port_label(port)).ok()
 }
 
 // --- result-struct writers (volatile, through the raw pointer to the pinned static) -----------

@@ -179,7 +179,10 @@ mod tests {
         mock::reset();
         let f130 = Chip::from_descriptor(descriptor_f130());
         assert!(apply_defaults(&f130, Family::F1x0).is_ok());
-        assert!(f130.base(PeriphLabel::Usart0).is_err(), "detected chip untouched");
+        assert!(
+            f130.base(PeriphLabel::Usart0).is_err(),
+            "detected chip untouched"
+        );
 
         mock::reset();
         let f103 = Chip::from_descriptor(descriptor_f103());

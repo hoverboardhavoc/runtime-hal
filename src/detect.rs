@@ -47,12 +47,15 @@ pub mod bringup;
 /// selectors, the base-address table, and the family-default timer/ADC capability counts (which the
 /// peripheral-presence measurement then refines).
 ///
-/// HAL-internal (`pub(crate)`): the family is the detection-internal discriminator that drives
-/// descriptor synthesis; it is never returned to a caller (the silicon-purity principle: no caller
-/// names a family). The HAL hands back a [`Chip`] / capability fruits, never a `Family`.
+/// The detection-internal discriminator that drives descriptor synthesis. Application code never
+/// needs this (the silicon-purity principle: the HAL hands back a [`Chip`] / capability fruits, and
+/// an app derives any family-shaped fact from those, e.g. `chip.clock()`). It is public ONLY for the
+/// in-tree detection-acceptance bench firmware (`bench-fw/detect`, `bench-fw/probe`), which is THE
+/// on-silicon test of the detection path and must name the family it resolved to record the probe
+/// outcome for the human reader.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Family {
+pub enum Family {
     /// GD32F1x0 (e.g. F130): GPIO on AHB2 at `0x4800_0000`, the `RCU_AHBEN` GPIO clock enable.
     /// Wire code 1 (matches the `bench-fw-detect` `detected_family` sentinel).
     F1x0 = 1,
@@ -169,9 +172,10 @@ pub const F10X_K2_THRESHOLD_KIB: u16 = 128;
 /// with the MEASURED per-instance counts. The result passes `addrs.check_ranges(gpio, clock)` by
 /// construction (it reuses the family-correct bases).
 ///
-/// HAL-internal (`pub(crate)`): it takes the internal [`Family`] discriminator and returns an
-/// [`McuDescriptor`], a detection-internal step on the way to [`detect_chip`]; not a caller surface.
-pub(crate) fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
+/// It takes the [`Family`] discriminator and returns an [`McuDescriptor`], a detection-internal step
+/// on the way to [`detect_chip`]. Public for the same reason as [`Family`]: the in-tree detection
+/// acceptance firmware decomposes detect-then-synthesize to record each intermediate result.
+pub fn synthesize(family: Family, flash_kib: u16) -> McuDescriptor {
     match family {
         Family::F1x0 => descriptor_f130(), // flash_page is the family constant K1; density unused.
         Family::F10x => {

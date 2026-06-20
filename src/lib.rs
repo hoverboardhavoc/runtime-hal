@@ -72,10 +72,11 @@ pub use descriptor::{
     MAX_TIMERS, MAX_USARTS,
 };
 pub use detect::{
-    descriptor_f103, descriptor_f130, detect_chip, F10X_K2_THRESHOLD_KIB, FLASH_DENSITY_ADDR,
+    descriptor_f103, descriptor_f130, detect_chip, synthesize, Family, F10X_K2_THRESHOLD_KIB,
+    FLASH_DENSITY_ADDR,
 };
 pub use error::{
-    AdcError, ClockError, DescriptorError, DetectError, BringUpError, I2cError, PwmError, SpiError,
+    AdcError, BringUpError, ClockError, DescriptorError, DetectError, I2cError, PwmError, SpiError,
     UsartError, WatchdogError,
 };
 pub use gpio::{

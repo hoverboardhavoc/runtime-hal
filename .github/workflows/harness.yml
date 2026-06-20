@@ -119,6 +119,16 @@ jobs:
           run gpio_af_i2c0_scl_sda_f10x                gd32f10x
           run gpio_af_spi0_pins_f1x0                   gd32f1x0
           run gpio_af_spi0_pins_f10x                   gd32f10x
+          # advanced-timer (TIMER0) clock-enable + the six complementary gate-pin AF config goldens
+          # (the hot-path clock + gate-pin routing the PWM bring-up rides on).
+          run clock_enable_timer0_f1x0                 gd32f1x0
+          run clock_enable_timer0_f10x                 gd32f10x
+          run gpio_af_timer0_gates_f1x0                gd32f1x0
+          run gpio_af_timer0_gates_f10x                gd32f10x
+          # general-timer single-pin route (the LED/buzzer PWM pin: F1x0 AFSEL=AF2, F10x AFIO TIMER1
+          # partial remap then the CRL AF nibble).
+          run gpio_route_general_pwm_pin_pb3_f1x0      gd32f1x0
+          run gpio_route_general_pwm_pin_pb3_f10x      gd32f10x
 
           # i2c: bring-up config (vs GD SPL) + the IMU WHO_AM_I transfer poll-sequence golden.
           run i2c_bringup_i2c0_100k_f1x0               gd32f1x0
@@ -140,6 +150,9 @@ jobs:
           run adc_calibrate_adc0_f10x                  gd32f10x  runtime-hal
           run adc_transfer_vrefint_f1x0                gd32f1x0  runtime-hal
           run adc_transfer_vrefint_f10x                gd32f10x  runtime-hal
+          # dual-ADC regular-simultaneous ("routine parallel") config (F10x only: the dual-ADC parts;
+          # F1x0 is single-ADC so there is no f1x0 counterpart). Config-only golden vs GD SPL.
+          run adc_dual_adc_simultaneous_f10x           gd32f10x
 
           # --- M3 hot-path matrix: {gd32f1x0, gd32f10x} x {timer-pwm, timer-trigger, injected-adc} ---
           # The advanced-timer complementary PWM, the timer trigger output, and the timer-triggered
@@ -156,6 +169,9 @@ jobs:
           run timer_pwm_bringup_timer0_f10x            gd32f10x
           run timer_pwm_setduties_timer0_f1x0          gd32f1x0
           run timer_pwm_setduties_timer0_f10x          gd32f10x
+          # set_channel_outputs: the CHxCV channel-output enable/disable handle writes (vs GD SPL).
+          run timer_set_channel_outputs_timer0_f1x0    gd32f1x0
+          run timer_set_channel_outputs_timer0_f10x    gd32f10x
           # timer-trigger: the CH3 trigger compare (~CAR-1) + the CR2/CTL1 MMC TRGO select (vs GD SPL).
           run timer_trgo_trigger_timer0_f1x0           gd32f1x0
           run timer_trgo_trigger_timer0_f10x           gd32f10x
@@ -209,7 +225,12 @@ jobs:
             clock_tree_72m_irc8m_f1x0 clock_tree_72m_irc8m_f10x \
             timer_pwm_bringup_timer0_f1x0 timer_pwm_bringup_timer0_f10x \
             timer_pwm_setduties_timer0_f1x0 timer_pwm_setduties_timer0_f10x \
+            timer_set_channel_outputs_timer0_f1x0 timer_set_channel_outputs_timer0_f10x \
             timer_trgo_trigger_timer0_f1x0 timer_trgo_trigger_timer0_f10x \
+            clock_enable_timer0_f1x0 clock_enable_timer0_f10x \
+            gpio_af_timer0_gates_f1x0 gpio_af_timer0_gates_f10x \
+            gpio_route_general_pwm_pin_pb3_f1x0 gpio_route_general_pwm_pin_pb3_f10x \
+            adc_dual_adc_simultaneous_f10x \
             adc_inject_bringup_adc0_f1x0 adc_inject_bringup_adc0_f10x; do
             ./.venv/bin/regcmp capture "$v"
           done

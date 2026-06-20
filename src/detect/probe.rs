@@ -294,9 +294,10 @@ static FAULTED: AtomicBool = AtomicBool::new(false);
 /// The probe result: the detected family and the flash-density read (the F10x page-size input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detected {
-    /// The family the GPIO+RCU probe resolved. HAL-internal (`pub(crate)`): the family is the
-    /// detection-internal discriminator that drives [`super::synthesize`]; a caller never reads it.
-    pub(crate) family: Family,
+    /// The family the GPIO+RCU probe resolved, the detection-internal discriminator that drives
+    /// [`super::synthesize`]. Public for the in-tree detection acceptance firmware (see
+    /// [`super::Family`]); application code derives family-shaped facts from the [`crate::Chip`] instead.
+    pub family: Family,
     /// `FLASH_DENSITY[15:0]` (KiB of flash), read from `0x1FFF_F7E0`. Corroboration + the F10x
     /// `flash_page` input (spec section 4.3 / 5.2). Read after the family decision; advisory for
     /// F1x0 (constant K1).
