@@ -37,11 +37,8 @@ use cortex_m_rt::entry;
 use embedded_hal::delay::DelayNs;
 use panic_halt as _;
 
-use control::{Commutator, Direction, MotorContract, SixStep};
-use runtime_hal::{
-    detect_chip, ArmGate, BreakConfig, Chip, ClockDiv, InputGroup, OcMode, PeriphLabel, PwmAlign,
-    PwmChannelConfig, PwmConfig, PwmTimer, TrgoSource,
-};
+use control::{bring_up_motor, Direction, MotorContract, SixStep};
+use runtime_hal::{detect_chip, PeriphLabel};
 
 /// The reset IRC8M core clock this example runs on (no PLL bring-up).
 const SYSCLK_HZ: u32 = 8_000_000;
@@ -96,8 +93,23 @@ fn main() -> ! {
 
     // Right motor on TIMER0, left motor on TIMER7. BOTH resolve their timer base from the descriptor
     // (Timer7 is populated when a second advanced timer was detected): same call, no magic address.
-    let (comm_r, gate_r, halls_r) = bring_up(&chip, &DUAL_MOTOR_RIGHT, PeriphLabel::Timer0, ALIGN_OFFSET_RIGHT);
-    let (comm_l, gate_l, halls_l) = bring_up(&chip, &DUAL_MOTOR_LEFT, PeriphLabel::Timer7, ALIGN_OFFSET_LEFT);
+    // bring_up_motor does NOT arm; both bridges are energized explicitly below.
+    let (comm_r, gate_r, halls_r) = bring_up_motor(
+        &chip,
+        &DUAL_MOTOR_RIGHT,
+        PeriphLabel::Timer0,
+        PWM_PERIOD,
+        SixStep::new(DIRECTION, ALIGN_OFFSET_RIGHT),
+    )
+    .unwrap();
+    let (comm_l, gate_l, halls_l) = bring_up_motor(
+        &chip,
+        &DUAL_MOTOR_LEFT,
+        PeriphLabel::Timer7,
+        PWM_PERIOD,
+        SixStep::new(DIRECTION, ALIGN_OFFSET_LEFT),
+    )
+    .unwrap();
 
     let mut delay = runtime_hal::Delay::new(cp.SYST, SYSCLK_HZ);
     let duty = (u32::from(PWM_PERIOD) * DUTY_PERCENT / 100) as u16;
@@ -111,62 +123,5 @@ fn main() -> ! {
         let _ = comm_r.apply(halls_r.read(), duty);
         let _ = comm_l.apply(halls_l.read(), duty);
         delay.delay_us(LOOP_US);
-    }
-}
-
-/// Per-motor bring-up: configure the advanced timer from the contract (resolving its base from the
-/// descriptor), route the gate pins (family-internal), START the counter (safe while disarmed), and
-/// return the control-layer commutator, the arming gate, and the hall reader.
-fn bring_up(
-    chip: &Chip,
-    c: &MotorContract,
-    timer: PeriphLabel,
-    offset: u8,
-) -> (Commutator, ArmGate, InputGroup) {
-    let cfg = pwm_config(c, timer);
-    let pwm = PwmTimer::configure(chip, &cfg).unwrap();
-    for &gate in c.gate_high.iter().chain(c.gate_low.iter()) {
-        let _ = chip.route_advanced_pwm_pin(gate);
-    }
-    pwm.enable_counter();
-    let commutator = Commutator::new(pwm.handle(), SixStep::new(DIRECTION, offset));
-    let gate = pwm.arm_gate();
-    // The HAL resolves each hall pin's port base internally; the example never holds a base.
-    let reader = chip.input_group(c.hall_pins).unwrap();
-    (commutator, gate, reader)
-}
-
-/// Build a complementary-PWM config from a board contract (dead-time + gate pins from the RE; the
-/// period / alignment / clock-div chosen for this example's 8 MHz clock).
-fn pwm_config(c: &MotorContract, timer: PeriphLabel) -> PwmConfig {
-    let ch = |high: u8, low: u8| PwmChannelConfig {
-        high,
-        low,
-        polarity: true,
-        idle_high: true,
-        idle_high_n: true,
-    };
-    PwmConfig {
-        timer,
-        channels: [
-            ch(c.gate_high[0], c.gate_low[0]),
-            ch(c.gate_high[1], c.gate_low[1]),
-            ch(c.gate_high[2], c.gate_low[2]),
-        ],
-        period: PWM_PERIOD,
-        prescaler: 0,
-        dead_time: c.dead_time,
-        brk: BreakConfig {
-            enabled: false,
-            level: false,
-        },
-        trigger_compare: 0,
-        align: PwmAlign::Center2,
-        arse: true,
-        trigger_oc_mode: OcMode::Pwm0,
-        trigger_ch_enable: false,
-        crep: 0,
-        ckdiv: ClockDiv::Div2,
-        trgo_src: TrgoSource::Update,
     }
 }

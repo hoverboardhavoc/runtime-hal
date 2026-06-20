@@ -40,11 +40,8 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use panic_halt as _;
 
-use control::{Commutator, Direction, MotorContract, SixStep};
-use runtime_hal::{
-    detect_chip, BreakConfig, ClockDiv, OcMode, PeriphLabel, PwmAlign, PwmChannelConfig, PwmConfig,
-    PwmTimer, TrgoSource,
-};
+use control::{bring_up_motor, Direction, MotorContract, SixStep};
+use runtime_hal::{detect_chip, PeriphLabel};
 
 /// The reset IRC8M core clock this example runs on (no PLL bring-up): the `sysclk_hz` for `Delay`
 /// and the TIMER0 input clock.
@@ -91,32 +88,19 @@ fn main() -> ! {
     let mut self_hold = chip.output_pin(PeriphLabel::Gpiob, 12).unwrap();
     let _ = self_hold.set_high();
 
-    // Bring up TIMER0 for the complementary bridge from the contract (dead-time, period). MOE stays
-    // OFF and the counter STOPPED. The base is resolved + hidden inside the returned PwmTimer.
-    let cfg = pwm_config(&SPLIT_BOARD, PeriphLabel::Timer0);
-    let timer = PwmTimer::configure(&chip, &cfg).unwrap();
-
-    // Route the six gate pins to the advanced-timer alternate function. route_advanced_pwm_pin does
-    // the family-specific work internally (F1x0 AFSEL; F10x CRL/CRH nibble), no family branch here.
-    for &gate in SPLIT_BOARD.gate_high.iter().chain(SPLIT_BOARD.gate_low.iter()) {
-        let _ = chip.route_advanced_pwm_pin(gate);
-    }
-
-    // Halls are plain GPIO inputs (floating at reset), so they need only the port clock. Build the
-    // resolve-once input group (the HAL's neutral multi-pin reader) over the three hall lines. The
-    // HAL resolves each hall pin's port base internally, so the example never holds a base. Enable
-    // the hall ports' clocks via the port getters (the gate/SELF_HOLD ports were enabled by their
-    // routing / output_pin).
+    // Halls are plain GPIO inputs (floating at reset), so they need only the port clock. Enable the
+    // hall ports' clocks (the gate / SELF_HOLD ports were enabled by their routing / output_pin); the
+    // bring-up helper builds the hall reader over these lines.
     let _ = chip.gpioa();
     let _ = chip.gpioc();
-    let reader = chip.input_group(SPLIT_BOARD.hall_pins).unwrap();
 
-    // Start the counter (safe while disarmed: outputs do not reach the pins until MOE is set).
-    timer.enable_counter();
-
-    // The control-layer commutator (6-step decode + the HAL handle) and the separate arming gate.
-    let commutator = Commutator::new(timer.handle(), SixStep::new(DIRECTION, ALIGN_OFFSET));
-    let gate = timer.arm_gate();
+    // Bring up TIMER0's complementary bridge from the contract: configure the timer (dead-time +
+    // period), route the six gate pins (family-internal), start the counter, and hand back the
+    // control-layer commutator (6-step decode + the HAL handle), the arming gate, and the hall
+    // reader. MOE stays OFF (the helper does NOT arm); the bridge is energized explicitly below.
+    let (commutator, gate, reader) =
+        bring_up_motor(&chip, &SPLIT_BOARD, PeriphLabel::Timer0, PWM_PERIOD, SixStep::new(DIRECTION, ALIGN_OFFSET))
+            .unwrap();
 
     let mut delay = runtime_hal::Delay::new(cp.SYST, SYSCLK_HZ);
     let duty = (u32::from(PWM_PERIOD) * DUTY_PERCENT / 100) as u16;
@@ -130,43 +114,5 @@ fn main() -> ! {
         let code = reader.read();
         let _ = commutator.apply(code, duty);
         delay.delay_us(LOOP_US);
-    }
-}
-
-/// Build TIMER0's complementary-PWM config from a board contract (the dead-time + gate pins from the
-/// RE; the period / alignment / clock-div chosen for this example's 8 MHz clock).
-fn pwm_config(c: &MotorContract, timer: PeriphLabel) -> PwmConfig {
-    let ch = |high: u8, low: u8| PwmChannelConfig {
-        high,
-        low,
-        // Inverted (active-low) complementary low side so the bridge idles safe (the stock convention).
-        polarity: true,
-        idle_high: true,
-        idle_high_n: true,
-    };
-    PwmConfig {
-        timer,
-        channels: [
-            ch(c.gate_high[0], c.gate_low[0]),
-            ch(c.gate_high[1], c.gate_low[1]),
-            ch(c.gate_high[2], c.gate_low[2]),
-        ],
-        period: PWM_PERIOD,
-        prescaler: 0,
-        // The shoot-through-safe dead-time recovered from the stock firmware.
-        dead_time: c.dead_time,
-        brk: BreakConfig {
-            enabled: false,
-            level: false,
-        },
-        // 6-step uses NO injected ADC, so the CH3 trigger channel is unused / disabled.
-        trigger_compare: 0,
-        align: PwmAlign::Center2,
-        arse: true,
-        trigger_oc_mode: OcMode::Pwm0,
-        trigger_ch_enable: false,
-        crep: 0,
-        ckdiv: ClockDiv::Div2,
-        trgo_src: TrgoSource::Update,
     }
 }

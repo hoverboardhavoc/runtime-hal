@@ -33,7 +33,10 @@
 
 #![no_std]
 
-use runtime_hal::{PwmError, PwmHandle};
+use runtime_hal::{
+    ArmGate, BreakConfig, Chip, ClockDiv, DescriptorError, InputGroup, OcMode, PeriphLabel,
+    PwmAlign, PwmChannelConfig, PwmConfig, PwmError, PwmHandle, PwmTimer, TrgoSource,
+};
 
 /// Per-phase drive action for one 6-step (block) commutation step. This is MOTOR-CONTROL vocabulary,
 /// it lives here, not in the HAL: the silicon only knows "channel output enabled/disabled" and "set a
@@ -231,6 +234,97 @@ impl MotorContract {
     pub const fn pin(port: u8, pin: u8) -> u8 {
         (port << 4) | pin
     }
+
+    /// Build the stock-convention complementary-bridge [`PwmConfig`] for this contract on `timer`.
+    ///
+    /// This is the reusable BLDC bring-up config: it fills the fixed stock-convention fields (the
+    /// values the commutation examples used to hardcode) from the contract's gate pins + dead-time,
+    /// and takes `timer` and `period` as the clock-dependent knobs (`period` is the center-aligned
+    /// CAR the application picks for its core clock; the prescaler is fixed at 0). It encodes:
+    ///
+    /// - one complementary channel per phase (high-side `gate_high[i]` / low-side `gate_low[i]`),
+    ///   active-low (`polarity = true`) so the bridge idles safe, with both idle levels high;
+    /// - the shoot-through-safe `dead_time` from the contract;
+    /// - center-aligned ([`PwmAlign::Center2`]), auto-reload-shadow on (`arse = true`), timer clock
+    ///   divided by two ([`ClockDiv::Div2`]), TRGO on Update ([`TrgoSource::Update`]);
+    /// - no break input, and the CH3 trigger channel DISABLED (6-step uses no injected-ADC trigger).
+    pub fn pwm_config(&self, timer: PeriphLabel, period: u16) -> PwmConfig {
+        let ch = |high: u8, low: u8| PwmChannelConfig {
+            high,
+            low,
+            // Inverted (active-low) complementary low side so the bridge idles safe (stock convention).
+            polarity: true,
+            idle_high: true,
+            idle_high_n: true,
+        };
+        PwmConfig {
+            timer,
+            channels: [
+                ch(self.gate_high[0], self.gate_low[0]),
+                ch(self.gate_high[1], self.gate_low[1]),
+                ch(self.gate_high[2], self.gate_low[2]),
+            ],
+            period,
+            prescaler: 0,
+            // The shoot-through-safe dead-time recovered from the stock firmware.
+            dead_time: self.dead_time,
+            brk: BreakConfig {
+                enabled: false,
+                level: false,
+            },
+            // 6-step uses NO injected ADC, so the CH3 trigger channel is unused / disabled.
+            trigger_compare: 0,
+            align: PwmAlign::Center2,
+            arse: true,
+            trigger_oc_mode: OcMode::Pwm0,
+            trigger_ch_enable: false,
+            crep: 0,
+            ckdiv: ClockDiv::Div2,
+            trgo_src: TrgoSource::Update,
+        }
+    }
+}
+
+/// Bring up one motor's advanced-timer complementary bridge from its contract and hand back the
+/// per-motor trio the commutation examples drive: the [`Commutator`] (6-step decode + PWM handle),
+/// the [`ArmGate`], and the [`InputGroup`] hall reader.
+///
+/// This is the motor-control bring-up orchestration (it DOES touch registers, unlike the pure decode
+/// above), so it lives here in `control` as the BLDC bring-up layer. It:
+///
+/// 1. builds the config via [`MotorContract::pwm_config`] and [`PwmTimer::configure`] (the timer base
+///    resolves from the runtime descriptor, no magic address);
+/// 2. routes each gate pin with [`Chip::route_advanced_pwm_pin`] (the family-specific AF write is
+///    absorbed by the HAL);
+/// 3. starts the counter ([`PwmTimer::enable_counter`]), which is safe while disarmed (outputs do not
+///    reach the pins until MOE is set);
+/// 4. builds the [`Commutator`] over the PWM handle + a [`SixStep`] `step`, the [`ArmGate`], and the
+///    hall [`InputGroup`] over the contract's hall pins.
+///
+/// It does NOT arm the bridge: arming (setting MOE on the returned `ArmGate`) is the application's
+/// explicit, deliberate step, which keeps the energize point a visible safety boundary in the app.
+///
+/// The caller must have enabled the GPIO port clocks for the hall pins (the gate pins' clocks are
+/// enabled by the routing). Returns [`DescriptorError`] if a pin's port or the timer base is absent
+/// from the descriptor (e.g. a second advanced timer on a single-advanced-timer part: fail-loud).
+pub fn bring_up_motor(
+    chip: &Chip,
+    c: &MotorContract,
+    timer: PeriphLabel,
+    period: u16,
+    step: SixStep,
+) -> Result<(Commutator, ArmGate, InputGroup), DescriptorError> {
+    let cfg = c.pwm_config(timer, period);
+    let pwm = PwmTimer::configure(chip, &cfg)?;
+    for &gate in c.gate_high.iter().chain(c.gate_low.iter()) {
+        chip.route_advanced_pwm_pin(gate)?;
+    }
+    pwm.enable_counter();
+    let commutator = Commutator::new(pwm.handle(), step);
+    let gate = pwm.arm_gate();
+    // The HAL resolves each hall pin's port base internally; the caller never holds a base.
+    let reader = chip.input_group(c.hall_pins)?;
+    Ok((commutator, gate, reader))
 }
 
 #[cfg(test)]
@@ -317,5 +411,48 @@ mod tests {
         assert_eq!(MotorContract::pin(2, 13), 0x2D); // PC13
         assert_eq!(MotorContract::pin(0, 1), 0x01); // PA1
         assert_eq!(MotorContract::pin(0, 8), 0x08); // PA8 (a gate)
+    }
+
+    /// `pwm_config` fills the stock-convention complementary-bridge fields from the contract: the
+    /// three channels carry the contract's gate pins (active-low, idle-high), the dead-time matches,
+    /// the alignment is Center2, the clock divide is Div2, the timer/period knobs are passed through,
+    /// and the (injected-ADC) trigger channel is disabled. This is the byte-for-byte config both
+    /// commutation examples used to build inline.
+    #[test]
+    fn pwm_config_fills_stock_convention_fields() {
+        let c = MotorContract {
+            hall_pins: [MotorContract::pin(2, 13), MotorContract::pin(0, 1), MotorContract::pin(2, 14)],
+            gate_high: [MotorContract::pin(0, 8), MotorContract::pin(0, 9), MotorContract::pin(0, 10)],
+            gate_low: [MotorContract::pin(1, 13), MotorContract::pin(1, 14), MotorContract::pin(1, 15)],
+            dead_time: 25,
+        };
+        let cfg = c.pwm_config(PeriphLabel::Timer0, 250);
+
+        // The clock-dependent knobs are passed through; the prescaler is fixed at 0.
+        assert_eq!(cfg.timer, PeriphLabel::Timer0);
+        assert_eq!(cfg.period, 250);
+        assert_eq!(cfg.prescaler, 0);
+
+        // Each channel carries the contract's high/low gate pins, in phase order, active-low + idle-high.
+        for i in 0..3 {
+            assert_eq!(cfg.channels[i].high, c.gate_high[i], "channel {i} high gate");
+            assert_eq!(cfg.channels[i].low, c.gate_low[i], "channel {i} low gate");
+            assert!(cfg.channels[i].polarity, "channel {i} active-low");
+            assert!(cfg.channels[i].idle_high, "channel {i} idle high");
+            assert!(cfg.channels[i].idle_high_n, "channel {i} complementary idle high");
+        }
+
+        // The dead-time comes from the contract.
+        assert_eq!(cfg.dead_time, c.dead_time);
+
+        // The fixed stock-convention timer fields.
+        assert_eq!(cfg.align, PwmAlign::Center2);
+        assert_eq!(cfg.ckdiv, ClockDiv::Div2);
+        assert!(cfg.arse);
+        assert_eq!(cfg.trgo_src, TrgoSource::Update);
+
+        // No break, and the injected-ADC trigger channel is disabled (6-step uses no trigger).
+        assert!(!cfg.brk.enabled);
+        assert!(!cfg.trigger_ch_enable);
     }
 }
