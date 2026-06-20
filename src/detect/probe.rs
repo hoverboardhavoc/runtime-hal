@@ -599,8 +599,15 @@ const SCRATCH_RETAIN_MASK: u32 = 0x0000_0FFF;
 
 /// The two advanced-timer instance bases (TIMER0, TIMER7) on both families (APB2 map).
 const ADV_TIMER_BASES: [u32; 2] = [0x4001_2C00, 0x4001_3400];
+/// `RCU_APB2EN` clock-enable bit for each entry of [`ADV_TIMER_BASES`]: TIMER0EN = bit 11, TIMER7EN =
+/// bit 13. Both families' advanced timers are on APB2; bit 13 is reserved on F1x0, which has no TIM8
+/// at `0x4001_3400` and so still scratch-tests absent there.
+const ADV_TIMER_CLOCK_BITS: [u32; 2] = [11, 13];
 /// The three ADC instance bases (ADC0, ADC1, ADC2) on both families (APB2 map).
 const ADC_BASES: [u32; 3] = [0x4001_2400, 0x4001_2800, 0x4001_3C00];
+/// `RCU_APB2EN` clock-enable bit for each entry of [`ADC_BASES`]: ADC0EN = bit 9, ADC1EN = bit 10,
+/// ADC2EN = bit 15. F1x0 has only ADC0 (bit 9); the others are reserved there and scratch-test absent.
+const ADC_CLOCK_BITS: [u32; 3] = [9, 10, 15];
 
 /// MEASURE the advanced-timer and ADC instance counts of the running part, instead of trusting the
 /// family constant. For each candidate peripheral it runs the benign scratch write-back presence test
@@ -612,6 +619,13 @@ const ADC_BASES: [u32; 3] = [0x4001_2400, 0x4001_2800, 0x4001_3C00];
 /// scratch read is done inside the armed window so an unexpected fault is caught, not escalated), then
 /// restores both on exit. The application defines no fault handler.
 ///
+/// Each candidate's peripheral clock is enabled BEFORE its scratch test: an unclocked GD32 timer / ADC
+/// ignores the write-back and reads zero, so without the clock it would be miscounted as absent (this
+/// under-count is why TIMER7 went undetected on the high-density F10x part, and why a dual-ADC F10x
+/// master mis-reported a single ADC). `RCU_APB2EN` is snapshotted on entry and restored on exit, so
+/// the clock enables are not a lasting side effect (the application re-enables what it uses at
+/// bring-up), the same leave-as-found contract `scratch_present` follows for the scratch value.
+///
 /// NOT host-testable (the same reason as [`run`]: the write-back to an absent slot relies on real
 /// silicon behavior no host/emulator reproduces); validated on the bench.
 pub fn measure_counts() -> MeasuredCounts {
@@ -619,9 +633,16 @@ pub fn measure_counts() -> MeasuredCounts {
     with_probe_vector_table(|| {
         let prev = arm_busfault();
 
+        // Snapshot APB2EN so the per-candidate clock enables below can be reverted exactly (the
+        // scratch test needs each peripheral's clock ON to retain its write-back).
+        let apb2en = (RCU_BASE + RCU_APB2EN) as *mut u32;
+        // SAFETY: the shared RCU base is always present; this reads a control register.
+        let apb2en_saved = unsafe { core::ptr::read_volatile(apb2en) };
+
         let mut adv_timers = 0u8;
         let mut i = 0;
         while i < ADV_TIMER_BASES.len() {
+            rcu_set_bit(RCU_APB2EN, ADV_TIMER_CLOCK_BITS[i]);
             if scratch_present(ADV_TIMER_BASES[i]) {
                 adv_timers += 1;
             }
@@ -631,10 +652,17 @@ pub fn measure_counts() -> MeasuredCounts {
         let mut adc_count = 0u8;
         let mut j = 0;
         while j < ADC_BASES.len() {
+            rcu_set_bit(RCU_APB2EN, ADC_CLOCK_BITS[j]);
             if scratch_present(ADC_BASES[j]) {
                 adc_count += 1;
             }
             j += 1;
+        }
+
+        // Restore APB2EN to its pre-probe value: the clock enables were a means to test, not a result.
+        // SAFETY: as above; writing back the snapshot of a shared control register.
+        unsafe {
+            core::ptr::write_volatile(apb2en, apb2en_saved);
         }
 
         disarm_busfault(prev);
