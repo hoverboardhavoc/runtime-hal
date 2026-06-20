@@ -41,22 +41,43 @@ use embedded_hal::digital::OutputPin;
 use panic_halt as _;
 
 use control::{bring_up_motor, Direction, MotorContract, SixStep};
+use runtime_hal::clock::{configure_tree, ClockConfig};
 use runtime_hal::{detect_chip, PeriphLabel};
 
-/// The reset IRC8M core clock this example runs on (no PLL bring-up): the `sysclk_hz` for `Delay`
-/// and the TIMER0 input clock.
-const SYSCLK_HZ: u32 = 8_000_000;
-/// PWM period (CAR). Center-aligned at 8 MHz this is `8 MHz / (2 * 250) = 16 kHz`, matching the
-/// stock PWM rate and above most of the audible range.
-const PWM_PERIOD: u16 = 250;
+/// Core clock after the PLL bring-up below: the 72 MHz IRC8M->PLL tree, matching the stock board.
+/// This is the `sysclk_hz` for `Delay` and the TIMER0 input clock.
+const SYSCLK_HZ: u32 = 72_000_000;
+/// PWM period (CAR). Center-aligned at 72 MHz this is `72 MHz / (2 * 2250) = 16 kHz`, reproducing the
+/// stock ARR = 2250 / 16 kHz exactly (so the dead-time count DTG = 25 also yields the stock ~694 ns).
+const PWM_PERIOD: u16 = 2250;
 /// Starting duty as a percent of the period. Low: a gentle, slow spin.
 const DUTY_PERCENT: u32 = 30;
 /// The motor-specific hall-to-state alignment (0..5). Sweep on the bench until it spins smoothly.
-const ALIGN_OFFSET: u8 = 0;
+const ALIGN_OFFSET: u8 = 1;
 /// Rotation direction.
 const DIRECTION: Direction = Direction::Forward;
 /// Hall sampling period. Short enough to track the rotor at a slow spin.
 const LOOP_US: u32 = 200;
+
+/// SWD-readable observation block (find by the `COMMUT_OBS` symbol or read its RAM address).
+/// `magic` marks it; `seq` increments each loop (liveness); `hall_code` is the raw 3-bit hall
+/// reading (1..=6 valid, 0/7 = sensor fault -> coast); `applied` is 1 if the commutator drove a
+/// step, 0 if it coasted. A spinning motor shows `hall_code` cycling through 1..=6.
+#[repr(C)]
+struct CommutObs {
+    magic: u32,
+    seq: u32,
+    hall_code: u32,
+    applied: u32,
+}
+const OBS_MAGIC: u32 = 0xC0_77_07_05;
+#[no_mangle]
+static mut COMMUT_OBS: CommutObs = CommutObs {
+    magic: 0,
+    seq: 0,
+    hall_code: 0,
+    applied: 0,
+};
 
 // GPIO port indices for the `(port << 4) | pin` contract encoding.
 const A: u8 = 0;
@@ -83,16 +104,23 @@ fn main() -> ! {
     // Detect the chip; a part matching neither family panics (panic_halt halts): fail-loud.
     let chip = detect_chip().unwrap();
 
-    // SELF_HOLD (PB12) high: latch the board's main power rail on (the gate-driver rail sits behind
-    // it on the bench board). output_pin absorbs the family GPIO model; no family branch.
+    // Bring up the 72 MHz IRC8M->PLL clock tree (the stock board's rate). With CAR = 2250 this gives
+    // the stock 16 kHz PWM, and at this clock the contract's DTG = 25 / CKD = /2 is the stock ~694 ns
+    // dead-time. configure_tree validates against the family ceiling and polls for PLL lock + switch.
+    configure_tree(&chip, &ClockConfig::REFERENCE_72M_IRC8M).unwrap();
+
+    // Enable the port clocks FIRST. A GPIO write (pin-mode config or set_high) only sticks once the
+    // port's peripheral clock is on, and `output_pin` does NOT enable it. GPIOB carries SELF_HOLD
+    // (PB12) and the low-side gates (PB13/14/15); GPIOA/GPIOC carry the high-side gates / halls.
+    let _ = chip.gpioa();
+    let _ = chip.gpiob();
+    let _ = chip.gpioc();
+
+    // SELF_HOLD (PB12) high: latch the board's main power rail on (the gate-driver rail sits behind it
+    // on the slave board; the master's rail is powered regardless). GPIOB's clock is enabled above, so
+    // this write takes; without it PB12 stays low and the slave bridge has no gate-driver power.
     let mut self_hold = chip.output_pin(PeriphLabel::Gpiob, 12).unwrap();
     let _ = self_hold.set_high();
-
-    // Halls are plain GPIO inputs (floating at reset), so they need only the port clock. Enable the
-    // hall ports' clocks (the gate / SELF_HOLD ports were enabled by their routing / output_pin); the
-    // bring-up helper builds the hall reader over these lines.
-    let _ = chip.gpioa();
-    let _ = chip.gpioc();
 
     // Bring up TIMER0's complementary bridge from the contract: configure the timer (dead-time +
     // period), route the six gate pins (family-internal), start the counter, and hand back the
@@ -110,9 +138,23 @@ fn main() -> ! {
 
     // Hall-driven 6-step loop: read the rotor position, drive the matching commutation step at a low
     // duty, and the motor self-commutates. A sensor-fault code coasts (all channels floated).
+    let mut seq: u32 = 0;
     loop {
         let code = reader.read();
-        let _ = commutator.apply(code, duty);
+        let applied = commutator.apply(code, duty).unwrap_or(false);
+        seq = seq.wrapping_add(1);
+        // SWD readback: publish the live hall code + whether a step was driven (liveness via seq).
+        unsafe {
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!(COMMUT_OBS),
+                CommutObs {
+                    magic: OBS_MAGIC,
+                    seq,
+                    hall_code: u32::from(code),
+                    applied: applied as u32,
+                },
+            );
+        }
         delay.delay_us(LOOP_US);
     }
 }

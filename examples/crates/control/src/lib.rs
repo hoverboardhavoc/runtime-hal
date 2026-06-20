@@ -34,8 +34,8 @@
 #![no_std]
 
 use runtime_hal::{
-    ArmGate, BreakConfig, Chip, ClockDiv, DescriptorError, InputGroup, OcMode, PeriphLabel,
-    PwmAlign, PwmChannelConfig, PwmConfig, PwmError, PwmHandle, PwmTimer, TrgoSource,
+    enable_timer, ArmGate, BreakConfig, Chip, ClockDiv, DescriptorError, InputGroup, OcMode,
+    PeriphLabel, PwmAlign, PwmChannelConfig, PwmConfig, PwmError, PwmHandle, PwmTimer, TrgoSource,
 };
 
 /// Per-phase drive action for one 6-step (block) commutation step. This is MOTOR-CONTROL vocabulary,
@@ -245,7 +245,8 @@ impl MotorContract {
     /// - one complementary channel per phase (high-side `gate_high[i]` / low-side `gate_low[i]`),
     ///   active-low (`polarity = true`) so the bridge idles safe, with both idle levels high;
     /// - the shoot-through-safe `dead_time` from the contract;
-    /// - center-aligned ([`PwmAlign::Center2`]), auto-reload-shadow on (`arse = true`), timer clock
+    /// - center-aligned mode 1 ([`PwmAlign::Center1`], the stock CMS=01), auto-reload-shadow on
+    ///   (`arse = true`), timer clock
     ///   divided by two ([`ClockDiv::Div2`]), TRGO on Update ([`TrgoSource::Update`]);
     /// - no break input, and the CH3 trigger channel DISABLED (6-step uses no injected-ADC trigger).
     pub fn pwm_config(&self, timer: PeriphLabel, period: u16) -> PwmConfig {
@@ -274,7 +275,7 @@ impl MotorContract {
             },
             // 6-step uses NO injected ADC, so the CH3 trigger channel is unused / disabled.
             trigger_compare: 0,
-            align: PwmAlign::Center2,
+            align: PwmAlign::Center1,
             arse: true,
             trigger_oc_mode: OcMode::Pwm0,
             trigger_ch_enable: false,
@@ -305,8 +306,10 @@ impl MotorContract {
 /// explicit, deliberate step, which keeps the energize point a visible safety boundary in the app.
 ///
 /// The caller must have enabled the GPIO port clocks for the hall pins (the gate pins' clocks are
-/// enabled by the routing). Returns [`DescriptorError`] if a pin's port or the timer base is absent
-/// from the descriptor (e.g. a second advanced timer on a single-advanced-timer part: fail-loud).
+/// enabled by the routing). The advanced timer's OWN peripheral clock is enabled here (an unclocked
+/// GD32 timer silently ignores all config writes and reads back zero), so the caller does not. Returns
+/// [`DescriptorError`] if a pin's port or the timer base is absent from the descriptor (e.g. a second
+/// advanced timer on a single-advanced-timer part: fail-loud).
 pub fn bring_up_motor(
     chip: &Chip,
     c: &MotorContract,
@@ -314,6 +317,10 @@ pub fn bring_up_motor(
     period: u16,
     step: SixStep,
 ) -> Result<(Commutator, ArmGate, InputGroup), DescriptorError> {
+    // Enable the timer's peripheral clock BEFORE configuring it: an unclocked GD32 advanced timer
+    // ignores register writes and reads back zero, so `PwmTimer::configure` would be a no-op without
+    // this (the cause of a bridge that never drives).
+    enable_timer(chip.rcu_base()?, chip.clock(), timer)?;
     let cfg = c.pwm_config(timer, period);
     let pwm = PwmTimer::configure(chip, &cfg)?;
     for &gate in c.gate_high.iter().chain(c.gate_low.iter()) {
@@ -415,7 +422,7 @@ mod tests {
 
     /// `pwm_config` fills the stock-convention complementary-bridge fields from the contract: the
     /// three channels carry the contract's gate pins (active-low, idle-high), the dead-time matches,
-    /// the alignment is Center2, the clock divide is Div2, the timer/period knobs are passed through,
+    /// the alignment is Center1, the clock divide is Div2, the timer/period knobs are passed through,
     /// and the (injected-ADC) trigger channel is disabled. This is the byte-for-byte config both
     /// commutation examples used to build inline.
     #[test]
@@ -446,7 +453,7 @@ mod tests {
         assert_eq!(cfg.dead_time, c.dead_time);
 
         // The fixed stock-convention timer fields.
-        assert_eq!(cfg.align, PwmAlign::Center2);
+        assert_eq!(cfg.align, PwmAlign::Center1);
         assert_eq!(cfg.ckdiv, ClockDiv::Div2);
         assert!(cfg.arse);
         assert_eq!(cfg.trgo_src, TrgoSource::Update);
