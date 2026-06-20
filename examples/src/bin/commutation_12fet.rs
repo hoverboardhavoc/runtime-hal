@@ -131,28 +131,9 @@ fn bring_up(
     pwm.enable_counter();
     let commutator = Commutator::new(pwm.handle(), SixStep::new(DIRECTION, offset));
     let gate = pwm.arm_gate();
-    let reader = InputGroup::resolve(chip.gpio(), hall_lines(chip, c));
+    // The HAL resolves each hall pin's port base internally; the example never holds a base.
+    let reader = chip.input_group(c.hall_pins).unwrap();
     (commutator, gate, reader)
-}
-
-/// The three hall lines as `(port_base, pin)` pairs for [`InputGroup::resolve`], from a contract.
-fn hall_lines(chip: &Chip, c: &MotorContract) -> [(u32, u8); 3] {
-    [
-        (port_base(chip, c.hall_pins[0]), c.hall_pins[0] & 0x0F),
-        (port_base(chip, c.hall_pins[1]), c.hall_pins[1] & 0x0F),
-        (port_base(chip, c.hall_pins[2]), c.hall_pins[2] & 0x0F),
-    ]
-}
-
-/// Resolve the GPIO port base for a logical pin byte (high nibble = port A/B/C = 0/1/2).
-fn port_base(chip: &Chip, pin: u8) -> u32 {
-    let label = match pin >> 4 {
-        0 => PeriphLabel::Gpioa,
-        1 => PeriphLabel::Gpiob,
-        2 => PeriphLabel::Gpioc,
-        _ => unreachable!("dual-motor board uses only ports A/B/C"),
-    };
-    chip.base(label).unwrap()
 }
 
 /// Build a complementary-PWM config from a board contract (dead-time + gate pins from the RE; the

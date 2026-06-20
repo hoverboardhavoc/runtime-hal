@@ -42,8 +42,8 @@ use panic_halt as _;
 
 use control::{Commutator, Direction, MotorContract, SixStep};
 use runtime_hal::{
-    detect_chip, BreakConfig, Chip, ClockDiv, InputGroup, OcMode, PeriphLabel, PwmAlign,
-    PwmChannelConfig, PwmConfig, PwmTimer, TrgoSource,
+    detect_chip, BreakConfig, ClockDiv, OcMode, PeriphLabel, PwmAlign, PwmChannelConfig, PwmConfig,
+    PwmTimer, TrgoSource,
 };
 
 /// The reset IRC8M core clock this example runs on (no PLL bring-up): the `sysclk_hz` for `Delay`
@@ -103,12 +103,13 @@ fn main() -> ! {
     }
 
     // Halls are plain GPIO inputs (floating at reset), so they need only the port clock. Build the
-    // resolve-once input group (the HAL's neutral multi-pin reader) over the three hall lines. Enable
+    // resolve-once input group (the HAL's neutral multi-pin reader) over the three hall lines. The
+    // HAL resolves each hall pin's port base internally, so the example never holds a base. Enable
     // the hall ports' clocks via the port getters (the gate/SELF_HOLD ports were enabled by their
     // routing / output_pin).
     let _ = chip.gpioa();
     let _ = chip.gpioc();
-    let reader = InputGroup::resolve(chip.gpio(), hall_lines(&chip, &SPLIT_BOARD));
+    let reader = chip.input_group(SPLIT_BOARD.hall_pins).unwrap();
 
     // Start the counter (safe while disarmed: outputs do not reach the pins until MOE is set).
     timer.enable_counter();
@@ -130,26 +131,6 @@ fn main() -> ! {
         let _ = commutator.apply(code, duty);
         delay.delay_us(LOOP_US);
     }
-}
-
-/// The three hall lines as `(port_base, pin)` pairs for [`InputGroup::resolve`], from a contract.
-fn hall_lines(chip: &Chip, c: &MotorContract) -> [(u32, u8); 3] {
-    [
-        (port_base(chip, c.hall_pins[0]), c.hall_pins[0] & 0x0F),
-        (port_base(chip, c.hall_pins[1]), c.hall_pins[1] & 0x0F),
-        (port_base(chip, c.hall_pins[2]), c.hall_pins[2] & 0x0F),
-    ]
-}
-
-/// Resolve the GPIO port base for a logical pin byte (high nibble = port A/B/C = 0/1/2).
-fn port_base(chip: &Chip, pin: u8) -> u32 {
-    let label = match pin >> 4 {
-        0 => PeriphLabel::Gpioa,
-        1 => PeriphLabel::Gpiob,
-        2 => PeriphLabel::Gpioc,
-        _ => unreachable!("split board uses only ports A/B/C"),
-    };
-    chip.base(label).unwrap()
 }
 
 /// Build TIMER0's complementary-PWM config from a board contract (the dead-time + gate pins from the

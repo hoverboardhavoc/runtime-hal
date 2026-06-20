@@ -15,8 +15,10 @@ use crate::addr::PeriphLabel;
 use crate::adc::{Adc, AdcCapability};
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
 use crate::error::DescriptorError;
+use crate::gpio::gpio_in::INPUT_GROUP_LINES;
 use crate::gpio::{
-    self, GpioOutput, GpioPort, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins, PortPins,
+    self, GpioOutput, GpioPort, InputGroup, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins,
+    PortPins,
 };
 use crate::reg::Reg32;
 
@@ -42,8 +44,15 @@ impl Chip {
     }
 
     /// Resolve a label to its base address ([`DescriptorError::MissingBase`] if absent).
+    ///
+    /// HAL-internal (`pub(crate)`): the general raw-base escape, used heavily in-crate to source a
+    /// peripheral base from the descriptor. It is NOT public, so a caller never holds a raw base; the
+    /// chip-based builders (e.g. [`Chip::output_pin`], [`Chip::input_group`], [`Chip::adc`],
+    /// [`crate::timer::PwmTimer::configure`], [`crate::watchdog::FreeWatchdog::start`]) resolve the
+    /// base internally and hand back a handle. If an external consumer needs a base, that is a signal
+    /// to add the missing chip-based builder, not to re-expose this.
     #[inline]
-    pub fn base(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
+    pub(crate) fn base(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
         self.desc.addrs.resolve(label)
     }
 
@@ -247,6 +256,30 @@ impl Chip {
         } else {
             Ok(AdcCapability::Single(primary))
         }
+    }
+
+    /// Build a resolve-once multi-pin input reader ([`crate::gpio::InputGroup`]) over `pins`, the
+    /// logical pin bytes (`(port << 4) | pin`, the same encoding [`Chip::route_advanced_pwm_pin`]
+    /// takes). Each pin's GPIO port base is resolved INTERNALLY from the descriptor (via the same
+    /// port-label mapping the routing uses), and the family's `GPIO_ISTAT` offset is picked from the
+    /// descriptor's [`GpioPath`], so the caller never holds a raw base or names a family. A motor
+    /// layer uses this for its rotor-position lines (read each cycle, decoded outside the HAL); the
+    /// reader itself is a neutral GPIO sampler.
+    ///
+    /// Returns [`DescriptorError::MissingBase`] if any pin's port is not in the descriptor (or the
+    /// port index is one this crate does not model). This is the base-hidden builder: it resolves the
+    /// per-pin port bases and the family ISTAT offset internally, so no caller-facing raw base or
+    /// `GpioPath` is involved.
+    pub fn input_group(
+        &self,
+        pins: [u8; INPUT_GROUP_LINES],
+    ) -> Result<InputGroup, DescriptorError> {
+        let mut lines = [(0u32, 0u8); INPUT_GROUP_LINES];
+        for (slot, &pin) in lines.iter_mut().zip(pins.iter()) {
+            let base = self.base(gpio_port_label(pin)?)?;
+            *slot = (base, pin & 0x0F);
+        }
+        Ok(InputGroup::resolve(self.desc.gpio, lines))
     }
 
     /// Route `pin` to the general-purpose-timer PWM output (TIMER1_CH1), doing ALL the family-specific

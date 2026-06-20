@@ -978,7 +978,7 @@ gpio_pin_struct! { PortFPins, "F", 5,
 ///
 /// The GPIO input-status register (`GPIO_ISTAT`) is at a **family-dependent offset**: 0x10 on the
 /// F1x0 (AHB) GPIO and 0x08 on the F10x (APB) GPIO (verified against `gd32f1x0_gpio.h` /
-/// `gd32f10x_gpio.h`). That offset is the only family divergence, so [`InputGroup::resolve`] takes the
+/// `gd32f10x_gpio.h`). That offset is the only family divergence, so the resolve step takes the
 /// [`crate::GpioPath`] and picks it once; the per-cycle read is then offset-free.
 ///
 /// This is silicon: a plain GPIO read, no timer input mode and no EXTI. A motor layer uses this for
@@ -1014,8 +1014,12 @@ pub mod gpio_in {
         /// Resolve the input lines from their `(port_base, pin)` pairs and the [`GpioPath`] (which
         /// picks the family's `GPIO_ISTAT` offset). The pairs are in code order (line 0 -> code bit
         /// 0, etc.).
+        ///
+        /// HAL-internal (`pub(crate)`): the application builds a reader base-hidden via
+        /// [`crate::Chip::input_group`], which resolves each pin's port base from the descriptor; a
+        /// caller never supplies raw bases here.
         #[inline]
-        pub fn resolve(path: GpioPath, lines: [(u32, u8); INPUT_GROUP_LINES]) -> Self {
+        pub(crate) fn resolve(path: GpioPath, lines: [(u32, u8); INPUT_GROUP_LINES]) -> Self {
             let istat_off = match path {
                 GpioPath::AhbCtlAfsel => ISTAT_AHB,
                 GpioPath::ApbCrlCrh => ISTAT_APB,
