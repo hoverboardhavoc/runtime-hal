@@ -77,29 +77,27 @@ def test_usart_brr_is_0x139_both_families(vector_id, family, baud_off):
 
 # --- M2 T2: clock-tree config goldens (gd-spl oracle) + with_polling goldens ------------------
 
-# Pre-existing F1x0 clock-tree limitation (NOT introduced by the API-refactor snippet revival): the
-# runtime-hal configure_tree path, built for the F1x0 descriptor, emits ZERO RCU/FMC MMIO under the
-# harness's Unicorn (the F10x descriptor's identical configure_tree path emits the full 21-write
-# sequence and passes). The snippet compiles and runs to a clean exit; configure_tree returns Ok but
-# the inner register writes do not surface for the F1x0 ClockPath. This is an emulator/codegen
-# interaction on the clock subsystem, which is out of this task's scope (GPIO/ADC/TIMER/I2C/USART
-# snippet revival) and cannot be addressed without editing src/ (forbidden). xfail-marked so the
-# limitation is visible without masking a real regression; the F10x clock vectors run unmarked.
-_F1X0_CLOCK_XFAIL = pytest.mark.xfail(
-    reason="F1x0 configure_tree emits no MMIO under Unicorn (pre-existing clock-subsystem emulator "
-           "limitation; F10x identical path works). Out of scope; src/ edits forbidden.",
-    strict=False,
-)
+# The F1x0 clock vectors used to xfail because the F1x0 runtime-hal clock trace came out EMPTY under
+# Unicorn while the identical F10x path emitted the full 21-write RCU/FMC sequence. Root cause (fixed
+# in extractor.py): a GLOBAL `UC_HOOK_MEM_READ` forced unicorn to translate every code block under
+# its instrumented-memory path, which on this unicorn (2.x ARM thumb) mis-executed the IT-block
+# conditional chain in the F1x0 `ClockConfig::validate_for` (the per-family sysclk-ceiling /
+# min-wait-state `if ... {0} else {1}` lowering). validate_for then returned a garbage `ClockError`
+# discriminant instead of Ok, so `configure_tree` bailed before any register write. The F10x path has
+# no such conditional chain, so only F1x0 was hit. The extractor now scopes the read/write hooks to
+# the declared peripheral ranges, leaving flash/RAM code under unicorn's normal translation so the IT
+# block decodes correctly; the F1x0 trace now emits the full sequence and matches the GD SPL oracle.
+# The vectors run unmarked on both families.
 
 # Config goldens: runtime-hal vs the committed GD SPL golden (final_state, both families).
 CLOCK_TREE_CONFIG = [
-    pytest.param("clock_tree_72m_irc8m_f1x0", "gd32f1x0", marks=_F1X0_CLOCK_XFAIL),
+    ("clock_tree_72m_irc8m_f1x0", "gd32f1x0"),
     ("clock_tree_72m_irc8m_f10x", "gd32f10x"),
 ]
 
 # with_polling goldens: runtime-hal vs its own committed golden (the poll-sequence self-test).
 CLOCK_TREE_POLLING = [
-    pytest.param("clock_tree_polling_72m_f1x0", "gd32f1x0", marks=_F1X0_CLOCK_XFAIL),
+    ("clock_tree_polling_72m_f1x0", "gd32f1x0"),
     ("clock_tree_polling_72m_f10x", "gd32f10x"),
 ]
 

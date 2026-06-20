@@ -243,8 +243,25 @@ def extract(
             return True
         return False
 
-    uc.hook_add(unicorn.UC_HOOK_MEM_WRITE, hook_mem_write)
-    uc.hook_add(unicorn.UC_HOOK_MEM_READ, hook_mem_read)
+    # Register the read/write hooks SCOPED to each declared peripheral range (begin/end) rather than
+    # globally over the whole address space. A global UC_HOOK_MEM_READ forces unicorn to translate
+    # *every* code block under the finer "instrumented memory" path, and on this unicorn (2.x ARM
+    # thumb) that path mis-executes an IT-block conditional chain in the F1x0 `ClockConfig::
+    # validate_for` (the per-family sysclk-ceiling / min-wait-state `if ... {0} else {1}` lowering):
+    # the function returns a garbage `ClockError` discriminant instead of Ok, so `configure_tree`
+    # bails before any RCU/FMC write and the F1x0 clock trace comes out EMPTY. (This is the same class
+    # as the `matches!` -> rbit/clz/ands.w IT-block mis-decode that clock.rs already works around with
+    # explicit comparisons; here the trigger is the global read hook, not the source lowering.) The
+    # F10x path lacks that conditional chain, so it was unaffected, which is why only F1x0 xfailed.
+    #
+    # Scoping the hooks to the peripheral ranges leaves the flash code region (0x0800_xxxx) and RAM
+    # (0x2000_xxxx) under unicorn's normal translation, so the IT block decodes correctly, while
+    # peripheral reads/writes are still intercepted exactly as before (validate_for touches no
+    # peripheral, so nothing observable is lost). Verified: with the scoped hook the F1x0 clock trace
+    # emits the full RCU/FMC sequence identical to F10x.
+    for rng in target.peripheral_ranges:
+        uc.hook_add(unicorn.UC_HOOK_MEM_WRITE, hook_mem_write, begin=rng.start, end=rng.end)
+        uc.hook_add(unicorn.UC_HOOK_MEM_READ, hook_mem_read, begin=rng.start, end=rng.end)
     uc.hook_add(
         unicorn.UC_HOOK_MEM_READ_UNMAPPED
         | unicorn.UC_HOOK_MEM_WRITE_UNMAPPED

@@ -100,13 +100,12 @@ def test_clock_polling_control_run_matches(vector_id):
     assert cr.matched, "\n".join(cr.diff)
 
 
-# F1x0 configure_tree emits no MMIO under Unicorn (pre-existing clock-subsystem emulator limitation;
-# see test_matrix._F1X0_CLOCK_XFAIL). With an empty trace there is no poll to drop, so this f1x0
-# parameter cannot exercise the mutation. xfail-marked (out of scope; src/ edits forbidden).
+# The F1x0 clock trace used to come out EMPTY under Unicorn (a global-read-hook IT-block mis-decode
+# in F1x0 `ClockConfig::validate_for`; fixed in extractor.py by scoping the read/write hooks to the
+# peripheral ranges, see test_matrix). With the full trace restored there are RCU status polls to
+# drop, so the f1x0 parameter now exercises the dropped-poll mutation like f10x; no xfail.
 @pytest.mark.parametrize("vector_id", [
-    pytest.param("clock_tree_polling_72m_f1x0", marks=pytest.mark.xfail(
-        reason="F1x0 configure_tree emits no MMIO under Unicorn (pre-existing); no poll to drop.",
-        strict=False)),
+    "clock_tree_polling_72m_f1x0",
     "clock_tree_polling_72m_f10x",
 ])
 def test_clock_dropped_poll_flagged(vector_id):
