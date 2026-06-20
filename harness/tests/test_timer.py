@@ -17,6 +17,12 @@ from regcmp import engine, paths, runner, vectors
 
 _TOOLS = shutil.which("cargo") and shutil.which(f"{paths.toolchain_prefix()}gcc")
 needs_tools = pytest.mark.skipif(not _TOOLS, reason="cargo or arm-none-eabi not on PATH")
+# Two-oracle tests rebuild the GD SPL; they need the local SPL tree + bench/harness.toml, absent on
+# CI (which runs the committed-golden compares instead), so gate them to skip cleanly there.
+needs_spl = pytest.mark.skipif(
+    not _TOOLS or not paths.bench_config_present(),
+    reason="two-oracle compare needs the local GD SPL tree + bench/harness.toml",
+)
 
 # T3/T4 full complementary-PWM bring-up config goldens (both families).
 PWM_CONFIG = [
@@ -37,7 +43,7 @@ def _golden_for(vector_id: str, family: str):
     return paths.golden_dir() / "gd-spl" / "local" / family / f"{vector_id}.trace"
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", ALL_PWM)
 def test_pwm_config_two_oracle(vector_id, family):
     """runtime-hal's TIMER0 complementary-PWM bring-up reaches the same end state as the GD SPL
@@ -143,7 +149,7 @@ INJECT_READ = [
 ]
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", TRGO_CONFIG + INJECT_CONFIG)
 def test_hotpath_config_two_oracle(vector_id, family):
     """runtime-hal's T6 timer-trigger config and T8 injected-ADC config each reach the same end

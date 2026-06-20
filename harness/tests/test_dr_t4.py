@@ -24,6 +24,12 @@ from regcmp import paths, runner, vectors
 
 _TOOLS = shutil.which("cargo") and shutil.which(f"{paths.toolchain_prefix()}gcc")
 needs_tools = pytest.mark.skipif(not _TOOLS, reason="cargo or arm-none-eabi not on PATH")
+# The two-oracle test rebuilds the GD SPL; it needs the local SPL tree + bench/harness.toml, absent
+# on CI (which runs the committed-golden compare instead), so gate it to skip cleanly there.
+needs_spl = pytest.mark.skipif(
+    not _TOOLS or not paths.bench_config_present(),
+    reason="two-oracle compare needs the local GD SPL tree + bench/harness.toml",
+)
 
 # (vector_id, family). The two new capabilities, each on both families.
 DR_T4 = [
@@ -76,7 +82,7 @@ def test_against_committed_golden(vector_id, family):
     assert cr.matched, "\n".join(cr.diff)
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", DR_T4)
 def test_two_oracle_runtime_hal_matches_spl(vector_id, family):
     """runtime-hal's enable_timer / timer-AF writes reach the same state as the GD

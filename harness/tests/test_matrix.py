@@ -15,6 +15,13 @@ from regcmp import engine, paths, runner, vectors
 
 _TOOLS = shutil.which("cargo") and shutil.which(f"{paths.toolchain_prefix()}gcc")
 needs_tools = pytest.mark.skipif(not _TOOLS, reason="cargo or arm-none-eabi not on PATH")
+# The two-oracle tests rebuild the GD SPL and diff it against the runtime-hal trace, so they need the
+# local GD SPL tree + bench/harness.toml. CI has neither (it runs the committed-golden compares
+# instead), so gate them on the bench config being present; they skip cleanly on CI.
+needs_spl = pytest.mark.skipif(
+    not _TOOLS or not paths.bench_config_present(),
+    reason="two-oracle compare needs the local GD SPL tree + bench/harness.toml",
+)
 
 # (vector_id, family) for the full M1 matrix. gpio has TX + RX per family; the
 # original gpio TX f1x0 is the thin-slice vector, included for completeness.
@@ -102,7 +109,7 @@ CLOCK_TREE_POLLING = [
 ]
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", CLOCK_TREE_CONFIG)
 def test_clock_tree_config_two_oracle(vector_id, family):
     """runtime-hal's RCU/FMC bring-up reaches the same end state as the GD SPL, both families."""
@@ -159,7 +166,7 @@ M2_BUS_MATRIX = [
 ]
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", M2_BUS_MATRIX)
 def test_m2_bus_two_oracle(vector_id, family):
     """runtime-hal's bus clock-enable / bus-pin AF config matches the GD SPL, both families."""
@@ -208,7 +215,7 @@ I2C_TRANSFER = [
 ]
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", I2C_CONFIG)
 def test_i2c_config_two_oracle(vector_id, family):
     """runtime-hal's I2C bring-up reaches the same end state as the GD SPL, both families.
@@ -296,7 +303,7 @@ SPI_TRANSFER = [
 ]
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", SPI_CONFIG)
 def test_spi_config_two_oracle(vector_id, family):
     """runtime-hal's SPI bring-up reaches the same end state as the GD SPL spi_init/spi_enable,

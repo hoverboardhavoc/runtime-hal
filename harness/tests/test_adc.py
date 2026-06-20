@@ -24,6 +24,12 @@ from regcmp import build_rusthal, engine, extractor, paths, runner, targets, vec
 
 _TOOLS = shutil.which("cargo") and shutil.which(f"{paths.toolchain_prefix()}gcc")
 needs_tools = pytest.mark.skipif(not _TOOLS, reason="cargo or arm-none-eabi not on PATH")
+# Two-oracle tests rebuild the GD SPL; they need the local SPL tree + bench/harness.toml, absent on
+# CI (which runs the committed-golden compares instead), so gate them to skip cleanly there.
+needs_spl = pytest.mark.skipif(
+    not _TOOLS or not paths.bench_config_present(),
+    reason="two-oracle compare needs the local GD SPL tree + bench/harness.toml",
+)
 
 
 # --- T10 config goldens (gd-spl oracle, final_state) ------------------------------------------
@@ -42,7 +48,7 @@ ADC_POLLING = [
 ]
 
 
-@needs_tools
+@needs_spl
 @pytest.mark.parametrize("vector_id,family", ADC_CONFIG)
 def test_adc_config_two_oracle(vector_id, family):
     """runtime-hal's ADC bring-up reaches the same end state as the GD SPL adc_* recipe, both
@@ -186,7 +192,7 @@ def test_adc_read_traces_trigger_poll_then_data():
 DUAL_ADC = ("adc_dual_adc_simultaneous_f10x", "gd32f10x")
 
 
-@needs_tools
+@needs_spl
 def test_dual_adc_config_two_oracle():
     """The F10x Dual arm: chip.adc() -> Dual; configure_simultaneous(ch4, ch5, st) reaches the same
     end state as the GD SPL per-ADC single config + adc_mode_config(ADC_DAUL_REGULAL_PARALLEL)."""
