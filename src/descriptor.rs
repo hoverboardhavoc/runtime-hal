@@ -167,6 +167,11 @@ pub struct McuDescriptor {
     pub addrs: AddrTable,
     /// Flash page size for FMC.
     pub flash_page: PageSize,
+    /// Total flash size in KiB, read from the factory `FLASH_DENSITY` register (`0x1FFF_F7E0`,
+    /// low 16 bits). The FMC driver bounds erase/program addresses against this extent
+    /// (`flash_kib * 1024`); see [`crate::Chip::flash_size_bytes`]. A pure read at detect, never
+    /// probed by writing.
+    pub flash_kib: u16,
     /// Advanced-timer count (1 or 2).
     pub adv_timers: u8,
     /// ADC count (1 = F1x0, 2 = F10x): capability, not the single/dual choice.

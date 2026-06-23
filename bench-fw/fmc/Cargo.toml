@@ -1,0 +1,26 @@
+[package]
+name = "bench-fw-fmc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "On-silicon validator for the runtime-hal FMC flash driver: runs erase/program/read-back and the arg + pre-check rejections through the REAL Fmc on the detected chip (real MMIO, NOT the mock feature), publishing per-case results to a fixed-layout RAM block a human reads over SWD. ONE image for F103/F130 (K1 / 64 KiB / 1 KiB pages) and the 12-FET (K2 / 256 KiB / 2 KiB pages); the scratch page + out-of-flash addresses derive from flash_size_bytes()/page_size() at runtime so the same binary adapts per part."
+
+[dependencies]
+# runtime-hal in its normal real-MMIO no_std build (NOT the mock feature; the FMC driver pokes real
+# flash). The fmc module + detect_chip are in the default public API, so no extra feature is needed.
+runtime-hal = { path = "../..", default-features = false }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-fmc"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing (matches the other bench-fw crates).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

@@ -256,6 +256,14 @@ impl Chip {
         self.desc.flash_page
     }
 
+    /// Total flash size in bytes (`flash_kib * 1024`, from the descriptor's `0x1FFF_F7E0` density
+    /// read). The absolute-address bound the FMC driver ([`crate::fmc::Fmc`]) uses for its
+    /// out-of-flash `BadArg` check. Read-only; the extent is never probed by writing.
+    #[inline]
+    pub const fn flash_size_bytes(&self) -> u32 {
+        (self.desc.flash_kib as u32) * 1024
+    }
+
     /// Advanced-timer count capability (1 or 2).
     #[inline]
     pub const fn adv_timers(&self) -> u8 {

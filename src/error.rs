@@ -269,6 +269,35 @@ pub enum PwmError {
     Other,
 }
 
+/// Per-peripheral runtime error for the FMC flash driver ([`crate::fmc::Fmc`]).
+///
+/// Like [`AdcError`] / [`WatchdogError`], `embedded-hal` 1.0 has **NO flash trait** (the
+/// `embedded-storage` `NorFlash` traits live in a separate crate with no in-tree consumer, so they
+/// are not implemented; see the FMC spec). It is therefore a **plain runtime-hal error**
+/// implementing no `embedded-hal` `Error` via `ErrorKind`, kept separate from [`DescriptorError`]
+/// (DECISIONS.md #5: parse vs runtime). Each variant is a distinct condition with distinct
+/// remediation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FmcError {
+    /// A mis-aligned or out-of-flash argument (a caller / guard-rail bug, caught BEFORE the FMC is
+    /// touched): an erase address not page-aligned, a program address or length not
+    /// halfword-aligned, or a span that runs past the flash extent.
+    BadArg,
+    /// A program target span is not erased (`0xFFFF`), caught by the pre-check before the FMC is
+    /// touched (flash left unchanged, no partial write). Recoverable by erasing the page; typically
+    /// signals a frontier/scan bug, distinct from [`FmcError::BadArg`].
+    NotErased,
+    /// The controller raised `WPERR` (a write-protected page).
+    WriteProtect,
+    /// The controller raised `PGERR` for a reason the pre-check did not foresee (the backstop behind
+    /// the [`FmcError::NotErased`] pre-check).
+    ProgramError,
+    /// The bounded `BUSY` poll hit its iteration budget (a genuinely stuck operation / flash
+    /// failure), the F130 hang-if-done-wrong class at the FMC boundary.
+    Timeout,
+}
+
 /// Shared per-cycle-path error (M3 T1, DECISIONS.md #5). The complementary-PWM + injected-ADC config
 /// / arming surface can fail in either the PWM/timer half or the injected-ADC half; this is the
 /// unified error the [`crate::timer::ComplementaryPwm`] / [`crate::adc::TriggeredAdc`] config methods

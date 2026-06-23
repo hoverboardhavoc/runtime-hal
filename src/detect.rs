@@ -122,6 +122,9 @@ mod synth {
                 .with(detected.adv_timers >= 2, PeriphLabel::Timer7, TIMER7_BASE)
                 .with(detected.adc_count >= 2, PeriphLabel::Adc1, ADC1_BASE),
             flash_page: flash_page_for(detected.family, detected.flash_kib),
+            // Retain the raw density (KiB) as the flash extent the FMC driver bounds writes against
+            // (`Chip::flash_size_bytes` = `flash_kib * 1024`); a pure read at detect, never written.
+            flash_kib: detected.flash_kib,
             adv_timers: detected.adv_timers,
             adc_count: detected.adc_count,
         }
@@ -347,18 +350,15 @@ mod tests {
 
     #[test]
     fn synthesize_f1x0_equals_descriptor_f130() {
-        // flash_kib is ignored for F1x0 (constant K1); try a value that WOULD trip K2 on F10x. The
-        // F130 bench part measures adv_timers == 1 / adc_count == 1, i.e. descriptor_f130().
-        assert_eq!(
-            synthesize(&detected(Family::F1x0, 256, 1, 1)),
-            descriptor_f130()
-        );
+        // F1x0 page size is the family constant K1 regardless of flash_kib (256 KiB would trip K2 only
+        // on F10x). flash_kib is now RETAINED as the flash extent, so a 256 KiB F1x0 differs from
+        // descriptor_f130() in that field alone while staying K1; the 64 KiB bench part matches it whole.
         assert_eq!(
             synthesize(&detected(Family::F1x0, 64, 1, 1)),
             descriptor_f130()
         );
         assert_eq!(
-            synthesize(&detected(Family::F1x0, 64, 1, 1)).flash_page,
+            synthesize(&detected(Family::F1x0, 256, 1, 1)).flash_page,
             PageSize::K1
         );
     }

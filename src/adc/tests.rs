@@ -323,6 +323,7 @@ mod injected {
             irq: IrqLayout::F1x0Grouped,
             addrs,
             flash_page: PageSize::K1,
+            flash_kib: 64,
             adv_timers: 1,
             adc_count: 1,
         })

@@ -170,6 +170,7 @@ fn descriptor_literal_and_addr_resolution() {
         irq: IrqLayout::F10xSeparate,
         addrs,
         flash_page: PageSize::K2,
+        flash_kib: 256,
         adv_timers: 1,
         adc_count: 2,
     };

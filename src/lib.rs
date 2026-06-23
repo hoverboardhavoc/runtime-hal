@@ -25,6 +25,10 @@ pub mod descriptor;
 /// flash density, and synthesizes the [`McuDescriptor`] the rest of the HAL is built on.
 pub mod detect;
 pub mod error;
+/// FMC flash erase/program driver ([`fmc::Fmc`]): the family-aware on-target flash primitive (page
+/// erase + halfword program at absolute addresses), with the unlock/command/BUSY-poll critical
+/// section RAM-resident + interrupts off on the target. Mechanism only (no placement/region policy).
+pub mod fmc;
 pub mod gpio;
 pub mod i2c;
 pub mod irq;
@@ -80,9 +84,10 @@ pub use detect::{
 #[cfg(feature = "detect-internals")]
 pub use detect::{family_capability, synthesize, Family};
 pub use error::{
-    AdcError, BringUpError, ClockError, DescriptorError, DetectError, I2cError, PwmError, SpiError,
-    UsartError, WatchdogError,
+    AdcError, BringUpError, ClockError, DescriptorError, DetectError, FmcError, I2cError, PwmError,
+    SpiError, UsartError, WatchdogError,
 };
+pub use fmc::{Fmc, FMC_BUSY_TIMEOUT};
 pub use gpio::{
     Floating, GpioOutput, GpioPort, Input, InputGroup, Output, Pin, PinRole, PortAPins, PortBPins,
     PortCPins, PortDPins, PortFPins, PortPins, PullDown, PullUp, PushPull,
