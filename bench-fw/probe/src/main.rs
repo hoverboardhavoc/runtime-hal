@@ -2,14 +2,15 @@
 //!
 //! # Why this exists
 //!
-//! The library's `detect_chip` MEASURES the advanced-timer / ADC instance counts ([`probe::measure_counts`])
-//! rather than trusting the family DEFAULT (`descriptor_f103()` => 2/2, `descriptor_f130()` => 1/1):
-//! a medium-density F103C8 carries only 1 advanced timer (TIMER0) and 2 ADCs, while a high-density
-//! F10x (two 3-phase bridges => TIMER0 + TIMER7) carries more. This firmware is the STANDALONE
-//! VALIDATOR for that measurement: it MEASURES presence per instance THREE ways and reports all the
-//! raw sub-signals next to the family DEFAULT, so we can see which signal is trustworthy and whether
-//! the default over- or under-counts. (The library function relies only on the write-back signal,
-//! which this firmware confirmed is the trustworthy one; see `bench/peripheral-probe-2026-06-18.md`.)
+//! The library's `detect_chip` MEASURES the advanced-timer / ADC instance counts (inside
+//! [`probe::run`], via [`probe::measure_counts`]) rather than trusting a family CAPABILITY baseline
+//! (F10x can carry up to 2 advanced timers / 2 ADCs; F1x0 up to 1 / 1): a medium-density F103C8
+//! carries only 1 advanced timer (TIMER0) and 2 ADCs, while a high-density F10x (two 3-phase bridges
+//! => TIMER0 + TIMER7) carries more. This firmware is the STANDALONE VALIDATOR for that measurement:
+//! it MEASURES presence per instance two ways and reports the raw sub-signals next to the family
+//! capability baseline ([`family_capability`]), so we can see which signal is trustworthy and whether
+//! that baseline over- or under-counts. (The library relies only on the write-back signal, which this
+//! firmware confirmed is the trustworthy one; see `bench/peripheral-probe-2026-06-18.md`.)
 //!
 //! # What it does (and the mirror of bench-fw-detect)
 //!
@@ -64,9 +65,11 @@ use cortex_m_rt::entry;
 use panic_halt as _;
 
 use runtime_hal::detect::probe::{self, RCU_APB2EN_OFFSET};
-// `synthesize` comes from the crate-root re-export gated behind the `detect-internals` feature
-// (enabled in this crate's Cargo.toml), not the `detect` module path.
-use runtime_hal::synthesize;
+// `family_capability` comes from the crate-root re-export gated behind the `detect-internals` feature
+// (enabled in this crate's Cargo.toml), not the `detect` module path. It is the constant per-family
+// capability baseline (the most advanced timers / ADCs a part of the family can carry) the measured
+// per-instance presence is compared against.
+use runtime_hal::family_capability;
 
 /// The magic value written last once the whole run completed (distinct from bench-fw-detect's).
 const MAGIC: u32 = 0x4DF7_9505;
@@ -219,10 +222,13 @@ struct ProbeResult {
     detected_family: u8,
     /// Non-zero only if the family probe matched NEITHER family (then the sweep is skipped).
     no_family: u8,
-    /// The family-constant INFERENCE the synthesized descriptor carries, recorded for the headline
-    /// comparison: this is what `detect-fallback` would report WITHOUT measurement.
+    /// The family CAPABILITY baseline for advanced timers (the most a part of this family can carry),
+    /// recorded for the headline comparison: this is what a no-measurement family inference would
+    /// report. Same field offset and same recorded value (F10x = 2, F1x0 = 1) as before; only its
+    /// source changed (the constant `family_capability`, not a half-built descriptor).
     syn_adv_timers: u8,
-    /// The family-constant inferred ADC count (the other half of the comparison).
+    /// The family CAPABILITY baseline for ADC instances (the other half of the comparison; F10x = 2,
+    /// F1x0 = 1).
     syn_adc_count: u8,
     /// Padding to keep the records array 4-byte aligned and the layout obvious to the decoder.
     _pad: [u8; 2],
@@ -268,16 +274,21 @@ fn main() -> ! {
     unsafe { core::ptr::write_volatile(result_ptr(), INIT_RESULT) };
 
     // Step 1: the bus-fault-safe family probe (giving the detected family + the family-correct
-    // register model). We record the family DEFAULT adv_timers/adc_count (the synthesized
-    // descriptor's constant) so the bench decode can compare it against the MEASURED per-instance
-    // presence below (the headline: does the default match reality?).
+    // register model). We record the family CAPABILITY baseline adv_timers/adc_count (the most a part
+    // of this family can carry, the genuine constant `family_capability` fact) so the bench decode can
+    // compare it against the MEASURED per-instance presence below (the headline: does the family
+    // baseline match reality?). NOTE: `probe::run` also measures the per-instance counts internally;
+    // this firmware re-measures each candidate below to break out the raw sub-signals, which the
+    // library's count does not expose.
     let family = match probe::run() {
         Some(detected) => {
             let fam = detected.family;
             store_u8(Field::DetectedFamily, fam as u8);
-            let desc = synthesize(fam, detected.flash_kib); // family DEFAULT counts, pre-measurement.
-            store_u8(Field::SynAdvTimers, desc.adv_timers);
-            store_u8(Field::SynAdcCount, desc.adc_count);
+            // The family capability baseline, straight from the constant family model (NOT a
+            // half-built descriptor): the most advanced timers / ADCs this family can carry.
+            let (max_adv_timers, max_adcs) = family_capability(fam);
+            store_u8(Field::SynAdvTimers, max_adv_timers);
+            store_u8(Field::SynAdcCount, max_adcs);
             Some(fam)
         }
         None => {

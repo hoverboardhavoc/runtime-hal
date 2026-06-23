@@ -78,7 +78,7 @@ pub use detect::{
 // (silicon purity). They are re-exported at the crate root ONLY behind the `detect-internals`
 // feature, for the in-tree detection-acceptance bench firmware that must introspect detection.
 #[cfg(feature = "detect-internals")]
-pub use detect::{synthesize, Family};
+pub use detect::{family_capability, synthesize, Family};
 pub use error::{
     AdcError, BringUpError, ClockError, DescriptorError, DetectError, I2cError, PwmError, SpiError,
     UsartError, WatchdogError,

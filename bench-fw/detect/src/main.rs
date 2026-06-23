@@ -1,11 +1,13 @@
 //! On-silicon acceptance firmware for runtime family detection.
 //!
 //! This is THE acceptance test for the detection path. It runs the bus-fault-safe ordered GPIO+RCU
-//! family probe and the family -> chip synthesis ENTIRELY through runtime-hal (its normal real-MMIO
-//! `no_std` build, NOT the `mock` feature: the probe relies on a REAL bus fault, which no
-//! host/emulator raises). It calls the same library primitives `detect_chip` does (`probe::run` for
-//! the family discriminator, `synthesize` for the descriptor, `probe::measure_counts` for the
-//! measured peripheral counts) and records the intermediate probe outcome for the human to verify.
+//! family probe and the `Detected` -> chip synthesis ENTIRELY through runtime-hal (its normal
+//! real-MMIO `no_std` build, NOT the `mock` feature: the probe relies on a REAL bus fault, which no
+//! host/emulator raises). It calls the same library primitives `detect_chip` does: `probe::run`
+//! gathers EVERY silicon observation up front into a fully-populated `Detected` (family + flash
+//! density + the MEASURED per-instance counts), and `synthesize(&detected)` builds the chip from it in
+//! one shot. This firmware records the reconstructed per-candidate probe outcome for the human to
+//! verify.
 //!
 //! It writes a fixed-layout result struct ([`DetectResult`]) to a `.bss` `static mut`, writes the
 //! `magic` word LAST, then busy-spins (NOT `wfi`; see the idle loop), the result-struct pattern the `coldpath` firmware uses:
@@ -15,9 +17,10 @@
 //!
 //! # The BusFault handling (the load-bearing piece, now HAL-owned)
 //!
-//! The BusFault handling is owned entirely by runtime-hal: `probe::run` / `probe::measure_counts`
-//! install a probe-scoped vector table whose BusFault slot points at the HAL-internal naked entry
-//! `probe::bus_fault_entry`, run the probe, then restore `VTOR`. On a probe fault the lib advances the
+//! The BusFault handling is owned entirely by runtime-hal: `probe::run` (which internally measures the
+//! per-instance counts) installs a probe-scoped vector table whose BusFault slot points at the
+//! HAL-internal naked entry `probe::bus_fault_entry`, runs the probe, then restores `VTOR`. On a probe
+//! fault the lib advances the
 //! stacked PC past the fixed-width probe load (the `+4` PC-fixup, DF-5) so the faulting `LDR` is
 //! skipped on return; the probe then reads the recorded "faulted" flag as the family-negative signal.
 //! This firmware therefore defines NO `#[exception] BusFault`; it is a thin recorder around the lib.
@@ -133,11 +136,12 @@ fn main() -> ! {
     // SAFETY: RESULT_ADDR is reserved RAM (see memory.x); single writer.
     unsafe { core::ptr::write_volatile(result_ptr(), INIT_RESULT) };
 
-    // Runtime detection, the same primitives `detect_chip` runs, decomposed here so the intermediate
-    // outcome can be recorded: the bus-fault-safe family probe, then the family -> chip synthesis,
-    // then the MEASURED peripheral counts. This runs on the reset IRC8M clock. The HAL installs its
-    // own probe-scoped vector table for the fault-safe reads and restores VTOR before each call
-    // returns, so this firmware defines no BusFault handler.
+    // Runtime detection, the same primitives `detect_chip` runs: `probe::run` gathers every silicon
+    // observation up front (the bus-fault-safe family probe, the flash density, and the MEASURED
+    // per-instance counts) into one fully-populated `Detected`, then `synthesize(&detected)` resolves
+    // the chip in one shot. This runs on the reset IRC8M clock. The HAL installs its own probe-scoped
+    // vector table for the fault-safe reads and restores VTOR before the call returns, so this
+    // firmware defines no BusFault handler.
     match probe::run() {
         Some(detected) => {
             let family = detected.family;
@@ -162,14 +166,12 @@ fn main() -> ! {
             let readback = unsafe { core::ptr::read_volatile(gpioa_base as *const u32) };
             store_u32(StructField::GpioaReadback, readback);
 
-            // Synthesize the family-correct descriptor (selectors + density-derived flash page), then
-            // build the same Chip detect_chip returns by writing the MEASURED per-instance counts over
-            // the family default. Record the synthesized selectors and the measured counts.
-            let mut desc = synthesize(family, detected.flash_kib);
-            let counts = probe::measure_counts();
-            desc.adv_timers = counts.adv_timers;
-            desc.adc_count = counts.adc_count;
-            let chip = Chip::from_descriptor(desc);
+            // Build the same Chip detect_chip returns: `probe::run` already gathered the family, the
+            // flash density, and the MEASURED per-instance counts into `detected`, so a single
+            // `synthesize(&detected)` resolves the whole descriptor (selectors + density-derived flash
+            // page + the measured counts + the count-conditional Timer7/Adc1 bases) in one shot.
+            // Record the resolved selectors and the measured counts.
+            let chip = Chip::from_descriptor(synthesize(&detected));
 
             store_u8(StructField::SynGpio, gpio_code(chip.gpio()));
             store_u8(StructField::SynClock, clock_code(chip.clock()));

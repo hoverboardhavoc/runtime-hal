@@ -291,7 +291,10 @@ static PROBED_ADDR: AtomicU32 = AtomicU32::new(0);
 /// Set by the handler so the probe learns the access faulted (the family-negative signal).
 static FAULTED: AtomicBool = AtomicBool::new(false);
 
-/// The probe result: the detected family and the flash-density read (the F10x page-size input).
+/// The fully-populated probe result: EVERY silicon observation gathered in one pass, ready to hand to
+/// [`crate::detect::synthesize`] in one shot. The family discriminator, the flash-density read, and
+/// the MEASURED per-instance advanced-timer / ADC counts. There is no half-built / default value:
+/// `run` does not return until all of these are known (DECISIONS.md #11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detected {
     /// The family the GPIO+RCU probe resolved, the detection-internal discriminator that drives
@@ -303,6 +306,13 @@ pub struct Detected {
     /// `flash_page` input (spec section 4.3 / 5.2). Read after the family decision; advisory for
     /// F1x0 (constant K1).
     pub flash_kib: u16,
+    /// The MEASURED number of advanced timers present (TIMER0 + TIMER7, by the benign scratch
+    /// write-back), measured by [`measure_counts`] after the family decision. Never a family default
+    /// (the bench proved a family constant wrong in both directions).
+    pub adv_timers: u8,
+    /// The MEASURED number of ADC instances present (ADC0 + ADC1 + ADC2, by the scratch write-back),
+    /// measured by [`measure_counts`] after the family decision.
+    pub adc_count: u8,
 }
 
 // --- the fixed-width pinned probe read (DF-5) -------------------------------------------------
@@ -341,8 +351,9 @@ fn rcu_set_bit(reg_off: u32, bit: u32) {
 
 // --- the ordered probe (DF-T4, spec section 4.2) ----------------------------------------------
 
-/// Run the ordered GPIO+RCU family probe ONCE inside the fault-safe harness, returning the detected
-/// family (or `None` if neither matched => fail safe).
+/// Run the ordered GPIO+RCU family probe ONCE inside the fault-safe harness and, once a family is
+/// known, MEASURE the per-instance counts, returning the fully-populated [`Detected`] (or `None` if
+/// neither family matched => fail safe).
 ///
 /// Sequence (spec section 4.2):
 /// 1. **F1x0 probe.** Set `RCU_AHBEN.PAEN` (bit 17). Read GPIOA control at `0x4800_0000`. A clean
@@ -350,17 +361,22 @@ fn rcu_set_bit(reg_off: u32, bit: u32) {
 /// 2. **F10x probe** (only if step 1 faulted). Set `RCU_APB2EN.PAEN` (bit 2). Read GPIOA control at
 ///    `0x4001_0800`. A clean read => F10x. A bus-fault => NEITHER family; fail safe (`None`).
 /// 3. Read the flash-density register for the F10x page-size input (corroboration; the GPIO result
-///    is authoritative).
+///    is authoritative), and MEASURE the advanced-timer / ADC instance counts ([`measure_counts`]).
+///
+/// Gathering the counts here (rather than in a separate caller step) means `run` returns a
+/// fully-populated `Detected` with no half-built intermediate: every silicon observation is in hand
+/// before [`crate::detect::synthesize`] runs (DECISIONS.md #11). `measure_counts` takes no family
+/// argument and runs after the family discriminator, so it fits cleanly into the positive paths.
 ///
 /// `run` installs the HAL's probe-scoped vector table (BusFault slot -> [`bus_fault_entry`]) for the
-/// duration of the probe, sets `SHCSR.BUSFAULTENA` on entry, and restores both on every exit, so a
-/// precise data-bus error traps to the HAL-internal BusFault handler rather than escalating to
+/// duration of the family probe, sets `SHCSR.BUSFAULTENA` on entry, and restores both on every exit,
+/// so a precise data-bus error traps to the HAL-internal BusFault handler rather than escalating to
 /// HardFault, and the application defines no fault handler. It does NOT retry or loop.
 pub fn run() -> Option<Detected> {
-    // The vector-table swap is strictly probe-scoped: install -> probe -> restore, all inside this
-    // call. The HAL's BusFault entry handles a faulted candidate read; every other vector is the
-    // application's (copied from the active table).
-    with_probe_vector_table(|| {
+    // The family-probe vector-table swap is strictly probe-scoped: install -> probe -> restore, all
+    // inside this call. The HAL's BusFault entry handles a faulted candidate read; every other vector
+    // is the application's (copied from the active table).
+    let family = with_probe_vector_table(|| {
         // Enable the dedicated BusFault handler so a precise reserved-read fault traps to it (not
         // HardFault). Remember the prior state so we can restore it.
         // SAFETY: bring-up context, single core, no concurrent SCB users; we restore below.
@@ -368,7 +384,7 @@ pub fn run() -> Option<Detected> {
         let bf_was_enabled = scb.is_enabled(Exception::BusFault);
         scb.enable(Exception::BusFault);
 
-        let result = run_inner();
+        let family = probe_family();
 
         // Restore the prior BUSFAULTENA state. The probe handler is strictly boot-temporary.
         if !bf_was_enabled {
@@ -378,32 +394,41 @@ pub fn run() -> Option<Detected> {
         // The probe leaves the shared atomics disarmed.
         EXPECTING_FAULT.store(false, Ordering::SeqCst);
 
-        result
+        family
+    })?;
+
+    // A family matched. Gather the REMAINING silicon observations so the returned `Detected` is fully
+    // populated in one literal: the flash density (always-mapped, fault-free) and the MEASURED
+    // per-instance counts (`measure_counts` installs its own probe-scoped harness for the sweep). No
+    // half-built value escapes: every field below is its real value.
+    let counts = measure_counts();
+    Some(Detected {
+        family,
+        flash_kib: read_flash_density(),
+        adv_timers: counts.adv_timers,
+        adc_count: counts.adc_count,
     })
 }
 
-/// The ordered candidate set, run with BUSFAULTENA already set.
-fn run_inner() -> Option<Detected> {
+/// The ordered family-discriminator candidate set, run with BUSFAULTENA already set. Returns the
+/// matched [`Family`] or `None` if neither candidate read cleanly (fail safe). The remaining
+/// observations (flash density, measured counts) are gathered by the caller [`run`] once a family is
+/// known, so this returns only the family decision.
+fn probe_family() -> Option<Family> {
     // Step 1: F1x0. Enable GPIOA's clock in the F1x0-correct RCU register, then read GPIOA control.
     rcu_set_bit(RCU_AHBEN, F1X0_PAEN_BIT);
     if probe_candidate(F1X0_GPIOA_BASE).is_some() {
         // Clean read at the F1x0 base => F1x0 family. (The known-good F130 readback is 0x682a73a3;
         // it MAY be used as an extra plausibility gate but is not load-bearing, the wrong base
         // faults rather than returning garbage, so "did not fault" is already the strong signal.)
-        return Some(Detected {
-            family: Family::F1x0,
-            flash_kib: read_flash_density(),
-        });
+        return Some(Family::F1x0);
     }
 
     // Step 2: F10x (only reached if step 1 faulted). Enable GPIOA in the F10x-correct RCU register,
     // then read GPIOA control at the F10x base.
     rcu_set_bit(RCU_APB2EN, F10X_PAEN_BIT);
     if probe_candidate(F10X_GPIOA_BASE).is_some() {
-        return Some(Detected {
-            family: Family::F10x,
-            flash_kib: read_flash_density(),
-        });
+        return Some(Family::F10x);
     }
 
     // Both candidates faulted: NEITHER family matched. Fail safe (do not guess).
@@ -431,17 +456,18 @@ fn probe_candidate(base: u32) -> Option<u32> {
     }
 }
 
-// --- the peripheral-presence measurement (folded into detect_chip) ----------------------------
+// --- the peripheral-presence measurement (folded into `run`) ----------------------------------
 //
 // These GENERALIZE the family probe's machinery for the peripheral-presence MEASUREMENT: instead of
 // resolving F1x0-vs-F10x, MEASURE which advanced timers / ADCs a given instance actually has, per
 // chip, rather than inferring counts from a family constant. They reuse the SAME shared atomics
 // (EXPECTING_FAULT / PROBED_ADDR / FAULTED) and the SAME fixed-width `probe_read32` + `+4` PC-fixup
-// `on_bus_fault` as `run`; no new private duplicate state. `run` itself is unchanged. The whole sweep
-// runs under ONE BusFault enable (rather than per-candidate like `run`), so the SCB enable/disable is
+// `on_bus_fault` as the family probe; no new private duplicate state. The whole sweep runs under ONE
+// BusFault enable (rather than per-candidate like the family probe), so the SCB enable/disable is
 // split out into [`arm_busfault`] / [`disarm_busfault`] and the per-access armed read is exposed as
-// [`probe_present`]. `bench-fw-probe/` is the standalone validator that reports the raw sub-signals;
-// the library function [`measure_counts`] is the production caller `detect_chip` uses.
+// [`probe_present`]. `run` calls [`measure_counts`] once a family is known so its `Detected` carries
+// the measured counts; `bench-fw-probe/` is the standalone validator that reports the raw sub-signals
+// (it calls [`measure_counts`] / the lower-level helpers directly to break out each sub-signal).
 
 /// Enable the dedicated BusFault handler (`SHCSR.BUSFAULTENA`) so a precise reserved-read fault traps
 /// to the BusFault handler instead of escalating to HardFault. Returns the PRIOR enabled state so the

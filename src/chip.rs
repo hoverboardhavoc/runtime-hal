@@ -511,16 +511,15 @@ mod tests {
         let single = Chip::from_descriptor(descriptor_f130());
         assert!(matches!(single.adc(), Ok(AdcCapability::Single(_))));
 
-        // Two ADCs (as detect_chip populates for adc_count == 2): Dual, with ADC1 carried.
-        let mut d = descriptor_f103();
-        d.adc_count = 2;
-        d.addrs.set(PeriphLabel::Adc1, 0x4001_2800);
-        let dual = Chip::from_descriptor(d);
+        // Two ADCs (the resolved F103C8 descriptor carries adc_count == 2 with ADC1's base): Dual.
+        let dual = Chip::from_descriptor(descriptor_f103());
         assert!(matches!(dual.adc(), Ok(AdcCapability::Dual(_))));
 
-        // A part that claims 2 ADCs but is missing the ADC1 base fails loud (no fake handle).
-        let mut bad = descriptor_f103();
+        // A part that claims 2 ADCs but is missing the ADC1 base fails loud (no fake handle). Build
+        // it from the single-ADC F130 baseline (no ADC1 base) and bump the count to 2.
+        let mut bad = descriptor_f130();
         bad.adc_count = 2;
+        assert!(bad.addrs.get(PeriphLabel::Adc1).is_none());
         assert!(Chip::from_descriptor(bad).adc().is_err());
     }
 

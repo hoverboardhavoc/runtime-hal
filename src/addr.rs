@@ -262,10 +262,24 @@ impl AddrTable {
     }
 
     /// Set the base for a label (builder-style; used by the decoder and by tests). `const` so the
-    /// per-family descriptor constants ([`crate::detect::descriptor_f103`] /
-    /// [`crate::detect::descriptor_f130`]) can be built in a `const fn`.
+    /// constant per-family base table ([`crate::detect`]'s `family_model`) can be built in a
+    /// `const fn`.
     pub const fn set(&mut self, label: PeriphLabel, base: u32) {
         self.bases[label.index()] = Some(base);
+    }
+
+    /// Non-mutating conditional set: return a copy of this table with `label` set to `base` when
+    /// `cond` is true, or unchanged when it is false. The count-conditional descriptor entries
+    /// (`Timer7` when `adv_timers >= 2`, `Adc1` when `adc_count >= 2`) are applied through this inside
+    /// the single `synthesize` struct literal, so the resolved table is built in one expression with
+    /// no post-construction mutation (DECISIONS.md #11). When `cond` is false the label stays absent,
+    /// so a request for it resolves [`DescriptorError::MissingBase`] rather than a faked base.
+    #[must_use]
+    pub const fn with(mut self, cond: bool, label: PeriphLabel, base: u32) -> Self {
+        if cond {
+            self.bases[label.index()] = Some(base);
+        }
+        self
     }
 
     /// The raw base if present (no validation).
