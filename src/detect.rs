@@ -148,7 +148,6 @@ mod synth {
             Family::F10x => PageSize::K1,
         }
     }
-
 }
 
 /// TIM8 (TIMER7) base on the F10x high-density parts (APB2 advanced-timer window). Carried by
@@ -350,8 +349,14 @@ mod tests {
     fn synthesize_f1x0_equals_descriptor_f130() {
         // flash_kib is ignored for F1x0 (constant K1); try a value that WOULD trip K2 on F10x. The
         // F130 bench part measures adv_timers == 1 / adc_count == 1, i.e. descriptor_f130().
-        assert_eq!(synthesize(&detected(Family::F1x0, 256, 1, 1)), descriptor_f130());
-        assert_eq!(synthesize(&detected(Family::F1x0, 64, 1, 1)), descriptor_f130());
+        assert_eq!(
+            synthesize(&detected(Family::F1x0, 256, 1, 1)),
+            descriptor_f130()
+        );
+        assert_eq!(
+            synthesize(&detected(Family::F1x0, 64, 1, 1)),
+            descriptor_f130()
+        );
         assert_eq!(
             synthesize(&detected(Family::F1x0, 64, 1, 1)).flash_page,
             PageSize::K1
@@ -362,18 +367,36 @@ mod tests {
     fn synthesize_f10x_c8_baseline_equals_descriptor_f103() {
         // The bench F103C8 is a 64 KiB medium-density part measuring adv_timers == 1 / adc_count == 2;
         // synthesize of that Detected == descriptor_f103() (the same construction, by definition).
-        assert_eq!(synthesize(&detected(Family::F10x, 64, 1, 2)), descriptor_f103());
+        assert_eq!(
+            synthesize(&detected(Family::F10x, 64, 1, 2)),
+            descriptor_f103()
+        );
     }
 
     #[test]
     fn f10x_density_branch_picks_page_size() {
         // <= 128 KiB => K1 (medium density); > 128 KiB => K2 (high/extra density). The counts do not
         // affect the page-size branch.
-        assert_eq!(synthesize(&detected(Family::F10x, 64, 1, 2)).flash_page, PageSize::K1);
-        assert_eq!(synthesize(&detected(Family::F10x, 128, 1, 2)).flash_page, PageSize::K1);
-        assert_eq!(synthesize(&detected(Family::F10x, 129, 2, 3)).flash_page, PageSize::K2);
-        assert_eq!(synthesize(&detected(Family::F10x, 256, 2, 3)).flash_page, PageSize::K2);
-        assert_eq!(synthesize(&detected(Family::F10x, 512, 2, 3)).flash_page, PageSize::K2);
+        assert_eq!(
+            synthesize(&detected(Family::F10x, 64, 1, 2)).flash_page,
+            PageSize::K1
+        );
+        assert_eq!(
+            synthesize(&detected(Family::F10x, 128, 1, 2)).flash_page,
+            PageSize::K1
+        );
+        assert_eq!(
+            synthesize(&detected(Family::F10x, 129, 2, 3)).flash_page,
+            PageSize::K2
+        );
+        assert_eq!(
+            synthesize(&detected(Family::F10x, 256, 2, 3)).flash_page,
+            PageSize::K2
+        );
+        assert_eq!(
+            synthesize(&detected(Family::F10x, 512, 2, 3)).flash_page,
+            PageSize::K2
+        );
     }
 
     #[test]
