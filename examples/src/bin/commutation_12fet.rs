@@ -1,11 +1,12 @@
 //! Hall-driven 6-step (block) commutation on the 12-FET DUAL-MOTOR board (one GD32F103RCT6 that can
 //! drive TWO motors on TIMER0 / TIM1 and TIMER7 / TIM8).
 //!
-//! # SINGLE-WHEEL-FIRST mode
+//! # Dual-motor mode
 //!
-//! For the first on-hardware bring-up this example drives ONLY the RIGHT motor (TIMER0), so only one
-//! bridge is energized while the alignment is found. The LEFT motor (TIMER7) is defined but NOT
-//! brought up or armed; re-enable it via the commented block in `main` once the right wheel spins.
+//! This example brings up and arms BOTH motors: the RIGHT motor on TIMER0 and the LEFT motor on
+//! TIMER7. Each carries its own bench-swept alignment offset ([`ALIGN_OFFSET_RIGHT`] /
+//! [`ALIGN_OFFSET_LEFT`]). To work one motor in isolation on the bench, clear the other bridge's MOE
+//! over SWD (TIMER0 CCHP / TIMER7 CCHP, bit 15); the loop does not re-arm, so it stays disarmed.
 //!
 //! # 12-FET dual-motor board ONLY (RE'd, previously dump-only)
 //!
@@ -16,7 +17,7 @@
 //! Do NOT flash this to the bench SPLIT board: it targets TIMER7 / TIM8, which a 48-pin F103C8 does
 //! not have, and uses the dual-motor hall pins. Use `commutation_splitboard` for the bench split board.
 //! On a single-advanced-timer part `PwmTimer::configure(.., Timer7, ..)` fails loud, so the left-motor
-//! block (when re-enabled) does not silently mis-drive the wrong board.
+//! bring-up cannot silently mis-drive the wrong board.
 //!
 //! # No magic addresses, no family branch
 //!
@@ -26,17 +27,20 @@
 //!
 //! # SWD readback
 //!
-//! `COMMUT_OBS` (a `#[no_mangle]` static) carries `{ magic, seq, hall_code, applied }` for the right
-//! motor, updated every pass. `magic` (0xC0770712); `seq` increments (liveness); `hall_code` is the
-//! raw 3-bit hall reading (1..=6 valid, 0/7 = fault -> coast); `applied` = 1 if a step was driven.
+//! `COMMUT_OBS` / `COMMUT_OBS_LEFT` (`#[no_mangle]` statics) each carry `{ magic, seq, hall_code,
+//! applied, offset }` for the right / left motor, updated every pass. `magic` (0xC0770712); `seq`
+//! increments (liveness); `hall_code` is the raw 3-bit hall reading (1..=6 valid, 0/7 = fault ->
+//! coast); `applied` = 1 if a step was driven.
 //!
-//! # SAFETY (read before any attempt to run). This ENERGIZES the right motor bridge.
+//! # SAFETY (read before any attempt to run). This ENERGIZES BOTH motor bridges.
 //!
-//! It arms TIMER0 (sets MOE), so the right six FET gates go live. Current-limit the supply
-//! (<= 0.5 A), keep the wheel free, start at the low [`DUTY_PERCENT`]. The dead-time (DTG = 32) is
+//! It arms TIMER0 and TIMER7 (sets MOE), so all twelve FET gates go live. Current-limit the supply
+//! (<= 0.5 A), keep the wheels free, start at the low [`DUTY_PERCENT`]. The dead-time (DTG = 32) is
 //! programmed from the RE'd contract; at this 8 MHz clock that is a LONGER (safer) absolute dead-time
-//! than the stock value, never shorter. Sweep [`ALIGN_OFFSET_RIGHT`] (0..5) for the smooth-spin
-//! alignment. A sensor-fault hall code coasts the motor.
+//! than the stock value, never shorter. The per-motor alignment ([`ALIGN_OFFSET_RIGHT`] /
+//! [`ALIGN_OFFSET_LEFT`], 0..5) is bench-swept for the smooth-spin value. The commutation is
+//! closed-loop with no self-start: give each wheel a nudge to break it free. A sensor-fault hall code
+//! coasts that motor.
 
 #![no_std]
 #![no_main]
@@ -54,14 +58,15 @@ const SYSCLK_HZ: u32 = 8_000_000;
 /// PWM period (CAR). Center-aligned at 8 MHz: `8 MHz / (2 * 250) = 16 kHz`.
 const PWM_PERIOD: u16 = 250;
 /// Starting duty (percent of period): the average phase voltage is `DUTY_PERCENT% * Vbus`, so this is
-/// the speed knob. Kept LOW for a first bring-up at 35 V (10% of 35 V ~= 3.5 V average). Raise it if
-/// the wheel won't start (too little torque to break stiction); the 0.5 A supply limit is the hard cap.
-const DUTY_PERCENT: u32 = 10;
-/// Right-motor (TIMER0) hall-to-state alignment (0..5), swept on the bench.
+/// the speed knob. 30% (~10.5 V average at 35 V) is the floor that reliably keeps both wheels turning
+/// after a hand-nudge at the 0.5 A bench limit; 10% held position but would not sustain rotation. Raise
+/// [`DUTY_OVERRIDE`] over SWD for more; the 0.5 A supply limit is the hard cap.
+const DUTY_PERCENT: u32 = 30;
+/// Right-motor (TIMER0) hall-to-state alignment (0..5), bench-swept: 1 = smooth-spin forward, 4 = reverse.
 const ALIGN_OFFSET_RIGHT: u8 = 1;
-/// Left-motor (TIMER7) alignment; used only when the left-motor block in `main` is re-enabled.
-#[allow(dead_code)]
-const ALIGN_OFFSET_LEFT: u8 = 0;
+/// Left-motor (TIMER7) hall-to-state alignment (0..5), bench-swept (isolated via per-bridge MOE): 1 =
+/// smooth-spin, same as the right motor.
+const ALIGN_OFFSET_LEFT: u8 = 1;
 /// Rotation direction.
 const DIRECTION: Direction = Direction::Forward;
 /// Hall sampling period.
