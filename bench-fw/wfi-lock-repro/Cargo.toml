@@ -1,0 +1,28 @@
+[package]
+name = "bench-fw-wfi-lock-repro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal ISOLATION repro for the GD32F130 wfi SWD-lockout. Does NOTHING but write a RAM marker (0x5EEF_5EEF @ 0x2000_1F00) and idle in wfi: no runtime-hal, no clock/GPIO setup, no bus-fault probe, nothing. Flash it, power-cycle, re-probe over SWD: if AP-write is then dead, `wfi` ALONE is sufficient to lock SWD re-attach on this part (rules out any interaction with the detect/probe code)."
+
+[features]
+# Required opt-in to build at all. This firmware intentionally locks SWD re-attach on GD32F130;
+# without this feature it fails to compile (see the compile_error! in src/main.rs) so it can't be
+# built or flashed by accident.
+yes-lock-this-board = []
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-wfi-lock-repro"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

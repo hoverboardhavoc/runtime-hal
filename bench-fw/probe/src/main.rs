@@ -18,7 +18,7 @@
 //! (`probe::with_probe_vector_table`) with BusFault enabled ONCE around the whole sweep, it MEASURES
 //! each candidate peripheral two independent ways and records both plus
 //! the raw sub-results, classifies present/absent/disagree, writes a fixed-layout result struct to a
-//! `.bss` `static mut`, writes `magic` LAST, and idles in `wfi`, exactly the bench-fw-detect pattern:
+//! `.bss` `static mut`, writes `magic` LAST, and busy-spins (NOT `wfi`; see the idle loop), exactly the bench-fw-detect pattern:
 //! the SWD reader reads the struct at its FIXED address ([`RESULT_ADDR`]) NON-HALTING, and
 //! `magic` written last means the whole run completed. The struct is NOT pinned to a fixed section
 //! (the bench-fw-m2 lesson: a fixed RAM-origin section collided with cortex-m-rt's RAM allocation).
@@ -318,8 +318,12 @@ fn main() -> ! {
 
     // Done: write the magic LAST, then idle. A reader that sees MAGIC knows every store above ran.
     store_u32(Field::Magic, MAGIC);
+    // Busy-spin, NOT wfi. A core left in WFI sleep with no DBGMCU debug-low-power bits set locks out
+    // SWD re-attach on these GD32F130s (the AP-write to halt the sleeping core fails after a
+    // power-cycle), which presents as a permanent debug "brick" until a connect-under-reset +
+    // mass-erase. This validator has no reason to sleep, so spin and stay re-attachable.
     loop {
-        cortex_m::asm::wfi();
+        cortex_m::asm::nop();
     }
 }
 

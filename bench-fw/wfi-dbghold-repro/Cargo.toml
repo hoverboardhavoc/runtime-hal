@@ -1,0 +1,22 @@
+[package]
+name = "bench-fw-wfi-dbghold-repro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A/B partner to wfi-lock-repro: identical (marker + loop{wfi}) EXCEPT it sets the GD32F1x0 DBG_CTL0 sleep-hold bits (SLP_HOLD/DSLP_HOLD/STB_HOLD) before sleeping. If this does NOT lock SWD after a power-cycle while the plain wfi-lock-repro does, the DBGMCU debug-hold bits are the fix that lets firmware sleep without locking out the debugger."
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-wfi-dbghold-repro"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

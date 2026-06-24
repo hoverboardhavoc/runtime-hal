@@ -8,7 +8,7 @@
 //! measured peripheral counts) and records the intermediate probe outcome for the human to verify.
 //!
 //! It writes a fixed-layout result struct ([`DetectResult`]) to a `.bss` `static mut`, writes the
-//! `magic` word LAST, then idles in `wfi`, the same result-struct pattern the `coldpath` firmware uses:
+//! `magic` word LAST, then busy-spins (NOT `wfi`; see the idle loop), the result-struct pattern the `coldpath` firmware uses:
 //! the SWD reader reads the struct at its FIXED address ([`RESULT_ADDR`]) NON-HALTING, and `magic`
 //! written last means the whole run completed. The struct address is NOT pinned to a fixed section
 //! (a fixed RAM-origin section collided with cortex-m-rt's RAM allocation).
@@ -192,8 +192,12 @@ fn main() -> ! {
 
     // Done: write the magic LAST, then idle. A reader that sees MAGIC knows every store above ran.
     store_u32(StructField::Magic, MAGIC);
+    // Busy-spin, NOT wfi. A core left in WFI sleep with no DBGMCU debug-low-power bits set locks out
+    // SWD re-attach on these GD32F130s (the AP-write to halt the sleeping core fails after a
+    // power-cycle), which presents as a permanent debug "brick" until a connect-under-reset +
+    // mass-erase. This validator has no reason to sleep, so spin and stay re-attachable.
     loop {
-        cortex_m::asm::wfi();
+        cortex_m::asm::nop();
     }
 }
 

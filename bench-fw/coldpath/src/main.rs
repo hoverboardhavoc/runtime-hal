@@ -154,8 +154,12 @@ fn main() -> ! {
 
     // Done: everything has been written; write the magic LAST, then idle.
     write_magic();
+    // Busy-spin, NOT wfi. A core left in WFI sleep with no DBGMCU debug-low-power bits set locks out
+    // SWD re-attach on these GD32F130s (the AP-write to halt the sleeping core fails after a
+    // power-cycle), which presents as a permanent debug "brick" until a connect-under-reset +
+    // mass-erase. This validator has no reason to sleep, so spin and stay re-attachable.
     loop {
-        cortex_m::asm::wfi();
+        cortex_m::asm::nop();
     }
 }
 
