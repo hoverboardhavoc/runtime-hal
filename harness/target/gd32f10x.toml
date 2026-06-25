@@ -179,6 +179,12 @@ AFIO_BASE   = 0x40010000
 "0x0C" = "0x00000000"
 "0x10" = "0x00000000"
 
+# USART2 (ST USART3) is F10x-only on APB1 (+0x400 vs USART1); same register block, same reset state.
+[reset_values.USART2_BASE]
+"0x00" = "0x00000000"
+"0x0C" = "0x00000000"
+"0x10" = "0x00000000"
+
 # I2C0 registers reset to 0 (the bits these paths set/RMW start clear, so both oracles start equal).
 [reset_values.I2C0_BASE]
 "0x00" = "0x00000000"

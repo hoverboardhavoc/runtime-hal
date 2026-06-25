@@ -97,6 +97,8 @@ jobs:
           run gpio_af_usart1_rx_pa3_f10x               gd32f10x
           run usart_bringup_usart1_115200_8n1_f1x0     gd32f1x0
           run usart_bringup_usart1_115200_8n1_f10x     gd32f10x
+          # USART2 (ST USART3) is F10x-only (APB1 +0x400 vs USART1); no F1x0 counterpart.
+          run usart_bringup_usart2_115200_8n1_f10x     gd32f10x
 
           # --- M2 cold-path matrix: {gd32f1x0, gd32f10x} x {clock-tree, i2c, spi, adc} ---
           # Each peripheral has its config golden (vs GD SPL, final_state) and its

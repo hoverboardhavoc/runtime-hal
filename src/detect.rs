@@ -199,6 +199,9 @@ const fn family_model(family: Family) -> FamilyModel {
         Family::F10x => {
             let mut addrs = AddrTable::new();
             addrs.set(PeriphLabel::Usart1, 0x4000_4400);
+            // USART2 (ST USART3) is F10x-only, on APB1 at base 0x4000_4400 + 0x400; F1x0 has no
+            // USART2 (its F1x0 arm below carries no base, so it resolves MissingBase(Usart2)).
+            addrs.set(PeriphLabel::Usart2, 0x4000_4800);
             // F10x GPIO ports: APB2, GPIOA at 0x4001_0800, 0x400 per-port stride (GPIOC = +0x800,
             // GPIOD = +0xC00, GPIOF = +0x1400). GPIOE (+0x1000) is rarely wired on these boards and
             // is not carried.
@@ -370,6 +373,27 @@ mod tests {
         assert_eq!(
             synthesize(&detected(Family::F10x, 64, 1, 2)),
             descriptor_f103()
+        );
+    }
+
+    #[test]
+    fn f10x_descriptor_resolves_usart2_base() {
+        // GD Usart2 (ST USART3) is F10x-only, on APB1 at 0x4000_4800. The resolved F103 descriptor
+        // carries that base.
+        assert_eq!(
+            descriptor_f103().addrs.resolve(PeriphLabel::Usart2),
+            Ok(0x4000_4800)
+        );
+    }
+
+    #[test]
+    fn f1x0_descriptor_has_no_usart2() {
+        // F1x0 has no USART2: resolving its base errors (MissingBase) rather than faking one.
+        assert_eq!(
+            descriptor_f130().addrs.resolve(PeriphLabel::Usart2),
+            Err(crate::error::DescriptorError::MissingBase(
+                PeriphLabel::Usart2
+            ))
         );
     }
 

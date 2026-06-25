@@ -1,0 +1,66 @@
+name: bringup_usart2_115200_8n1_f10x
+description: |
+  Bring up USART2 (ST USART3) @ 115200 8N1 on the F10x (f10x_rcc) register model,
+  no byte transfer. USART2 is F10x-only and sits on APB1 at base 0x4000_4800
+  (USART1 +0x400), so it shares USART1's APB1 36 MHz clock and the same BAUD. The
+  72 MHz clock tree is seeded into RCU_CFG0 (see reset_values in
+  target/gd32f10x.toml) so the SPL's usart_baudrate_set -> rcu_clock_freq_get
+  computes CK_APB1 = 36 MHz WITHOUT running SystemInit, giving BAUD = 0x139.
+  runtime-hal's compute_brr is driven by a ClockProfile of the SAME 72 MHz tree.
+
+  The F10x USART register model differs from F1x0: STAT at 0x00, BAUD at 0x08,
+  CTL0 at 0x0C, CTL1 at 0x10, and CTL0.UEN is BIT(13) (not BIT(0)). So the F10x
+  CTL0 end state is UEN|REN|TEN = 0x2000|0x4|0x8 = 0x200C. Same end states as the
+  USART1 vector, shifted only by the +0x400 base (USART2 vs USART1).
+
+  runtime-hal: Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &UsartConfig{Usart2,8N1,By16,115200}).
+  GD SPL: usart_disable; usart_baudrate_set(115200); usart_word_length_set(8BIT);
+          usart_stop_bit_set(1BIT); usart_parity_config(NONE);
+          usart_transmit_config(ENABLE); usart_receive_config(ENABLE); usart_enable.
+
+# Mode rationale: final_state. Same as the F1x0 / USART1 usart vectors: the SPL
+# config helpers clear-then-set (two writes per field) while runtime-hal's modify
+# is a single RMW, so write counts differ by coding style; the END STATE per
+# register is the correctness criterion. Expected end state:
+#   BAUD = 0x00000139   (USART2 @ 115200 on 36 MHz APB1)   +0x08
+#   CTL0 = 0x0000200C   (UEN bit13 | REN bit2 | TEN bit3)  +0x0C
+#   CTL1 = 0x00000000   (STB = 1 stop)                     +0x10
+# Headline assertion: BAUD = 0x139 on the 72 MHz tree, same divisor as USART1.
+mode: final_state
+
+implementations:
+  gd-spl/gd32f10x:
+    includes: [gd32f10x.h, gd32f10x_usart.h]
+    body: |
+      usart_disable(USART2);
+      usart_baudrate_set(USART2, 115200U);
+      usart_word_length_set(USART2, USART_WL_8BIT);
+      usart_stop_bit_set(USART2, USART_STB_1BIT);
+      usart_parity_config(USART2, USART_PM_NONE);
+      usart_transmit_config(USART2, USART_TRANSMIT_ENABLE);
+      usart_receive_config(USART2, USART_RECEIVE_ENABLE);
+      usart_enable(USART2);
+
+  runtime-hal/gd32f10x:
+    body: |
+      use runtime_hal::{Chip, McuDescriptor, AddrTable, PeriphLabel};
+      use runtime_hal::{AdcPath, ClockPath, GpioPath, IrqLayout, PageSize};
+      use runtime_hal::usart::Usart;
+      use runtime_hal::clock::ClockConfig;
+      use runtime_hal::config::{UsartConfig, UsartFrame, Oversampling};
+
+      fn chip() -> Chip {
+          let mut addrs = AddrTable::new();
+          addrs.set(PeriphLabel::Usart2, 0x4000_4800);
+          Chip::from_descriptor(McuDescriptor {
+              gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, flash_kib: 64,
+              adv_timers: 1, adc_count: 1,
+          })
+      }
+
+      pub fn body() {
+          let cfg = UsartConfig { usart: PeriphLabel::Usart2, tx: 0x1A, rx: 0x1B, baud: 115200,
+              frame: UsartFrame::EIGHT_N_ONE, oversampling: Oversampling::By16 };
+          let _ = Usart::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
+      }
