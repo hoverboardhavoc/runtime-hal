@@ -101,12 +101,66 @@ def toolchain_prefix() -> str:
     return bench_config().get("toolchain", {}).get("arm_prefix", "arm-none-eabi-")
 
 
+# The GD SPL source ships as the `third_party/GD32Firmware` submodule: a shallow pin of
+# github.com/CommunityGD32Cores/GD32Firmware (the public GD SPL mirror). Local dev and CI build
+# the SPL oracle from it, so no machine-local paths are needed. Per-family layout RELATIVE to the
+# submodule root: the SPL `Source` dir, the include dirs the compile needs (SPL Include, CMSIS GD
+# Include, CMSIS core), and the family-category define the SPL headers require.
+VENDORED_SPL_SUBMODULE = "third_party/GD32Firmware"
+_VENDORED_SPL_LAYOUT = {
+    "gd32f10x": {
+        "src_dir": "GD32F10x/GD32F10x_standard_peripheral/Source",
+        "include_dirs": [
+            "GD32F10x/GD32F10x_standard_peripheral/Include",
+            "GD32F10x/CMSIS/GD/GD32F10x/Include",
+            "GD32F10x/CMSIS",
+        ],
+        "chip_define": "GD32F10X_HD",
+    },
+    "gd32f1x0": {
+        "src_dir": "GD32F1x0/GD32F1x0_standard_peripheral/Source",
+        "include_dirs": [
+            "GD32F1x0/GD32F1x0_standard_peripheral/Include",
+            "GD32F1x0/CMSIS/GD/GD32F1x0/Include",
+            "GD32F1x0/CMSIS",
+        ],
+        "chip_define": "GD32F130_150",
+    },
+}
+
+
+def vendored_spl_root() -> Path:
+    """Root of the GD SPL submodule (`third_party/GD32Firmware`)."""
+    return repo_root() / VENDORED_SPL_SUBMODULE
+
+
+def spl_present() -> bool:
+    """True if the GD SPL submodule is checked out (the source the SPL oracle builds from).
+
+    Replaces the old "bench config present?" availability signal: the SPL source now ships as a
+    submodule, so the SPL-build path is available on CI too once
+    ``git submodule update --init --depth 1`` has run.
+    """
+    return (vendored_spl_root() / "GD32F10x").is_dir()
+
+
 def spl_layout(family: str) -> dict:
-    """Per-family GD SPL layout (src_dir, include_dirs, chip_define) from bench config."""
-    spl = bench_config().get("spl", {})
-    if family not in spl:
-        raise KeyError(
-            f"bench config has no [spl.{family}] section; add the GD SPL source "
-            f"paths for {family}."
-        )
-    return spl[family]
+    """Per-family GD SPL layout (src_dir, include_dirs, chip_define).
+
+    Defaults to the vendored ``third_party/GD32Firmware`` submodule, resolved repo-relative so no
+    machine-local paths are needed (local dev and CI share this). A bench config ``[spl.<family>]``
+    section, if present, overrides it (e.g. to point at a full local SPL tree).
+    """
+    if bench_config_present():
+        spl = bench_config().get("spl", {})
+        if family in spl:
+            return spl[family]
+    if family not in _VENDORED_SPL_LAYOUT:
+        raise KeyError(f"no vendored SPL layout for family {family!r}")
+    layout = _VENDORED_SPL_LAYOUT[family]
+    root = vendored_spl_root()
+    return {
+        "src_dir": str(root / layout["src_dir"]),
+        "include_dirs": [str(root / d) for d in layout["include_dirs"]],
+        "chip_define": layout["chip_define"],
+    }

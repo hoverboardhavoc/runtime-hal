@@ -19,7 +19,7 @@ needs_tools = pytest.mark.skipif(not _TOOLS, reason="cargo or arm-none-eabi not 
 # local GD SPL tree + bench/harness.toml. CI has neither (it runs the committed-golden compares
 # instead), so gate them on the bench config being present; they skip cleanly on CI.
 needs_spl = pytest.mark.skipif(
-    not _TOOLS or not paths.bench_config_present(),
+    not _TOOLS or not paths.spl_present(),
     reason="two-oracle compare needs the local GD SPL tree + bench/harness.toml",
 )
 

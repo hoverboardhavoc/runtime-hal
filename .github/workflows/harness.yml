@@ -5,13 +5,12 @@ name: harness
 # COMMITTED GD SPL goldens (compare --against-trace), plus the planted-bug
 # self-test and the pure-python harness tests.
 #
-# CI has no local GD32Firmware SPL tree and no bench/harness.toml, so the
-# SPL-rebuild + capture path cannot run here. The harness gates every SPL-build
-# test on the bench config being present (paths.bench_config_present()), so on
-# CI those tests skip cleanly while the runtime-hal-side build + against-trace
-# compare + self-test + pure-python tests all run. Regenerating goldens (which
-# DOES need the local SPL) is a separate manual/dispatch job below, expected to
-# run only on a machine that has the SPL tree and bench config.
+# The GD SPL source ships as the third_party/GD32Firmware submodule (a shallow pin of
+# the public CommunityGD32Cores/GD32Firmware mirror), so CI builds the SPL oracle the
+# same way local dev does. Every SPL-build test gates on the submodule being checked
+# out (paths.spl_present()), and a CI re-capture reproduces the committed goldens
+# byte-for-byte (same pinned SPL commit + arm-gcc release). A gitignored
+# bench/harness.toml can still override the SPL source to a full local tree.
 
 on:
   push:
@@ -23,7 +22,11 @@ jobs:
     name: runtime-hal trace vs committed goldens
     runs-on: ubuntu-latest
     steps:
+      # Check out with the GD SPL submodule (third_party/GD32Firmware, shallow) so the
+      # SPL oracle can be built and captured on CI, not just compared.
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # Rust thumbv7m target: the runtime-hal snippet crate is a no_std
       # thumbv7m-none-eabi staticlib.
@@ -31,14 +34,15 @@ jobs:
         with:
           targets: thumbv7m-none-eabi
 
-      # arm-none-eabi toolchain: used as the LINKER for the runtime-hal snippet
-      # staticlib (gcc links the staticlib + startup.S into the trace ELF). The
-      # SPL C build also uses it, but that path is gated off on CI. Pinned to the
-      # same Arm GNU Toolchain release line the local goldens were captured with.
+      # arm-none-eabi toolchain: LINKER for the runtime-hal snippet staticlib (gcc links
+      # the staticlib + startup.S into the trace ELF) AND the compiler for the GD SPL C
+      # build, now available via the submodule. Pinned to 15.2.Rel1, the exact Arm GNU
+      # Toolchain release the committed goldens were captured with, so a CI re-capture
+      # reproduces them byte-for-byte.
       - name: Install arm-none-eabi-gcc
         uses: carlosperate/arm-none-eabi-gcc-action@v1
         with:
-          release: "13.2.Rel1"
+          release: "15.2.Rel1"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -186,26 +190,31 @@ jobs:
           exit $fail
 
       # The planted-bug self-test (harness self-validation) + the pure-python and
-      # runtime-hal-side tests. The SPL-build tests skip because there is no
-      # bench config on CI.
+      # runtime-hal-side tests. The SPL-build tests now run too: they build the SPL
+      # from the third_party/GD32Firmware submodule (paths.spl_present()).
       - name: Harness pytest (self-test + against-trace + python)
         working-directory: harness
         run: ./.venv/bin/pytest -q -rs
 
-  # Manual/dispatch only: regenerate the GD SPL goldens. This NEEDS the local
-  # GD32Firmware SPL tree and a bench/harness.toml, neither of which exist on a
-  # stock CI runner, so it is expected to run on a self-hosted runner / bench
-  # machine. It is documented here so the golden-pin-bump path is discoverable;
-  # do not enable it on the PR path.
+  # Manual/dispatch only: regenerate the GD SPL goldens from the submodule. Uses the
+  # pinned third_party/GD32Firmware SPL + arm-gcc 15.2.Rel1, so it runs on a stock
+  # runner and reproduces the committed goldens byte-for-byte; review the resulting
+  # diff before committing a golden-pin bump. Not on the PR path.
   goldens:
-    name: regenerate GD SPL goldens (manual; needs local SPL)
+    name: regenerate GD SPL goldens (manual)
     if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, gd-spl]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7m-none-eabi
+      - name: Install arm-none-eabi-gcc
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: "15.2.Rel1"
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -215,7 +224,7 @@ jobs:
         run: |
           python -m venv .venv
           ./.venv/bin/pip install -e . pytest
-      - name: Recapture goldens (requires bench/harness.toml + local SPL)
+      - name: Recapture goldens from the submodule SPL
         working-directory: harness
         run: |
           set -euo pipefail

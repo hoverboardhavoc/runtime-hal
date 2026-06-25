@@ -25,7 +25,7 @@ gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2);
 _GCC = f"{paths.toolchain_prefix()}gcc"
 
 pytestmark = pytest.mark.skipif(
-    shutil.which(_GCC) is None or not paths.bench_config_present(),
+    shutil.which(_GCC) is None or not paths.spl_present(),
     reason="arm-none-eabi toolchain or local GD SPL bench config not available",
 )
 

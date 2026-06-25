@@ -1,0 +1,4 @@
+[submodule "third_party/GD32Firmware"]
+	path = third_party/GD32Firmware
+	url = https://github.com/CommunityGD32Cores/GD32Firmware
+	shallow = true

@@ -17,7 +17,7 @@ _TOOLS = shutil.which("cargo") and shutil.which(f"{paths.toolchain_prefix()}gcc"
 # The end-to-end engine tests build the GD SPL oracle, so they also need the
 # local SPL bench config (absent in CI, which compares against committed goldens).
 needs_tools = pytest.mark.skipif(
-    not _TOOLS or not paths.bench_config_present(),
+    not _TOOLS or not paths.spl_present(),
     reason="cargo/arm-none-eabi or local GD SPL bench config not available",
 )
 
