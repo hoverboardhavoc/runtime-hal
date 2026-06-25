@@ -55,7 +55,7 @@ implementations:
           addrs.set(PeriphLabel::Usart1, 0x4000_4400);
           let chip = Chip::from_descriptor(McuDescriptor {
               gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
-              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+              irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, flash_kib: 64, adv_timers: 1, adc_count: 1,
           });
           let pins = chip.gpioa().unwrap().split();
           let _ = Usart::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::Usart1,

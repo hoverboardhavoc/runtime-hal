@@ -24,7 +24,7 @@ pub fn body() {
     addrs.set(PeriphLabel::Gpioa, 0x4800_0000);
     let chip = Chip::from_descriptor(McuDescriptor {
         gpio: GpioPath::AhbCtlAfsel, clock: ClockPath::F1x0Rcu, adc: AdcPath::Single,
-        irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+        irq: IrqLayout::F1x0Grouped, addrs, flash_page: PageSize::K1, flash_kib: 64, adv_timers: 1, adc_count: 1,
     });
     let _ = chip.route_advanced_pwm_pin(0x08);
 }

@@ -68,7 +68,7 @@ implementations:
           addrs.set(PeriphLabel::Adc1, 0x4001_2800);
           let chip = Chip::from_descriptor(McuDescriptor {
               gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Dual,
-              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 2,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, flash_kib: 256, adv_timers: 1, adc_count: 2,
           });
           if let Ok(AdcCapability::Dual(d)) = chip.adc() {
               // ADC0 ch4, ADC1 ch5, 1.5-cycle sample time. Config-only (no EOC poll).

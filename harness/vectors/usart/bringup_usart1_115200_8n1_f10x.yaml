@@ -51,7 +51,7 @@ implementations:
           addrs.set(PeriphLabel::Usart1, 0x4000_4400);
           Chip::from_descriptor(McuDescriptor {
               gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
-              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, adv_timers: 1, adc_count: 1,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K1, flash_kib: 64, adv_timers: 1, adc_count: 1,
           })
       }
 

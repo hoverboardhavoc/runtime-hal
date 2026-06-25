@@ -33,7 +33,7 @@ implementations:
           addrs.set(PeriphLabel::I2c0, 0x4000_5400);
           Chip::from_descriptor(McuDescriptor {
               gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
-              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, flash_kib: 256, adv_timers: 1, adc_count: 1,
           })
       }
 

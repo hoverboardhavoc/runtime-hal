@@ -42,7 +42,7 @@ implementations:
           addrs.set(PeriphLabel::Usart1, 0x4000_4400);
           let chip = Chip::from_descriptor(McuDescriptor {
               gpio: GpioPath::ApbCrlCrh, clock: ClockPath::F10xRcc, adc: AdcPath::Single,
-              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, adv_timers: 1, adc_count: 1,
+              irq: IrqLayout::F10xSeparate, addrs, flash_page: PageSize::K2, flash_kib: 256, adv_timers: 1, adc_count: 1,
           });
           let pins = chip.gpioa().unwrap().split();
           let _ = Usart::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::Usart1,
