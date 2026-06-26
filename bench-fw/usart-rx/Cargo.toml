@@ -3,12 +3,14 @@ name = "bench-fw-usart-rx"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "On-silicon S0 validator for the multi-instance USART RX spec: a SINGLE F103 bluepill with an intra-board cross-wire (PA2->PB11, PB10->PA3), driving the existing polled Usart path on both USART1 (PA2/PA3) and the module USART (Usart2 = ST USART3, PB10/PB11) at 115200 8N1. Loops a known frame each direction, pulses PB9 on a full pass, and publishes a fixed RAM result block readable over SWD. ZERO new library code."
+description = "On-silicon S0+S1 validator for the multi-instance USART RX spec: a SINGLE F103 bluepill with an intra-board cross-wire (PA2->PB11, PB10->PA3). S0 drives the polled Usart path on both USART1 (PA2/PA3) and the module USART (Usart2 = GD USART2, PB10/PB11). S1 drives interrupt-buffered BufferedRx on both instances: the module receives via its own slot+vector (IRQ 39), USART1 regresses, and both run simultaneously without cross-talk. Pulses PB9 on a full pass and publishes a fixed RAM result block readable over SWD."
 
 [dependencies]
 # runtime-hal in its normal (real volatile MMIO, no_std) build: NOT the `mock` feature.
 runtime-hal = { path = "../..", default-features = false }
 embedded-hal = "1.0"
+# BufferedRx's ring is an application-owned heapless SPSC queue (DECISIONS.md #10).
+heapless = "0.8"
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"

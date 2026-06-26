@@ -17,8 +17,8 @@ use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, 
 use crate::dma::{DmaRxMap, DMA0_BASE};
 use crate::error::{DescriptorError, UsartError};
 use crate::irq::{
-    install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ, F1X0_DMA_CH3_4_IRQ,
-    F1X0_USART1_IRQ,
+    install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ, F10X_USART_MODULE_IRQ,
+    F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ,
 };
 use crate::reg::{mock, Reg32};
 use crate::usart::Usart;
@@ -27,6 +27,10 @@ use std::sync::MutexGuard;
 
 /// The bench USART1 base in the mock window (the offsets within it are what assertions key on).
 const USART_BASE: u32 = 0x4000_4400;
+/// The BLE-module USART base (HAL `Usart2` = GD USART2, the F10x second instance). Distinct from
+/// `USART_BASE` in the mock window (idx 0x4800 vs 0x4400), so the two slots' register spaces never
+/// alias: this is what the two-instances-live coexistence case keys on.
+const MODULE_BASE: u32 = 0x4000_4800;
 /// A non-zero RAM-table address for `install_mock` (stands in for the section).
 const RAM_ADDR: u32 = 0x2000_4000;
 
@@ -78,6 +82,7 @@ fn f1x0() -> Fam {
 fn chip_for(fam: &Fam) -> Chip {
     let mut addrs = AddrTable::new();
     addrs.set(PeriphLabel::Usart1, USART_BASE);
+    addrs.set(PeriphLabel::Usart2, MODULE_BASE);
     addrs.set(PeriphLabel::Rcu, 0x4002_1000);
     Chip::from_descriptor(McuDescriptor {
         gpio: if fam.clock == ClockPath::F1x0Rcu {
@@ -124,14 +129,43 @@ fn install<const N: usize>(fam: &Fam) -> BufferedRx {
     let chip = chip_for(fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
     let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
-    let rx = BufferedRx::new(&chip, usart, storage).unwrap();
+    let rx = BufferedRx::new(&chip, usart, PeriphLabel::Usart1, storage).unwrap();
     install_mock(fam.irq, RAM_ADDR);
     rx
 }
 
 fn stage_byte(fam: &Fam, b: u8) {
-    Reg32::new(USART_BASE, fam.data).write(b as u32);
-    Reg32::new(USART_BASE, fam.stat).write(RBNE);
+    stage_byte_at(USART_BASE, fam, b);
+}
+
+/// Stage a ready RBNE byte at an arbitrary USART base (so the module instance's register space, at
+/// `MODULE_BASE`, can be driven independently of USART1's).
+fn stage_byte_at(base: u32, fam: &Fam, b: u8) {
+    Reg32::new(base, fam.data).write(b as u32);
+    Reg32::new(base, fam.stat).write(RBNE);
+}
+
+/// A `UsartConfig` for the BLE-module USART (HAL `Usart2`): the F10x-only second instance. `bring_up`
+/// uses only `usart`/`baud`/`frame`/`oversampling` (not the pin bytes), so the placeholder PB10/PB11
+/// values are inert here.
+fn module_cfg() -> UsartConfig {
+    UsartConfig {
+        usart: PeriphLabel::Usart2,
+        tx: 0x0A,
+        rx: 0x0B,
+        baud: 115_200,
+        frame: UsartFrame::EIGHT_N_ONE,
+        oversampling: Oversampling::By16,
+    }
+}
+
+/// Bring up a module-USART `BufferedRx` (slot 1) over a leaked `'static` ring of capacity word `N`.
+/// Does NOT flip the RAM table (callers that need `dispatch` flip it themselves, so a coexistence case
+/// can install both instances before one flip).
+fn bring_up_module<const N: usize>(chip: &Chip) -> BufferedRx {
+    let usart = Usart::bring_up(chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
+    let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
+    BufferedRx::new(chip, usart, PeriphLabel::Usart2, storage).unwrap()
 }
 
 fn fire(fam: &Fam) {
@@ -300,6 +334,124 @@ fn b5_line_error_is_cleared_surfaced_and_rx_recovers() {
             assert_eq!(&buf[..n], &[0x5A], "RX still alive after the line error");
         }
     }
+}
+
+// ============================================================================================
+// Second-instance (module USART, F10x) cases B14-B17 (uart-rx-multi-instance.md S1)
+// ============================================================================================
+//
+// The interrupt-path generalization: a BufferedRx can target the BLE-module USART (HAL `Usart2`),
+// which has its OWN static slot (index 1) and its OWN F10x vector (`USART2_IRQn` = 39,
+// `F10X_USART_MODULE_IRQ`), independent of USART1's slot 0 / vector 38. The module instance is
+// F10x-only; constructing it on F1x0 (or naming any other label) fails loud.
+
+// --- B14: the module instance uses its own slot, driven by its own vector (IRQ 39) ------------
+
+#[test]
+fn b14_module_instance_uses_its_own_slot_and_vector() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let mut rx = bring_up_module::<8>(&chip);
+    install_mock(fam.irq, RAM_ADDR);
+
+    // Stage bytes in the MODULE register space and fire the MODULE vector (39), never USART1's (38).
+    let pattern = [0x71u8, 0x72, 0x73];
+    for &b in &pattern {
+        stage_byte_at(MODULE_BASE, &fam, b);
+        // SAFETY: the RAM table is installed and slot 39 holds the module RX handler.
+        unsafe { mock_vtor::dispatch(F10X_USART_MODULE_IRQ) };
+    }
+    assert!(
+        rx.ready(),
+        "the module slot buffered bytes after its ISR ran"
+    );
+
+    let mut buf = [0u8; 8];
+    let n = rx.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n],
+        &pattern,
+        "module slot received its own bytes via IRQ 39"
+    );
+}
+
+// --- B15: two instances live at once, no slot/vector collision (coexistence) ------------------
+
+#[test]
+fn b15_two_instances_live_no_slot_or_vector_collision() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+
+    // USART1 BufferedRx (slot 0, vector 38) and module BufferedRx (slot 1, vector 39), both live.
+    let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let s1: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let mut rx1 = BufferedRx::new(&chip, u1, PeriphLabel::Usart1, s1).unwrap();
+    let mut rxm = bring_up_module::<8>(&chip);
+    install_mock(fam.irq, RAM_ADDR);
+
+    // Drive USART1 (byte in the USART1 space + the USART1 vector), then the module (a DIFFERENT byte
+    // in the module space + the module vector).
+    stage_byte_at(USART_BASE, &fam, 0xA1);
+    // SAFETY: table installed; slot 38 holds the USART1 RX handler.
+    unsafe { mock_vtor::dispatch(F10X_USART1_IRQ) };
+    stage_byte_at(MODULE_BASE, &fam, 0xB2);
+    // SAFETY: table installed; slot 39 holds the module RX handler.
+    unsafe { mock_vtor::dispatch(F10X_USART_MODULE_IRQ) };
+
+    // Each receiver holds exactly its own byte: the ISRs filled different slots, no cross-talk.
+    let mut b1 = [0u8; 4];
+    let n1 = rx1.read(&mut b1).unwrap();
+    assert_eq!(&b1[..n1], &[0xA1], "USART1 slot got only its own byte");
+    let mut bm = [0u8; 4];
+    let nm = rxm.read(&mut bm).unwrap();
+    assert_eq!(&bm[..nm], &[0xB2], "module slot got only its own byte");
+
+    // And neither vector leaked into the other's ring: a re-read of each is the empty case.
+    assert_eq!(
+        rx1.read(&mut b1),
+        Ok(0),
+        "USART1 ring drained, no stray byte"
+    );
+    assert_eq!(
+        rxm.read(&mut bm),
+        Ok(0),
+        "module ring drained, no stray byte"
+    );
+}
+
+// --- B16: the module instance is F10x-only; F1x0 fails loud ------------------------------------
+
+#[test]
+fn b16_module_instance_on_f1x0_is_unsupported() {
+    let fam = f1x0();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
+    let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    assert_eq!(
+        BufferedRx::new(&chip, usart, PeriphLabel::Usart2, storage).map(|_| ()),
+        Err(DescriptorError::Unsupported),
+        "the module USART is F10x-only; F1x0 returns DescriptorError (no silent untested mapping)"
+    );
+}
+
+// --- B17: a selector that is neither USART1 nor the module USART is rejected -------------------
+
+#[test]
+fn b17_unknown_instance_selector_is_rejected() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    // USART0 is a real label but not a supported buffered-RX instance (only USART1 + the module are).
+    assert_eq!(
+        BufferedRx::new(&chip, usart, PeriphLabel::Usart0, storage).map(|_| ()),
+        Err(DescriptorError::UnknownSelector),
+        "an unsupported instance selector fails loud, not a silent wrong mapping"
+    );
 }
 
 // ============================================================================================

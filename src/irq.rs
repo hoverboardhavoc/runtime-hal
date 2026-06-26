@@ -111,6 +111,12 @@ pub const F1X0_USART1_IRQ: usize = 28;
 /// F10x `USART1_IRQn` (`gd32f10x.h:159`). Note the SAME logical USART1 sits on a DIFFERENT vector
 /// number per family (28 vs 38), so the layout-specific `build_table` arm picks the right slot.
 pub const F10X_USART1_IRQ: usize = 38;
+/// F10x `USART2_IRQn` (`gd32f10x.h:160`): the BLE-module USART (HAL [`crate::addr::PeriphLabel::Usart2`]
+/// = GD USART2 register block at 0x4000_4800, PB10/PB11) on the F10x master. The interrupt-buffered RX's
+/// SECOND instance routes through this vector. **F10x-only**: the module USART does not exist on F1x0
+/// (the `uart-rx-multi-instance.md` family scope), so there is no F1x0 module-USART IRQ const and no
+/// module slot in the F1x0 `build_table` arm.
+pub const F10X_USART_MODULE_IRQ: usize = 39;
 
 /// F10x `DMA0_Channel5_IRQn` (`gd32f10x.h:135`): on F10x the DMA channel carrying `USART1_RX` (Ch5)
 /// has its OWN vector (separate-vector layout). The DMA-ring RX ([`crate::usart_rx::RingBufferedRx`])
@@ -295,6 +301,45 @@ pub fn call_usart_rx_handler() {
     f();
 }
 
+// --- Static USART RX handler registration for the SECOND instance (module USART, F10x) ----------
+//
+// The module USART's RX vector (F10x `USART2_IRQn` = 39, `module_usart_rx_isr`) routes through this
+// SECOND, fully-independent handler pair so two interrupt-buffered receivers (USART1 + the module
+// USART) can be live at once with no vector collision (`uart-rx-multi-instance.md` items 1-2). Same
+// shape as the USART1 pair above; the body (its own static RX slot) lives in [`crate::usart_rx`].
+
+/// The no-op default that guards the module-USART RX vector before its handler is registered (mirrors
+/// [`default_usart_rx_handler`]).
+pub extern "C" fn default_usart_rx_handler2() {}
+
+/// The registered module-USART RX handler pointer. `AtomicPtr`, starts at the no-op default.
+static USART_RX_HANDLER2: AtomicPtr<()> = AtomicPtr::new(default_usart_rx_handler2 as *mut ());
+
+/// Register the module-USART interrupt-buffered RX `'static` ISR body. Called by
+/// [`crate::usart_rx::BufferedRx::new`] when the second (module) instance is brought up, before it
+/// unmasks the module USART IRQ. Symmetric with [`register_usart_rx_handler`].
+#[inline]
+pub fn register_usart_rx_handler2(handler: ControlHandler) {
+    USART_RX_HANDLER2.store(handler as *mut (), Ordering::Release);
+}
+
+/// Reset the module-USART RX handler back to the no-op default (host tests / clean teardown).
+#[inline]
+pub fn clear_usart_rx_handler2() {
+    USART_RX_HANDLER2.store(default_usart_rx_handler2 as *mut (), Ordering::Release);
+}
+
+/// Call the registered module-USART RX handler (or the no-op default). The `module_usart_rx_isr` slot
+/// calls through this.
+#[inline]
+pub fn call_usart_rx_handler2() {
+    let p = USART_RX_HANDLER2.load(Ordering::Acquire);
+    // SAFETY: `p` is always either `default_usart_rx_handler2` or a `'static` fn the RX bring-up
+    // registered via `register_usart_rx_handler2`; both are valid `extern "C" fn()` pointers.
+    let f: ControlHandler = unsafe { core::mem::transmute::<*mut (), ControlHandler>(p) };
+    f();
+}
+
 // --- Static DMA-RX handler registration (G-DMA-UART Gate B) ------------------------------------
 //
 // The DMA-channel vector that carries USART1_RX (its own vector on F10x, the grouped Ch3/4 vector on
@@ -397,6 +442,9 @@ pub fn build_table(layout: IrqLayout) -> [usize; MAX_VECTORS] {
             t[SYSTEM_VECTORS + F10X_EXTI10_15_IRQ] = handler_addr(exti_isr);
             // The interrupt-buffered RX vector (USART1 = IRQ 38 on F10x).
             t[SYSTEM_VECTORS + F10X_USART1_IRQ] = handler_addr(usart1_rx_isr);
+            // The SECOND interrupt-buffered RX vector: the BLE-module USART (GD USART2 = IRQ 39),
+            // F10x-only (the F1x0 arm installs no module-USART slot).
+            t[SYSTEM_VECTORS + F10X_USART_MODULE_IRQ] = handler_addr(module_usart_rx_isr);
             // The DMA-ring RX vector: separate DMA0 Ch5 = IRQ 16 on F10x.
             t[SYSTEM_VECTORS + F10X_DMA0_CH5_IRQ] = handler_addr(dma_rx_isr);
         }
@@ -455,6 +503,14 @@ extern "C" fn adc_isr() {
 /// a safe no-op.
 extern "C" fn usart1_rx_isr() {
     call_usart_rx_handler();
+}
+
+/// The module-USART RX vector body (F10x `USART2_IRQn` = 39): route to the registered second-instance
+/// interrupt-buffered RX handler, mirroring [`usart1_rx_isr`]. **F10x-only** (the module USART does
+/// not exist on F1x0), so this slot is installed by [`build_table`]'s F10x arm and never its F1x0 arm.
+/// Until the handler is registered this is a safe no-op.
+extern "C" fn module_usart_rx_isr() {
+    call_usart_rx_handler2();
 }
 
 /// The DMA-RX vector body (F10x `DMA0_Channel5` IRQ 16 / F1x0 grouped `DMA_Channel3_4` IRQ 11): route

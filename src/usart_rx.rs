@@ -10,10 +10,10 @@
 //! The USART RX vector is an argument-less `extern "C" fn` (it reaches the ISR body via
 //! [`crate::irq::call_usart_rx_handler`]), yet the body needs the USART registers and the ring. The
 //! crate already solved this for the control loop (a static handler pointer, DECISIONS.md #7) and the
-//! grouped demux (a static base). This module uses the same shape: a single `static` RX context
-//! ([`RX_USART1`]) holds the USART base + the family bit + the ring's queue pointer + the
-//! monomorphised push, and is inert until [`BufferedRx::new`] installs it. The ISR does NO per-family
-//! branching beyond reading the one already-resolved family bit (DECISIONS.md #4).
+//! grouped demux (a static base). This module uses the same shape: a `static` RX context (a slot in
+//! [`RX_SLOTS`], one per instance) holds the USART base + the family bit + the ring's queue pointer +
+//! the monomorphised push, and is inert until [`BufferedRx::new`] installs it. The ISR does NO
+//! per-family branching beyond reading the one already-resolved family bit (DECISIONS.md #4).
 //!
 //! # Why the ring is reconstructed per access
 //!
@@ -28,7 +28,9 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 use heapless::spsc::{Consumer, Producer, Queue};
 
+use crate::addr::PeriphLabel;
 use crate::chip::Chip;
+use crate::descriptor::ClockPath;
 // `IrqLayout` is used only by the NVIC-IRQ-number helpers, which are hardware-build-only.
 #[cfg(not(feature = "mock"))]
 use crate::descriptor::IrqLayout;
@@ -36,7 +38,7 @@ use crate::error::{DescriptorError, UsartError};
 use crate::irq;
 use crate::usart::Usart;
 
-// --- the static RX context (one per supported instance; the bench needs only USART1) ----------
+// --- the static RX contexts (one independent slot per supported instance: USART1 + module) -----
 
 /// Sticky line-error codes stored in [`RxSlot::line_error`] (0 = none). The buffered path surfaces a
 /// line error through the next [`BufferedRx::read`], the way the polled path surfaces it inline.
@@ -45,9 +47,10 @@ const ERR_FRAMING: u8 = 1;
 const ERR_PARITY: u8 = 2;
 const ERR_OVERRUN: u8 = 3;
 
-/// The single static RX context for USART1. Every field is an atomic, so the whole `static` is
-/// `Sync` and the ISR reads it lock-free. Inert (`installed == false`, `base == 0`) until
-/// [`BufferedRx::new`] installs it, exactly like the grouped demux's base is 0 until set.
+/// One static RX context (the bring-up of a [`BufferedRx`] installs one per instance; see
+/// [`RX_SLOTS`]). Every field is an atomic, so the whole `static` is `Sync` and the ISR reads it
+/// lock-free. Inert (`installed == false`, `base == 0`) until [`BufferedRx::new`] installs it,
+/// exactly like the grouped demux's base is 0 until set.
 struct RxSlot {
     /// `true` once `new` has installed a context; the ISR is a no-op before this.
     installed: AtomicBool,
@@ -85,8 +88,57 @@ impl RxSlot {
     }
 }
 
-/// The USART1 RX context. One instance: the bench (and current firmware) only buffers USART1.
-static RX_USART1: RxSlot = RxSlot::new();
+/// The static RX contexts, one independent slot per supported buffered-RX instance: index 0 = USART1
+/// (family-generic), index 1 = the BLE-module USART (HAL [`PeriphLabel::Usart2`], F10x-only). Two
+/// [`BufferedRx`] may be live at once (USART1 + module), so the slots must not share state
+/// (`uart-rx-multi-instance.md` item 1). Each slot is inert until a `new` installs it.
+static RX_SLOTS: [RxSlot; 2] = [RxSlot::new(), RxSlot::new()];
+
+/// Which buffered-RX instance a receiver targets, resolved from the caller's [`PeriphLabel`] selector.
+/// Selects the static RX slot, the NVIC vector, and (S2) the DMA channel. The module USART is F10x-only
+/// (`uart-rx-multi-instance.md` family scope); any other selector, or the module on F1x0, fails loud in
+/// [`resolve_instance`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RxInstance {
+    /// USART1 (HAL [`PeriphLabel::Usart1`], base 0x4000_4400): slot 0, the family-generic first instance.
+    Usart1,
+    /// The BLE-module USART (HAL [`PeriphLabel::Usart2`], base 0x4000_4800, F10x-only): slot 1.
+    Module,
+}
+
+impl RxInstance {
+    /// The static-slot index for this instance (`RX_SLOTS[..]`).
+    #[inline]
+    const fn slot_index(self) -> usize {
+        match self {
+            RxInstance::Usart1 => 0,
+            RxInstance::Module => 1,
+        }
+    }
+
+    /// The `'static` RX slot for this instance.
+    #[inline]
+    fn slot(self) -> &'static RxSlot {
+        &RX_SLOTS[self.slot_index()]
+    }
+}
+
+/// Resolve a [`PeriphLabel`] selector to a supported [`RxInstance`] for `chip`'s family, fail-loud
+/// otherwise (`uart-rx-multi-instance.md` item 4):
+/// - `Usart1` -> the family-generic first instance.
+/// - `Usart2` on F10x -> the BLE-module instance; on F1x0 -> [`DescriptorError::Unsupported`] (the
+///   module USART is F10x-only; no F1x0 board validates its vector/channel).
+/// - anything else -> [`DescriptorError::UnknownSelector`].
+fn resolve_instance(chip: &Chip, selector: PeriphLabel) -> Result<RxInstance, DescriptorError> {
+    match selector {
+        PeriphLabel::Usart1 => Ok(RxInstance::Usart1),
+        PeriphLabel::Usart2 => match chip.clock() {
+            ClockPath::F10xRcc => Ok(RxInstance::Module),
+            ClockPath::F1x0Rcu => Err(DescriptorError::Unsupported),
+        },
+        _ => Err(DescriptorError::UnknownSelector),
+    }
+}
 
 // --- monomorphised ring access (the type erasure boundary) ------------------------------------
 
@@ -117,12 +169,19 @@ fn ready_impl<const N: usize>(q: *mut ()) -> bool {
     cons.ready()
 }
 
-// --- the ISR body (registered by `new`, reached via the USART1 vector slot) -------------------
+// --- the ISR bodies (one per instance, each reached via its own vector slot) -------------------
 
-/// The registered ISR body: service the USART1 RX context. Reached from the `usart1_rx_isr` vector
-/// slot through [`crate::irq::call_usart_rx_handler`].
+/// The registered ISR body for USART1 (slot 0). Reached from the `usart1_rx_isr` vector slot through
+/// [`crate::irq::call_usart_rx_handler`].
 extern "C" fn rx_irq_handler() {
-    on_usart_rx_irq(&RX_USART1);
+    on_usart_rx_irq(&RX_SLOTS[0]);
+}
+
+/// The registered ISR body for the module USART (slot 1, F10x-only). Reached from the
+/// `module_usart_rx_isr` vector slot through [`crate::irq::call_usart_rx_handler2`]. Independent of
+/// [`rx_irq_handler`] so the two instances never touch each other's slot (item 1/2 coexistence).
+extern "C" fn module_rx_irq_handler() {
+    on_usart_rx_irq(&RX_SLOTS[1]);
 }
 
 /// The interrupt-buffered RX ISR logic, factored out so a host test drives it against the mock
@@ -210,8 +269,8 @@ fn decode_error(code: u8) -> UsartError {
 /// [`BufferedRx`] (with a real ring `queue`/`push`) and [`RingBufferedRx`] (with null `queue`/`push`:
 /// under DMA the ISR's RBNE drain never runs, only its IDLE + line-error path) use this, so the IDLE
 /// latch and line-error sticky live in one place (section 3.2 / 5.3).
-fn install_usart_ctx(usart: &Usart, queue: *mut (), push: *mut ()) {
-    let slot = &RX_USART1;
+fn install_usart_ctx(usart: &Usart, instance: RxInstance, queue: *mut (), push: *mut ()) {
+    let slot = instance.slot();
     slot.base.store(usart.base(), Ordering::Release);
     slot.is_f1x0.store(usart.is_f1x0(), Ordering::Release);
     slot.queue.store(queue, Ordering::Release);
@@ -220,17 +279,28 @@ fn install_usart_ctx(usart: &Usart, queue: *mut (), push: *mut ()) {
     slot.idle_seen.store(false, Ordering::Release);
     slot.line_error.store(ERR_NONE, Ordering::Release);
     slot.installed.store(true, Ordering::Release);
-    irq::register_usart_rx_handler(rx_irq_handler);
+    // Register the ISR body for THIS instance's vector (each instance has its own handler pair, so the
+    // two slots never collide). The module USART is F10x-only, so its handler only ever fires there.
+    match instance {
+        RxInstance::Usart1 => irq::register_usart_rx_handler(rx_irq_handler),
+        RxInstance::Module => irq::register_usart_rx_handler2(module_rx_irq_handler),
+    }
 }
 
-/// The USART1 IRQ number for `chip`'s family (the vector differs: 28 on F1x0, 38 on F10x). Used only
-/// to drive the NVIC, so it is hardware-build-only.
+/// The USART RX IRQ number for `chip`'s family + `instance`. The vector differs by family for USART1
+/// (28 on F1x0, 38 on F10x) and is the F10x-only module vector (39) for the module instance (the module
+/// USART cannot exist on F1x0, so its IRQ is unconditionally the F10x one). Hardware-build-only (drives
+/// the NVIC).
 #[cfg(not(feature = "mock"))]
 #[inline]
-fn usart_irq_num(chip: &Chip) -> usize {
-    match chip.irq() {
-        IrqLayout::F1x0Grouped => irq::F1X0_USART1_IRQ,
-        IrqLayout::F10xSeparate => irq::F10X_USART1_IRQ,
+fn usart_irq_num(chip: &Chip, instance: RxInstance) -> usize {
+    match instance {
+        RxInstance::Usart1 => match chip.irq() {
+            IrqLayout::F1x0Grouped => irq::F1X0_USART1_IRQ,
+            IrqLayout::F10xSeparate => irq::F10X_USART1_IRQ,
+        },
+        // `resolve_instance` only yields `Module` on F10x, so its vector is always the F10x module IRQ.
+        RxInstance::Module => irq::F10X_USART_MODULE_IRQ,
     }
 }
 
@@ -289,6 +359,9 @@ pub struct BufferedRx {
     /// they live in non-generic fields set by the generic `new`).
     pop: fn(*mut ()) -> Option<u8>,
     ready: fn(*mut ()) -> bool,
+    /// This receiver's `'static` RX slot (USART1 or the module USART): `read` / `take_idle` reference
+    /// it directly, so two `BufferedRx` on different instances never touch each other's state.
+    slot: &'static RxSlot,
 }
 
 impl BufferedRx {
@@ -302,8 +375,13 @@ impl BufferedRx {
     pub fn new<const N: usize>(
         chip: &Chip,
         usart: Usart,
+        instance: PeriphLabel,
         storage: &'static mut Queue<u8, N>,
     ) -> Result<BufferedRx, DescriptorError> {
+        // Resolve the instance selector to a slot + vector (fail-loud on F1x0 module / unknown label),
+        // before touching any hardware (`uart-rx-multi-instance.md` item 4).
+        let inst = resolve_instance(chip, instance)?;
+
         // The type erasure reconstructs the producer/consumer from the queue pointer, which is sound
         // only because a `heapless` producer/consumer is exactly one pointer. Pin that here.
         assert_eq!(
@@ -314,23 +392,24 @@ impl BufferedRx {
 
         let queue = storage as *mut Queue<u8, N> as *mut ();
 
-        // 1. Install the shared RX context (base + family bit + this ring's queue + monomorphised push)
-        //    and register the ISR body the USART1 vector routes to.
-        install_usart_ctx(&usart, queue, push_impl::<N> as *mut ());
+        // 1. Install this instance's RX slot (base + family bit + this ring's queue + monomorphised
+        //    push) and register the ISR body the instance's vector routes to.
+        install_usart_ctx(&usart, inst, queue, push_impl::<N> as *mut ());
 
         // 2. Enable the RX interrupt sources on the USART.
         usart.listen_rbne();
         usart.listen_idle();
 
-        // 3. Unmask the USART IRQ in the NVIC (hardware only).
+        // 3. Unmask this instance's USART IRQ in the NVIC (hardware only).
         let _ = chip;
         #[cfg(not(feature = "mock"))]
-        nvic_unmask(usart_irq_num(chip));
+        nvic_unmask(usart_irq_num(chip, inst));
 
         Ok(BufferedRx {
             queue,
             pop: pop_impl::<N>,
             ready: ready_impl::<N>,
+            slot: inst.slot(),
         })
     }
 
@@ -348,7 +427,7 @@ impl BufferedRx {
     /// [`take_idle`](BufferedRx::take_idle), so a drain-then-check poll loop cannot race the boundary
     /// away (the caller owns when the latch is consumed, not the byte path).
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
-        let slot = &RX_USART1;
+        let slot = self.slot;
 
         // Surface a sticky condition first (overflow as Overrun, then any line error), clearing it.
         if slot.overflow.swap(false, Ordering::AcqRel) {
@@ -394,7 +473,7 @@ impl BufferedRx {
     /// the same entry as the final bytes (or between two polls) is still observed on the next
     /// `take_idle`, not silently eaten.
     pub fn take_idle(&self) -> bool {
-        RX_USART1.idle_seen.swap(false, Ordering::AcqRel)
+        self.slot.idle_seen.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -465,7 +544,14 @@ impl RingBufferedRx {
 
         // Install the shared RX context (no SPSC ring under DMA: the ISR's RBNE drain never runs, since
         // the DMA controller's RDATA read auto-clears RBNE; only its IDLE + line-error path is used).
-        install_usart_ctx(&usart, core::ptr::null_mut(), core::ptr::null_mut());
+        // The DMA-ring path is USART1-only in this slice (the DMA channel resolver is the S2 work), so
+        // it always installs slot 0.
+        install_usart_ctx(
+            &usart,
+            RxInstance::Usart1,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
         // Install the DMA-RX context (wrap counter) + register the DMA ISR body.
         crate::dma::install(&map);
 
@@ -474,7 +560,7 @@ impl RingBufferedRx {
         #[cfg(not(feature = "mock"))]
         {
             nvic_unmask(dma_irq_num(chip));
-            nvic_unmask(usart_irq_num(chip));
+            nvic_unmask(usart_irq_num(chip, RxInstance::Usart1));
         }
 
         Ok(RingBufferedRx {
@@ -531,8 +617,9 @@ impl RingBufferedRx {
     ///   overwritten before being read) returns [`UsartError::Overrun`] and resyncs the cursor to the
     ///   freshest position so subsequent reads continue (section 5.2).
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
-        // Line error first (fail-loud): stop reception and surface; caller re-`new`s.
-        let code = RX_USART1.line_error.swap(ERR_NONE, Ordering::AcqRel);
+        // Line error first (fail-loud): stop reception and surface; caller re-`new`s. The DMA-ring path
+        // is USART1-only (slot 0) in this slice.
+        let code = RX_SLOTS[0].line_error.swap(ERR_NONE, Ordering::AcqRel);
         if code != ERR_NONE {
             self.map.disable();
             return Err(decode_error(code));
@@ -566,23 +653,26 @@ impl RingBufferedRx {
     /// [`BufferedRx::take_idle`]: the IDLE boundary is delivered by the shared USART IRQ (section 5.3),
     /// so the DMA-ring reader uses the same latch to know a variable-length frame just ended.
     pub fn take_idle(&self) -> bool {
-        RX_USART1.idle_seen.swap(false, Ordering::AcqRel)
+        RX_SLOTS[0].idle_seen.swap(false, Ordering::AcqRel)
     }
 }
 
-/// Reset the static RX context and the registered handler (host-test teardown between cases).
+/// Reset every static RX slot and both registered handlers (host-test teardown between cases). Both
+/// instances' slots are reset so a case that installed the module slot cannot leak into the next.
 #[cfg(feature = "mock")]
 pub fn reset_for_test() {
-    let slot = &RX_USART1;
-    slot.installed.store(false, Ordering::Release);
-    slot.base.store(0, Ordering::Release);
-    slot.is_f1x0.store(false, Ordering::Release);
-    slot.queue.store(core::ptr::null_mut(), Ordering::Release);
-    slot.push.store(core::ptr::null_mut(), Ordering::Release);
-    slot.overflow.store(false, Ordering::Release);
-    slot.idle_seen.store(false, Ordering::Release);
-    slot.line_error.store(ERR_NONE, Ordering::Release);
+    for slot in &RX_SLOTS {
+        slot.installed.store(false, Ordering::Release);
+        slot.base.store(0, Ordering::Release);
+        slot.is_f1x0.store(false, Ordering::Release);
+        slot.queue.store(core::ptr::null_mut(), Ordering::Release);
+        slot.push.store(core::ptr::null_mut(), Ordering::Release);
+        slot.overflow.store(false, Ordering::Release);
+        slot.idle_seen.store(false, Ordering::Release);
+        slot.line_error.store(ERR_NONE, Ordering::Release);
+    }
     irq::clear_usart_rx_handler();
+    irq::clear_usart_rx_handler2();
 }
 
 #[cfg(test)]
