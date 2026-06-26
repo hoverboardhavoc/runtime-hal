@@ -17,8 +17,8 @@ use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, 
 use crate::dma::{DmaRxMap, DMA0_BASE};
 use crate::error::{DescriptorError, UsartError};
 use crate::irq::{
-    install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ, F10X_USART_MODULE_IRQ,
-    F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ,
+    install_mock, mock_vtor, F10X_DMA0_CH2_IRQ, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ,
+    F10X_USART_MODULE_IRQ, F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ,
 };
 use crate::reg::{mock, Reg32};
 use crate::usart::Usart;
@@ -509,7 +509,7 @@ fn install_ring(fam: &Fam, len: usize) -> (RingBufferedRx, u8, *mut u8) {
     let buf: &'static mut [u8] = vec![0u8; len].leak();
     let ptr = buf.as_mut_ptr();
     let ch = DmaRxMap::usart1_rx(&chip).channel;
-    let rx = RingBufferedRx::new(&chip, usart, buf).unwrap();
+    let rx = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf).unwrap();
     install_mock(fam.irq, RAM_ADDR);
     (rx, ch, ptr)
 }
@@ -553,7 +553,7 @@ fn b7_channel_programming_and_denr() {
         let buf: &'static mut [u8] = vec![0u8; 32].leak();
         let maddr = buf.as_ptr() as u32;
         let ch = DmaRxMap::usart1_rx(&chip).channel;
-        let _rx = RingBufferedRx::new(&chip, usart, buf).unwrap();
+        let _rx = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf).unwrap();
 
         // PADDR = the RDATA address; MADDR = buffer ptr; CNT = len.
         assert_eq!(
@@ -725,7 +725,7 @@ fn b10_grouped_demux_routes_ch4_not_ch3() {
     // Exactly one wrap counted (Ch4's), and INTC cleared ONLY Ch4's bits (GIF+FTFIF at 4*4): Ch3 was
     // not serviced and no Ch3 event was invented.
     assert_eq!(
-        crate::dma::wraps(),
+        crate::dma::wraps(0),
         1,
         "only the Ch4 full-transfer was counted"
     );
@@ -753,7 +753,7 @@ fn b11_self_check_failure_arms_nothing() {
 
     assert!(
         matches!(
-            RingBufferedRx::new(&chip, usart, buf),
+            RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf),
             Err(DescriptorError::SelfCheckFailed)
         ),
         "a channel that does not respond fails loud"
@@ -801,7 +801,7 @@ fn b12_line_error_stops_reception_and_re_new_rearms() {
     let chip = chip_for(&fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
     let buf2: &'static mut [u8] = vec![0u8; 32].leak();
-    let _rx2 = RingBufferedRx::new(&chip, usart, buf2).unwrap();
+    let _rx2 = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf2).unwrap();
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
         CHEN,
@@ -821,5 +821,144 @@ fn b12_line_error_stops_reception_and_re_new_rearms() {
         Reg32::new(USART_BASE, fam.ctl0).read() & CTL0_IDLEIE,
         CTL0_IDLEIE,
         "IDLEIE re-enabled"
+    );
+}
+
+// ============================================================================================
+// Second-instance DMA-ring (module USART, F10x) cases B18-B21 (uart-rx-multi-instance.md S2)
+// ============================================================================================
+//
+// The DMA-path generalization: a RingBufferedRx can target the BLE-module USART (HAL `Usart2`), whose
+// RX is GD `USART2_RX` = DMA0 Channel 2 (UM §9.4.9 Table 9-3), with its OWN DMA vector
+// (`DMA0_Channel2_IRQn` = 13, `F10X_DMA0_CH2_IRQ`) and its OWN wrap-counter context (index 1),
+// independent of USART1's channel 5 / vector 16 / context 0. F10x-only; F1x0 fails loud.
+
+/// Bring up a module-USART `RingBufferedRx` (channel 2, context 1) over a leaked `'static` DMA buffer
+/// of `len` bytes, with the F10x RAM table flipped. Returns the receiver, its channel, and the buf ptr.
+fn install_ring_module(len: usize) -> (RingBufferedRx, u8, *mut u8) {
+    let chip = chip_for(&f10x());
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
+    let buf: &'static mut [u8] = vec![0u8; len].leak();
+    let ptr = buf.as_mut_ptr();
+    let ch = DmaRxMap::module_rx().channel;
+    let rx = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart2, buf).unwrap();
+    install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
+    (rx, ch, ptr)
+}
+
+// --- B18: DmaRxMap::module_rx resolves channel 2 (GD USART2_RX), base, separate vector ---------
+
+#[test]
+fn b18_dma_rx_map_module_resolves_channel2() {
+    let m = DmaRxMap::module_rx();
+    assert_eq!(
+        m.channel, 2,
+        "GD USART2_RX is DMA0 Ch2 on F10x (UM Table 9-3, the USART row)"
+    );
+    assert_eq!(m.base, DMA0_BASE);
+    assert!(!m.grouped, "F10x DMA0_Channel2 has its own vector (IRQ 13)");
+}
+
+// --- B19: module RingBufferedRx reads channel 2's CHxCNT; its vector bumps its own context ------
+
+#[test]
+fn b19_module_ring_reads_channel2_and_its_own_context() {
+    let _g = setup();
+    let (mut rx, ch, ptr) = install_ring_module(8);
+    assert_eq!(ch, 2, "module RingBufferedRx armed DMA0 Ch2");
+
+    // The DMA "wrote" 6 bytes into the module buffer; CHxCNT(2) = len - 6 = 2 (write index 6).
+    let first = [20u8, 21, 22, 23, 24, 25];
+    for (i, &b) in first.iter().enumerate() {
+        dma_write(ptr, i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 6);
+    let mut out = [0u8; 16];
+    let n = rx.read(&mut out).unwrap();
+    assert_eq!(
+        n, 6,
+        "len - CHxCNT(2) bytes available from the module channel"
+    );
+    assert_eq!(&out[..6], &first, "the module channel's bytes, in order");
+
+    // A buffer wrap: fire the MODULE DMA vector (IRQ 13). Only the module wrap context (1) increments;
+    // USART1's context (0) is untouched (no cross-talk between the two DMA contexts).
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(ch));
+    // SAFETY: the F10x table is installed and slot 13 holds the module DMA handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH2_IRQ) };
+    assert_eq!(crate::dma::wraps(1), 1, "module wrap counted on context 1");
+    assert_eq!(crate::dma::wraps(0), 0, "USART1 context untouched");
+}
+
+// --- B20: two DMA receivers live; each vector services only its own channel/context ------------
+
+#[test]
+fn b20_two_dma_instances_live_no_channel_or_context_collision() {
+    let _g = setup();
+    let chip = chip_for(&f10x());
+
+    // USART1 RingBufferedRx (channel 5, context 0, vector 16) and module RingBufferedRx (channel 2,
+    // context 1, vector 13), both live.
+    let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let b1: &'static mut [u8] = vec![0u8; 16].leak();
+    let _r1 = RingBufferedRx::new(&chip, u1, PeriphLabel::Usart1, b1).unwrap();
+    let ch_u1 = DmaRxMap::usart1_rx(&chip).channel;
+    let um = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
+    let bm: &'static mut [u8] = vec![0u8; 16].leak();
+    let _rm = RingBufferedRx::new(&chip, um, PeriphLabel::Usart2, bm).unwrap();
+    let ch_mod = DmaRxMap::module_rx().channel;
+    assert_eq!((ch_u1, ch_mod), (5, 2), "distinct channels, no collision");
+    install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
+
+    // Both channels' full-transfer flags pending. Fire ONLY the USART1 DMA vector: it counts only its
+    // own channel (5 / context 0) and leaves the module channel's flag pending.
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(ch_u1) | ftf_flag(ch_mod));
+    // SAFETY: table installed; slot 16 holds the USART1 DMA handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH5_IRQ) };
+    assert_eq!(crate::dma::wraps(0), 1, "USART1 context counted its wrap");
+    assert_eq!(
+        crate::dma::wraps(1),
+        0,
+        "module context untouched by the USART1 vector"
+    );
+    assert_ne!(
+        Reg32::new(DMA0_BASE, 0x00).read() & ftf_flag(ch_mod),
+        0,
+        "the module channel's FTF is still pending (USART1 vector did not service Ch2)"
+    );
+
+    // Now fire the module DMA vector: it services only its own channel (2 / context 1).
+    // SAFETY: table installed; slot 13 holds the module DMA handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH2_IRQ) };
+    assert_eq!(crate::dma::wraps(1), 1, "module context counted its wrap");
+    assert_eq!(
+        crate::dma::wraps(0),
+        1,
+        "USART1 context unchanged by the module vector"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, 0x00).read() & ftf_flag(ch_mod),
+        0,
+        "the module channel's FTF is now cleared by its own vector"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, 0x00).read() & ftf_flag(ch_u1),
+        0,
+        "the USART1 channel's FTF stayed cleared (its vector cleared it, the module vector left it)"
+    );
+}
+
+// --- B21: the module DMA path is F10x-only; F1x0 fails loud ------------------------------------
+
+#[test]
+fn b21_module_ring_on_f1x0_is_unsupported() {
+    let _g = setup();
+    let chip = chip_for(&f1x0());
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
+    let buf: &'static mut [u8] = vec![0u8; 16].leak();
+    assert_eq!(
+        RingBufferedRx::new(&chip, usart, PeriphLabel::Usart2, buf).map(|_| ()),
+        Err(DescriptorError::Unsupported),
+        "the module DMA path is F10x-only; F1x0 returns DescriptorError (no silent untested mapping)"
     );
 }

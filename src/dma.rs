@@ -86,6 +86,21 @@ impl DmaRxMap {
         }
     }
 
+    /// Resolve the BLE-module USART's RX mapping (HAL `Usart2` = GD `USART2`, the F10x second instance).
+    /// **F10x-only**: the GD32F10x User Manual §9.4.9 (Figure 9-4 / Table 9-3, the "USART" row) maps GD
+    /// `USART2_RX` to **DMA0 Channel 2**, a separate per-channel vector (`DMA0_Channel2_IRQn` = 13). The
+    /// caller ([`crate::usart_rx::RingBufferedRx::new`]) only reaches this after resolving the instance
+    /// to the module, which is rejected on F1x0, so this is unconditionally the F10x Ch2 mapping (the
+    /// module USART has no F1x0 silicon to validate a channel against).
+    #[inline]
+    pub fn module_rx() -> DmaRxMap {
+        DmaRxMap {
+            base: DMA0_BASE,
+            channel: 2,
+            grouped: false,
+        }
+    }
+
     #[inline]
     fn ch(&self) -> u32 {
         self.channel as u32
@@ -193,27 +208,47 @@ impl DmaRxCtx {
     }
 }
 
-static DMA_RX: DmaRxCtx = DmaRxCtx::new();
+/// The DMA-RX contexts, one independent wrap-counter per supported DMA-ring instance: index 0 = USART1
+/// (its channel: Ch5 F10x / Ch4 F1x0), index 1 = the BLE-module USART (Ch2, F10x-only). Two
+/// [`RingBufferedRx`] may be live at once, so each services ONLY its own channel's `INTF` bits and bumps
+/// ONLY its own wrap counter, with no channel/context collision (`uart-rx-multi-instance.md` items 2-3).
+/// Same shape as the interrupt path's `RX_SLOTS`. Index convention matches `RxInstance::slot_index`.
+static DMA_RX: [DmaRxCtx; 2] = [DmaRxCtx::new(), DmaRxCtx::new()];
 
-/// Install the DMA-RX context for `map` and register the ISR body. Called by `RingBufferedRx::new`.
-pub(crate) fn install(map: &DmaRxMap) {
-    DMA_RX.wraps.store(0, Ordering::Release);
-    DMA_RX.base.store(map.base, Ordering::Release);
-    DMA_RX.channel.store(map.channel, Ordering::Release);
-    DMA_RX.installed.store(true, Ordering::Release);
-    irq::register_dma_rx_handler(dma_rx_handler);
+/// Install the DMA-RX context `ctx_index` for `map` and register the matching ISR body (each instance
+/// has its own DMA vector + handler, so the two contexts never collide). Called by `RingBufferedRx::new`.
+pub(crate) fn install(map: &DmaRxMap, ctx_index: usize) {
+    let ctx = &DMA_RX[ctx_index];
+    ctx.wraps.store(0, Ordering::Release);
+    ctx.base.store(map.base, Ordering::Release);
+    ctx.channel.store(map.channel, Ordering::Release);
+    ctx.installed.store(true, Ordering::Release);
+    // Register the body for THIS instance's DMA vector. The module DMA channel is F10x-only, so its
+    // handler only ever fires there.
+    match ctx_index {
+        0 => irq::register_dma_rx_handler(dma_rx_handler),
+        _ => irq::register_dma_rx_handler2(module_dma_rx_handler),
+    }
 }
 
-/// The buffer-wrap count the ISR has observed (monotonic; wraps on `u32` overflow, which is far beyond
-/// any bench run). The read path combines it with `CHxCNT` to detect a lapped (overwritten) cursor.
+/// The buffer-wrap count DMA-RX context `ctx_index` has observed (monotonic; wraps on `u32` overflow,
+/// far beyond any bench run). The read path combines it with `CHxCNT` to detect a lapped cursor.
 #[inline]
-pub(crate) fn wraps() -> u32 {
-    DMA_RX.wraps.load(Ordering::Acquire)
+pub(crate) fn wraps(ctx_index: usize) -> u32 {
+    DMA_RX[ctx_index].wraps.load(Ordering::Acquire)
 }
 
-/// The registered ISR body (reached via the DMA vector slot through `call_dma_rx_handler`).
+/// The registered ISR body for USART1's DMA channel (context 0). Reached via that channel's DMA vector
+/// slot through `call_dma_rx_handler`.
 extern "C" fn dma_rx_handler() {
-    service_dma_rx(&DMA_RX);
+    service_dma_rx(&DMA_RX[0]);
+}
+
+/// The registered ISR body for the module USART's DMA channel (context 1, F10x-only). Reached via the
+/// module DMA vector slot (`module_dma_rx_isr`) through `call_dma_rx_handler2`. Independent of
+/// [`dma_rx_handler`]: it services only Ch2's flags and bumps only context 1's wrap counter.
+extern "C" fn module_dma_rx_handler() {
+    service_dma_rx(&DMA_RX[1]);
 }
 
 /// The DMA-RX ISR / demux logic, factored out so a host test drives it against the mock `INTF`.
@@ -253,12 +288,16 @@ fn service_dma_rx(ctx: &DmaRxCtx) {
     }
 }
 
-/// Reset the DMA-RX context + registered handler (host-test teardown between cases).
+/// Reset every DMA-RX context + both registered handlers (host-test teardown between cases). Both
+/// contexts are reset so a case that installed the module channel cannot leak into the next.
 #[cfg(feature = "mock")]
 pub fn reset_for_test() {
-    DMA_RX.installed.store(false, Ordering::Release);
-    DMA_RX.base.store(0, Ordering::Release);
-    DMA_RX.channel.store(0, Ordering::Release);
-    DMA_RX.wraps.store(0, Ordering::Release);
+    for ctx in &DMA_RX {
+        ctx.installed.store(false, Ordering::Release);
+        ctx.base.store(0, Ordering::Release);
+        ctx.channel.store(0, Ordering::Release);
+        ctx.wraps.store(0, Ordering::Release);
+    }
     irq::clear_dma_rx_handler();
+    irq::clear_dma_rx_handler2();
 }

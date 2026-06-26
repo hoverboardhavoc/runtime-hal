@@ -27,11 +27,11 @@ use super::grouped_inner;
 use super::{
     build_table, call_control_handler, clear_control_handler, default_isr, handler_addr,
     install_mock, mock_vtor, register_control_handler, set_grouped_demux_timer_base,
-    ControlHandler, F10X_ADC0_1_IRQ, F10X_EXTI10_15_IRQ, F10X_EXTI5_9_IRQ, F10X_TIMER0_BRK_IRQ,
-    F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ, F10X_TIMER0_UP_IRQ, F1X0_ADC_CMP_IRQ,
-    F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ,
-    F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF, INTF_UPIF, MAX_VECTORS,
-    SYSTEM_VECTORS, TIMER_INTF,
+    ControlHandler, F10X_ADC0_1_IRQ, F10X_DMA0_CH2_IRQ, F10X_EXTI10_15_IRQ, F10X_EXTI5_9_IRQ,
+    F10X_TIMER0_BRK_IRQ, F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ, F10X_TIMER0_UP_IRQ,
+    F1X0_ADC_CMP_IRQ, F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ,
+    F1X0_TIMER0_BRK_UP_TRG_COM_IRQ, F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF,
+    INTF_UPIF, MAX_VECTORS, SYSTEM_VECTORS, TIMER_INTF,
 };
 use crate::descriptor::IrqLayout;
 use crate::reg::{mock, Reg32};
@@ -105,11 +105,16 @@ fn f10x_separate_slots_match_spl_layout() {
     assert_eq!(slot(&t, F10X_EXTI5_9_IRQ), handler_addr(super::exti_isr));
     assert_eq!(slot(&t, F10X_EXTI10_15_IRQ), handler_addr(super::exti_isr));
 
-    // The F1x0-only combined-timer slot (13) is NOT a demux on F10x (it is TIMER0_BRK on F1x0's 13,
-    // but on F10x IRQ 13 is unused by the advanced timer): it stays the default.
+    // IRQ 13 differs by family: on F1x0 it is the grouped TIMER0_BRK_UP_TRG_COM demux, but on F10x it
+    // is DMA0_Channel2 = the module USART's DMA-ring RX vector (GD USART2_RX). The advanced timer does
+    // NOT use slot 13 on F10x; the module DMA channel does.
     assert_eq!(
-        slot(&t, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ),
-        handler_addr(default_isr)
+        F10X_DMA0_CH2_IRQ, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ,
+        "both are IRQ 13"
+    );
+    assert_eq!(
+        slot(&t, F10X_DMA0_CH2_IRQ),
+        handler_addr(super::module_dma_rx_isr)
     );
     // The grouped demux is never installed on the separate layout.
     let demux = handler_addr(super::timer0_grouped_demux);

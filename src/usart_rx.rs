@@ -304,14 +304,19 @@ fn usart_irq_num(chip: &Chip, instance: RxInstance) -> usize {
     }
 }
 
-/// The DMA-RX IRQ number for `chip`'s family (separate `DMA0_Channel5` = 16 on F10x, grouped
-/// `DMA_Channel3_4` = 11 on F1x0). Hardware-build-only (drives the NVIC).
+/// The DMA-RX IRQ number for `chip`'s family + `instance`. USART1's channel: separate `DMA0_Channel5`
+/// = 16 on F10x, grouped `DMA_Channel3_4` = 11 on F1x0. The module's channel: F10x-only `DMA0_Channel2`
+/// = 13 (`resolve_instance` only yields `Module` on F10x, so its vector is unconditionally that one).
+/// Hardware-build-only (drives the NVIC).
 #[cfg(not(feature = "mock"))]
 #[inline]
-fn dma_irq_num(chip: &Chip) -> usize {
-    match chip.irq() {
-        IrqLayout::F1x0Grouped => irq::F1X0_DMA_CH3_4_IRQ,
-        IrqLayout::F10xSeparate => irq::F10X_DMA0_CH5_IRQ,
+fn dma_irq_num(chip: &Chip, instance: RxInstance) -> usize {
+    match instance {
+        RxInstance::Usart1 => match chip.irq() {
+            IrqLayout::F1x0Grouped => irq::F1X0_DMA_CH3_4_IRQ,
+            IrqLayout::F10xSeparate => irq::F10X_DMA0_CH5_IRQ,
+        },
+        RxInstance::Module => irq::F10X_DMA0_CH2_IRQ,
     }
 }
 
@@ -493,6 +498,11 @@ pub struct RingBufferedRx {
     /// Monotonic count of bytes the application has consumed (the read cursor). `% len` is the buffer
     /// position; comparing it to `wraps * len + (len - CHxCNT)` detects a lapped (overwritten) cursor.
     cursor: u64,
+    /// This receiver's shared USART RX slot (USART1 or the module): `read` reads its sticky line error,
+    /// `take_idle` its IDLE latch. Two `RingBufferedRx` on different instances never touch each other's.
+    slot: &'static RxSlot,
+    /// This receiver's DMA-RX wrap-counter context index (`crate::dma::wraps`), independent per instance.
+    dma_ctx: usize,
 }
 
 impl RingBufferedRx {
@@ -508,16 +518,25 @@ impl RingBufferedRx {
     pub fn new(
         chip: &Chip,
         usart: Usart,
+        instance: PeriphLabel,
         dma_buf: &'static mut [u8],
     ) -> Result<RingBufferedRx, DescriptorError> {
+        // Resolve the instance selector to a slot + DMA channel + vectors (fail-loud on F1x0 module /
+        // unknown label) before touching hardware (`uart-rx-multi-instance.md` items 3-4).
+        let inst = resolve_instance(chip, instance)?;
+
         let len = dma_buf.len();
         if len == 0 || len > u16::MAX as usize {
             return Err(DescriptorError::Unsupported);
         }
         let buf = dma_buf.as_mut_ptr();
 
-        // 1. Resolve the DMA mapping for this family.
-        let map = crate::dma::DmaRxMap::usart1_rx(chip);
+        // 1. Resolve the DMA mapping for this instance: USART1's channel is family-generic; the module's
+        //    is the F10x-only GD `USART2_RX` channel (DMA0 Ch2).
+        let map = match inst {
+            RxInstance::Usart1 => crate::dma::DmaRxMap::usart1_rx(chip),
+            RxInstance::Module => crate::dma::DmaRxMap::module_rx(),
+        };
 
         // 2. Enable the DMA controller clock.
         crate::clock::enable_dma(chip.rcu_base()?);
@@ -528,6 +547,9 @@ impl RingBufferedRx {
         map.disable();
 
         // 3. Write-back self-check (fail-loud): confirm the resolved channel responds before arming.
+        //    NOTE: the self-check proves the channel RESPONDS, not that it is the one the USART feeds;
+        //    only the live bench loopback confirms the resolved channel mapping (a wrong channel passes
+        //    this but receives zero bytes).
         if !map.self_check() {
             return Err(DescriptorError::SelfCheckFailed);
         }
@@ -542,25 +564,18 @@ impl RingBufferedRx {
         usart.listen_idle();
         usart.listen_errors();
 
-        // Install the shared RX context (no SPSC ring under DMA: the ISR's RBNE drain never runs, since
-        // the DMA controller's RDATA read auto-clears RBNE; only its IDLE + line-error path is used).
-        // The DMA-ring path is USART1-only in this slice (the DMA channel resolver is the S2 work), so
-        // it always installs slot 0.
-        install_usart_ctx(
-            &usart,
-            RxInstance::Usart1,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-        );
-        // Install the DMA-RX context (wrap counter) + register the DMA ISR body.
-        crate::dma::install(&map);
+        // Install this instance's shared RX context (no SPSC ring under DMA: the ISR's RBNE drain never
+        // runs, since the DMA controller's RDATA read auto-clears RBNE; only its IDLE + line-error path
+        // is used) and the per-instance DMA-RX wrap-counter context + DMA ISR body.
+        install_usart_ctx(&usart, inst, core::ptr::null_mut(), core::ptr::null_mut());
+        crate::dma::install(&map, inst.slot_index());
 
-        // 7. Unmask both the DMA-channel and the USART IRQ (hardware only).
+        // 7. Unmask both the DMA-channel and the USART IRQ for this instance (hardware only).
         let _ = chip;
         #[cfg(not(feature = "mock"))]
         {
-            nvic_unmask(dma_irq_num(chip));
-            nvic_unmask(usart_irq_num(chip, RxInstance::Usart1));
+            nvic_unmask(dma_irq_num(chip, inst));
+            nvic_unmask(usart_irq_num(chip, inst));
         }
 
         Ok(RingBufferedRx {
@@ -568,6 +583,8 @@ impl RingBufferedRx {
             buf,
             len,
             cursor: 0,
+            slot: inst.slot(),
+            dma_ctx: inst.slot_index(),
         })
     }
 
@@ -585,11 +602,11 @@ impl RingBufferedRx {
     #[inline]
     fn snapshot(&self) -> (u32, u16) {
         loop {
-            let w1 = crate::dma::wraps();
+            let w1 = crate::dma::wraps(self.dma_ctx);
             let rem_a = self.map.remaining();
             let ftf = self.map.ftf_pending();
             let rem_b = self.map.remaining();
-            let w2 = crate::dma::wraps();
+            let w2 = crate::dma::wraps(self.dma_ctx);
             if w1 != w2 {
                 continue; // a counted wrap landed during the snapshot: retry
             }
@@ -617,9 +634,9 @@ impl RingBufferedRx {
     ///   overwritten before being read) returns [`UsartError::Overrun`] and resyncs the cursor to the
     ///   freshest position so subsequent reads continue (section 5.2).
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
-        // Line error first (fail-loud): stop reception and surface; caller re-`new`s. The DMA-ring path
-        // is USART1-only (slot 0) in this slice.
-        let code = RX_SLOTS[0].line_error.swap(ERR_NONE, Ordering::AcqRel);
+        // Line error first (fail-loud): stop reception and surface; caller re-`new`s. Reads THIS
+        // instance's shared RX slot (the module's IDLE/error path is independent of USART1's).
+        let code = self.slot.line_error.swap(ERR_NONE, Ordering::AcqRel);
         if code != ERR_NONE {
             self.map.disable();
             return Err(decode_error(code));
@@ -653,7 +670,7 @@ impl RingBufferedRx {
     /// [`BufferedRx::take_idle`]: the IDLE boundary is delivered by the shared USART IRQ (section 5.3),
     /// so the DMA-ring reader uses the same latch to know a variable-length frame just ended.
     pub fn take_idle(&self) -> bool {
-        RX_SLOTS[0].idle_seen.swap(false, Ordering::AcqRel)
+        self.slot.idle_seen.swap(false, Ordering::AcqRel)
     }
 }
 
