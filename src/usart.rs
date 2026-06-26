@@ -166,6 +166,13 @@ pub struct UsartModel {
 // Shared CTL0 bit positions (identical on both families).
 const CTL0_REN: u32 = 1 << 2;
 const CTL0_TEN: u32 = 1 << 3;
+/// CTL0 IDLE-line interrupt enable `IDLEIE` (`USART_CTL0_IDLEIE`, bit 4) and read-data-buffer-not-
+/// empty interrupt enable `RBNEIE` (`USART_CTL0_RBNEIE`, bit 5). These sit in the low half of CTL0
+/// that does NOT shift between the F10x (F1-style) and F1x0 (F0-style) blocks (confirmed identical
+/// in `gd32f10x_usart.h:84,85` and `gd32f1x0_usart.h:68,69`), so the [`crate::usart_rx::BufferedRx`]
+/// interrupt-buffered RX shares one constant across families, like `CTL0_REN`/`CTL0_TEN`.
+const CTL0_IDLEIE: u32 = 1 << 4;
+const CTL0_RBNEIE: u32 = 1 << 5;
 /// Parity selection `PM` (0 = even, 1 = odd) and parity-control enable `PCEN`.
 const CTL0_PM: u32 = 1 << 9;
 const CTL0_PCEN: u32 = 1 << 10;
@@ -174,11 +181,21 @@ const CTL0_WL: u32 = 1 << 12;
 const CTL0_OVSMOD: u32 = 1 << 15;
 /// CTL1 stop-bit field `STB = BITS(12,13)`.
 const CTL1_STB: u32 = 0b11 << 12;
+/// CTL2 error-interrupt-enable `ERRIE` (bit 0) and DMA-reception-enable `DENR` (bit 6); identical on
+/// both families (`gd32f10x_usart.h:107,113` / `gd32f1x0_usart.h:106,112`). Used by the DMA-ring RX:
+/// `DENR` routes received bytes to the DMA controller, `ERRIE` raises the USART IRQ on a line error so
+/// the shared RX ISR can surface it (the fail-loud path).
+const CTL2_ERRIE: u32 = 1 << 0;
+const CTL2_DENR: u32 = 1 << 6;
 
 // Shared STAT bit positions (identical on both families).
 const STAT_PERR: u32 = 1 << 0;
 const STAT_FERR: u32 = 1 << 1;
 const STAT_ORERR: u32 = 1 << 3;
+/// STAT IDLE-line-detected flag `IDLEF` (`USART_STAT_IDLEF`, bit 4; identical on both families,
+/// `gd32f10x_usart.h:65` / `gd32f1x0_usart.h:150`). Set when the line went quiet after at least one
+/// byte: the variable-length frame boundary the interrupt-buffered RX uses.
+const STAT_IDLEF: u32 = 1 << 4;
 const STAT_RBNE: u32 = 1 << 5;
 const STAT_TC: u32 = 1 << 6;
 const STAT_TBE: u32 = 1 << 7;
@@ -189,6 +206,11 @@ const STAT_TBE: u32 = 1 << 7;
 const INTC_PECF: u32 = STAT_PERR;
 const INTC_FECF: u32 = STAT_FERR;
 const INTC_ORECF: u32 = STAT_ORERR;
+/// F1x0 `INTC` IDLE-line-detected flag clear `IDLEC` (`USART_INTC_IDLEC`, bit 4, mirroring the STAT
+/// IDLEF position; `gd32f1x0_usart.h:174`). On F1x0 the IDLE flag is cleared by writing this bit to
+/// INTC, alongside the `*CF` line-error clears above. (F10x has no INTC: it clears IDLE by the
+/// STAT-then-data read pair, the same way it clears ORERR; see [`Usart::clear_idle`].)
+const INTC_IDLEC: u32 = STAT_IDLEF;
 
 impl UsartModel {
     /// The F10x (`gd32f10x_usart.h`) register model.
@@ -492,8 +514,11 @@ impl Usart {
     ///
     /// Only the flags present in `status` are cleared (a single masked INTC write on F1x0; the read
     /// pair on F10x clears all of them at once, which is correct because they are all recoverable).
+    ///
+    /// `pub(crate)` so the interrupt-buffered RX ISR ([`crate::usart_rx`]) reuses the exact same
+    /// family-correct clear the polled path uses.
     #[inline]
-    fn clear_line_errors(&self, status: &Status) {
+    pub(crate) fn clear_line_errors(&self, status: &Status) {
         match self.model.intc {
             // F1x0: write the *CF bits for the flags that are set into INTC.
             Some(intc_off) => {
@@ -564,6 +589,111 @@ impl Usart {
         }
         let data = Reg32::new(self.base, self.model.rx_data).read();
         Ok(Some((data & 0xFF) as u8))
+    }
+
+    // --- interrupt-buffered RX primitives (G-DMA-UART Gate A) ---------------------------------
+    //
+    // Thin register ops in the same style as `write_byte` / `clear_line_errors`, used by
+    // `crate::usart_rx::BufferedRx`. The polled path is unchanged: nothing here runs unless an
+    // application opts into interrupt-driven RX.
+
+    /// Enable the read-data-buffer-not-empty interrupt (`RBNEIE`): the USART raises its IRQ on each
+    /// received byte. Read-modify-write so it does not disturb the frame/enable bits.
+    #[inline]
+    pub fn listen_rbne(&self) {
+        self.ctl0().modify(CTL0_RBNEIE, CTL0_RBNEIE);
+    }
+
+    /// Enable the IDLE-line interrupt (`IDLEIE`): the USART raises its IRQ when the line goes quiet
+    /// after a byte (the variable-length frame boundary). Read-modify-write.
+    #[inline]
+    pub fn listen_idle(&self) {
+        self.ctl0().modify(CTL0_IDLEIE, CTL0_IDLEIE);
+    }
+
+    /// Enable DMA reception (`DENR`, CTL2 bit 6): received bytes are drained by the DMA controller,
+    /// whose read of `RDATA` auto-clears `RBNE` (so the CPU never sees `RBNE` for a DMA'd byte). The
+    /// DMA-ring RX path ([`crate::usart_rx::RingBufferedRx`]).
+    #[inline]
+    pub fn enable_dma_rx(&self) {
+        self.ctl2().modify(CTL2_DENR, CTL2_DENR);
+    }
+
+    /// Enable the error interrupt (`ERRIE`, CTL2 bit 0): under DMA RX, an overrun/framing/noise error
+    /// raises the USART IRQ so the shared RX ISR surfaces a line error (the DMA-ring fail-loud path).
+    #[inline]
+    pub fn listen_errors(&self) {
+        self.ctl2().modify(CTL2_ERRIE, CTL2_ERRIE);
+    }
+
+    /// Absolute address of the receive-data register: the source address (`CHxPADDR`) the DMA channel
+    /// reads each byte from.
+    #[inline]
+    pub(crate) fn rdata_addr(&self) -> u32 {
+        self.base + self.model.rx_data
+    }
+
+    /// Raw base address of this handle (HAL-internal: the RX ISR context stores it to rebuild the
+    /// handle, since the ISR is an argument-less `extern "C" fn`).
+    #[inline]
+    pub(crate) const fn base(&self) -> u32 {
+        self.base
+    }
+
+    /// Whether this handle uses the F1x0 (F0-style) register model (`true`) or the F10x (F1-style)
+    /// one (`false`). The RX ISR stores this one bit and rebuilds the model with [`Usart::from_parts`].
+    #[inline]
+    pub(crate) const fn is_f1x0(&self) -> bool {
+        self.model.intc.is_some()
+    }
+
+    /// Rebuild a handle from the base + family bit the RX ISR context stored (the inverse of
+    /// [`Usart::base`] / [`Usart::is_f1x0`]). The model is the chip's, resolved once at bring-up.
+    #[inline]
+    pub(crate) const fn from_parts(base: u32, is_f1x0: bool) -> Usart {
+        let model = if is_f1x0 {
+            UsartModel::F1X0
+        } else {
+            UsartModel::F10X
+        };
+        Usart { base, model }
+    }
+
+    /// True if the IDLE-line flag (`IDLEF`) is set.
+    #[inline]
+    pub(crate) fn idle_flag(&self) -> bool {
+        self.stat().read() & STAT_IDLEF != 0
+    }
+
+    /// Clear the IDLE-line flag the family-correct way (the [`Usart::clear_line_errors`] split,
+    /// applied to IDLEF):
+    /// - **F1x0** (`intc == Some(off)`): write `IDLEC` to `INTC`.
+    /// - **F10x** (`intc == None`): the STAT-then-data read pair (the same sequence that clears
+    ///   ORERR on F10x); the discarded byte is not the point, the clear is.
+    #[inline]
+    pub(crate) fn clear_idle(&self) {
+        match self.model.intc {
+            Some(intc_off) => Reg32::new(self.base, intc_off).write(INTC_IDLEC),
+            None => {
+                let _ = self.stat().read();
+                let _ = Reg32::new(self.base, self.model.rx_data).read();
+            }
+        }
+    }
+
+    /// Read one received byte from the data register. On silicon the act of reading clears `RBNE`
+    /// (the FIFO-less RX register empties), which is how the ISR drain loop (`while RBNE`) makes
+    /// progress.
+    #[inline]
+    pub(crate) fn read_rbne_byte(&self) -> u8 {
+        let b = (Reg32::new(self.base, self.model.rx_data).read() & 0xFF) as u8;
+        // The host-test backend is a passive backing array with no UART core, so a data-register
+        // read does NOT auto-clear RBNE the way silicon does. Model that side effect under `mock`
+        // so the ISR drain loop terminates after the staged byte; on real MMIO the hardware cleared
+        // RBNE on the read above and this is not compiled in.
+        #[cfg(feature = "mock")]
+        self.stat().modify(STAT_RBNE, 0);
+        b
     }
 }
 

@@ -1,0 +1,673 @@
+//! Host (mock) tests for the interrupt-buffered RX (`BufferedRx`), G-DMA-UART Gate A cases B1-B5.
+//!
+//! The same shape as the irq host tests: build the RAM vector table with `install_mock`, then fire
+//! the USART1 RX vector through `mock_vtor::dispatch`, which resolves the slot to `usart1_rx_isr` and
+//! calls the registered ISR body exactly the way hardware would after the `VTOR` flip. The mock
+//! register backend is a passive array with no UART core, so `Usart::read_rbne_byte` models the
+//! hardware "reading the data register clears RBNE" side effect under the `mock` feature (so the ISR
+//! drain loop terminates); each staged byte is one dispatch, mirroring the polled serial RX tests.
+#![cfg(feature = "mock")]
+
+use super::{reset_for_test, BufferedRx, RingBufferedRx};
+use crate::addr::{AddrTable, PeriphLabel};
+use crate::chip::Chip;
+use crate::clock::ClockConfig;
+use crate::config::{Oversampling, UsartConfig, UsartFrame};
+use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
+use crate::dma::{DmaRxMap, DMA0_BASE};
+use crate::error::{DescriptorError, UsartError};
+use crate::irq::{
+    install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ, F1X0_DMA_CH3_4_IRQ,
+    F1X0_USART1_IRQ,
+};
+use crate::reg::{mock, Reg32};
+use crate::usart::Usart;
+use heapless::spsc::Queue;
+use std::sync::MutexGuard;
+
+/// The bench USART1 base in the mock window (the offsets within it are what assertions key on).
+const USART_BASE: u32 = 0x4000_4400;
+/// A non-zero RAM-table address for `install_mock` (stands in for the section).
+const RAM_ADDR: u32 = 0x2000_4000;
+
+// STAT bit positions (identical on both families).
+const RBNE: u32 = 1 << 5;
+const IDLEF: u32 = 1 << 4;
+const ORERR: u32 = 1 << 3;
+const FERR: u32 = 1 << 1;
+const PERR: u32 = 1 << 0;
+
+/// Per-family register offsets + the matching IRQ layout / dispatch vector.
+struct Fam {
+    stat: u32,
+    data: u32,
+    ctl0: u32,
+    ctl2: u32,
+    intc: Option<u32>,
+    clock: ClockPath,
+    irq: IrqLayout,
+    dispatch: usize,
+}
+
+fn f10x() -> Fam {
+    Fam {
+        stat: 0x00,
+        data: 0x04,
+        ctl0: 0x0C,
+        ctl2: 0x14,
+        intc: None,
+        clock: ClockPath::F10xRcc,
+        irq: IrqLayout::F10xSeparate,
+        dispatch: F10X_USART1_IRQ,
+    }
+}
+
+fn f1x0() -> Fam {
+    Fam {
+        stat: 0x1C,
+        data: 0x24,
+        ctl0: 0x00,
+        ctl2: 0x08,
+        intc: Some(0x20),
+        clock: ClockPath::F1x0Rcu,
+        irq: IrqLayout::F1x0Grouped,
+        dispatch: F1X0_USART1_IRQ,
+    }
+}
+
+fn chip_for(fam: &Fam) -> Chip {
+    let mut addrs = AddrTable::new();
+    addrs.set(PeriphLabel::Usart1, USART_BASE);
+    addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+    Chip::from_descriptor(McuDescriptor {
+        gpio: if fam.clock == ClockPath::F1x0Rcu {
+            GpioPath::AhbCtlAfsel
+        } else {
+            GpioPath::ApbCrlCrh
+        },
+        clock: fam.clock,
+        adc: AdcPath::Single,
+        irq: fam.irq,
+        addrs,
+        flash_page: PageSize::K1,
+        flash_kib: 64,
+        adv_timers: 1,
+        adc_count: 1,
+    })
+}
+
+fn bench_cfg() -> UsartConfig {
+    UsartConfig {
+        usart: PeriphLabel::Usart1,
+        tx: 0x02,
+        rx: 0x03,
+        baud: 115_200,
+        frame: UsartFrame::EIGHT_N_ONE,
+        oversampling: Oversampling::By16,
+    }
+}
+
+/// Acquire the whole-case serialization lock and zero the register space + the static RX context +
+/// the recorded VTOR (a fresh world per case).
+fn setup() -> MutexGuard<'static, ()> {
+    let g = mock::lock();
+    mock::reset();
+    reset_for_test();
+    crate::dma::reset_for_test();
+    mock_vtor::reset();
+    g
+}
+
+/// Bring up the USART, install `BufferedRx` over a leaked `'static` ring of capacity word `N`, and
+/// flip the RAM table for `fam`'s layout so `dispatch` can route the RX vector.
+fn install<const N: usize>(fam: &Fam) -> BufferedRx {
+    let chip = chip_for(fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
+    let rx = BufferedRx::new(&chip, usart, storage).unwrap();
+    install_mock(fam.irq, RAM_ADDR);
+    rx
+}
+
+fn stage_byte(fam: &Fam, b: u8) {
+    Reg32::new(USART_BASE, fam.data).write(b as u32);
+    Reg32::new(USART_BASE, fam.stat).write(RBNE);
+}
+
+fn fire(fam: &Fam) {
+    // SAFETY: the RAM table is installed (install_mock) and the slot holds a handler.
+    unsafe { mock_vtor::dispatch(fam.dispatch) };
+}
+
+// --- B1: bring-up programs RBNEIE + IDLEIE, leaves DENR clear ----------------------------------
+
+#[test]
+fn b1_bringup_sets_rbneie_idleie_and_leaves_denr_clear() {
+    let fam = f10x();
+    let _g = setup();
+    let _rx = install::<8>(&fam);
+
+    let ctl0 = Reg32::new(USART_BASE, fam.ctl0).read();
+    assert_eq!(ctl0 & (1 << 5), 1 << 5, "RBNEIE set");
+    assert_eq!(ctl0 & (1 << 4), 1 << 4, "IDLEIE set");
+    // The polled enable bits from bring_up survive (REN+TEN+UEN; UEN is bit 13 on F10x).
+    assert_eq!(
+        ctl0 & ((1 << 2) | (1 << 3) | (1 << 13)),
+        (1 << 2) | (1 << 3) | (1 << 13),
+        "REN+TEN+UEN preserved"
+    );
+    // No DMA: CTL2 DENR (bit 6) stays clear (the interrupt-buffered mode spends no DMA channel).
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl2).read() & (1 << 6),
+        0,
+        "CTL2 DENR clear (no DMA)"
+    );
+}
+
+// --- B2: the ISR drains staged RBNE bytes into the ring, in order -----------------------------
+
+#[test]
+fn b2_isr_pushes_rbne_bytes_into_the_ring_in_order() {
+    let fam = f10x();
+    let _g = setup();
+    let mut rx = install::<8>(&fam);
+
+    let pattern = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+    for &b in &pattern {
+        stage_byte(&fam, b);
+        fire(&fam);
+    }
+    assert!(rx.ready(), "the ring has buffered bytes after the ISR ran");
+
+    let mut buf = [0u8; 8];
+    let n = rx.read(&mut buf).unwrap();
+    assert_eq!(n, pattern.len(), "all staged bytes drained");
+    assert_eq!(&buf[..n], &pattern, "bytes land in arrival order");
+    // Ring now empty: a follow-up read is the non-blocking empty case, not an error.
+    assert_eq!(rx.read(&mut buf), Ok(0));
+}
+
+// --- B3: IDLE handling, family-correct clear + library-owned latch, BOTH layouts --------------
+
+#[test]
+fn b3_idle_latches_clears_family_correct_and_is_consumed_by_take_idle() {
+    for fam in [f10x(), f1x0()] {
+        let _g = setup();
+        let mut rx = install::<8>(&fam);
+
+        // No byte ready, just the IDLE-line flag set.
+        Reg32::new(USART_BASE, fam.stat).write(IDLEF);
+        fire(&fam);
+
+        match fam.intc {
+            // F1x0: the IDLE flag is cleared by writing IDLEC (bit 4) to INTC.
+            Some(intc) => assert_eq!(
+                Reg32::new(USART_BASE, intc).read() & (1 << 4),
+                1 << 4,
+                "F1x0 wrote INTC IDLEC"
+            ),
+            // F10x: the clear is the STAT-then-data read pair (no INTC register to assert); the
+            // latch below is the observable.
+            None => {}
+        }
+
+        // `read` must NOT consume the IDLE latch: drain (nothing buffered) and the boundary survives.
+        let mut buf = [0u8; 4];
+        assert_eq!(rx.read(&mut buf), Ok(0));
+
+        // `take_idle` consumes the boundary exactly once: true now, false after.
+        assert!(
+            rx.take_idle(),
+            "the IDLE boundary latched and survived read ({:?})",
+            fam.clock
+        );
+        assert!(
+            !rx.take_idle(),
+            "take_idle consumed the latch (one boundary)"
+        );
+    }
+}
+
+// --- B4: ring-full overflow sets the sticky Overrun surfaced by the next read -----------------
+
+#[test]
+fn b4_ring_full_overflow_surfaces_overrun() {
+    let fam = f10x();
+    let _g = setup();
+    // Capacity word 4 => the ring holds 3 bytes (heapless N-1). The 4th byte overflows.
+    let mut rx = install::<4>(&fam);
+
+    for b in [0xA0u8, 0xA1, 0xA2, 0xA3] {
+        stage_byte(&fam, b);
+        fire(&fam);
+    }
+
+    // The next read surfaces the sticky overflow as Overrun (and clears it).
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        rx.read(&mut buf),
+        Err(UsartError::Overrun),
+        "ring-full overflow is surfaced, never a silent drop"
+    );
+    // After surfacing, the buffered bytes (the 3 that fit, in order) drain normally.
+    let n = rx.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], &[0xA0, 0xA1, 0xA2]);
+}
+
+// --- B5: line errors (ORERR/FERR/PERR) cleared + surfaced, RX not latched, BOTH layouts --------
+//
+// Looped over both families because the clear is family-divergent (F1x0 writes the matching `*CF`
+// bit to INTC, F10x uses the STAT-then-data read pair), so the buffered ISR's F1x0 line-error clear
+// is exercised here. The three staged errors map to Overrun / Framing / Parity respectively (the
+// spec's "ORERR/FERR/PERR").
+
+#[test]
+fn b5_line_error_is_cleared_surfaced_and_rx_recovers() {
+    for fam in [f10x(), f1x0()] {
+        for (err_bit, expected) in [
+            (ORERR, UsartError::Overrun),
+            (FERR, UsartError::Framing),
+            (PERR, UsartError::Parity),
+        ] {
+            let _g = setup();
+            let mut rx = install::<8>(&fam);
+
+            // Stage a line error (no RBNE): the ISR records it sticky and clears it family-correct.
+            Reg32::new(USART_BASE, fam.stat).write(err_bit);
+            fire(&fam);
+
+            // The family-correct clear ran: on F1x0 the matching `*CF` bit (same position as the
+            // STAT flag: ORECF/FECF/PECF) was written to INTC. F10x clears via the read pair (no
+            // INTC register), so there the surfaced error below is the observable.
+            if let Some(intc) = fam.intc {
+                assert_eq!(
+                    Reg32::new(USART_BASE, intc).read() & err_bit,
+                    err_bit,
+                    "F1x0 wrote the matching *CF bit to INTC ({:?})",
+                    expected
+                );
+            }
+
+            let mut buf = [0u8; 8];
+            assert_eq!(rx.read(&mut buf), Err(expected), "line error surfaced once");
+            // Surfaced once only: with no new data the follow-up read is empty, not Err again.
+            assert_eq!(rx.read(&mut buf), Ok(0), "the sticky error did not latch");
+
+            // RX is not stranded: a subsequent clean byte still arrives through the ISR.
+            stage_byte(&fam, 0x5A);
+            fire(&fam);
+            let n = rx.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &[0x5A], "RX still alive after the line error");
+        }
+    }
+}
+
+// ============================================================================================
+// DMA-ring (RingBufferedRx) cases B6-B12
+// ============================================================================================
+//
+// The DMA register block is at DMA0_BASE; in the mock window the per-channel registers are at the
+// confirmed offsets (stride 0x14: CHCTL 0x08, CHCNT 0x0C, CHPADDR 0x10, CHMADDR 0x14; INTF 0x00,
+// INTC 0x04). Tests read/write those directly (the same hardcoded-offset style the USART tests use),
+// drive the DMA ISR via `mock_vtor::dispatch`, and write the "DMA buffer" bytes through the raw
+// pointer (the buffer is plain RAM, not the mock register space, so reads use the real pointer).
+
+// CHxCTL bits (confirmed identical both families).
+const CHEN: u32 = 1 << 0;
+const FTFIE: u32 = 1 << 1;
+const HTFIE: u32 = 1 << 2;
+const CMEN: u32 = 1 << 5;
+const MNAGA: u32 = 1 << 7;
+// CTL2 / CTL0 enables the DMA bring-up sets.
+const CTL2_DENR: u32 = 1 << 6;
+const CTL2_ERRIE: u32 = 1 << 0;
+const CTL0_IDLEIE: u32 = 1 << 4;
+
+fn ch_ctl(ch: u8) -> u32 {
+    0x08 + 0x14 * ch as u32
+}
+fn ch_cnt(ch: u8) -> u32 {
+    0x0C + 0x14 * ch as u32
+}
+fn ch_paddr(ch: u8) -> u32 {
+    0x10 + 0x14 * ch as u32
+}
+fn ch_maddr(ch: u8) -> u32 {
+    0x14 + 0x14 * ch as u32
+}
+// INTF/INTC per-channel full-transfer (wrap) flag bit: flag << 4*channel.
+fn ftf_flag(ch: u8) -> u32 {
+    1 << (4 * ch as u32 + 1)
+}
+
+/// The DMA RX IRQ vector for a family's layout (separate Ch5 = 16 on F10x, grouped Ch3/4 = 11 F1x0).
+fn dma_dispatch(fam: &Fam) -> usize {
+    match fam.irq {
+        IrqLayout::F10xSeparate => F10X_DMA0_CH5_IRQ,
+        IrqLayout::F1x0Grouped => F1X0_DMA_CH3_4_IRQ,
+    }
+}
+
+/// Bring up the USART + RingBufferedRx over a leaked `'static` DMA buffer of `len` bytes, with the RAM
+/// table flipped for `fam`'s layout. Returns the receiver, the resolved channel, and the buffer ptr
+/// (so the test can simulate DMA writes into it).
+fn install_ring(fam: &Fam, len: usize) -> (RingBufferedRx, u8, *mut u8) {
+    let chip = chip_for(fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let buf: &'static mut [u8] = vec![0u8; len].leak();
+    let ptr = buf.as_mut_ptr();
+    let ch = DmaRxMap::usart1_rx(&chip).channel;
+    let rx = RingBufferedRx::new(&chip, usart, buf).unwrap();
+    install_mock(fam.irq, RAM_ADDR);
+    (rx, ch, ptr)
+}
+
+/// Write a byte into the (raw) DMA buffer, modelling a DMA store. The buffer is host RAM.
+fn dma_write(ptr: *mut u8, pos: usize, val: u8) {
+    // SAFETY: `pos` is within the leaked buffer the test sized.
+    unsafe { *ptr.add(pos) = val };
+}
+
+/// Fire the DMA ISR (a buffer wrap / transfer completion).
+fn fire_dma(fam: &Fam) {
+    // SAFETY: the RAM table is installed and the DMA slot holds the handler.
+    unsafe { mock_vtor::dispatch(dma_dispatch(fam)) };
+}
+
+// --- B6: DmaRxMap resolves channel 5 (F10x) / 4 (F1x0), base + grouping ----------------------
+
+#[test]
+fn b6_dma_rx_map_resolves_channel_base_and_grouping() {
+    let f103 = DmaRxMap::usart1_rx(&chip_for(&f10x()));
+    assert_eq!(f103.channel, 5, "USART1_RX is DMA0 Ch5 on F10x");
+    assert_eq!(f103.base, DMA0_BASE);
+    assert!(!f103.grouped, "F10x DMA0_Channel5 has its own vector");
+
+    let f130 = DmaRxMap::usart1_rx(&chip_for(&f1x0()));
+    assert_eq!(f130.channel, 4, "USART1_RX is Ch4 on F1x0");
+    assert_eq!(f130.base, DMA0_BASE);
+    assert!(f130.grouped, "F1x0 Ch3/4 share a grouped vector");
+}
+
+// --- B7: channel programming (PADDR/MADDR/CNT, CMEN, CHEN last) + DENR ------------------------
+
+#[test]
+fn b7_channel_programming_and_denr() {
+    for fam in [f10x(), f1x0()] {
+        let _g = setup();
+        let chip = chip_for(&fam);
+        let usart =
+            Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+        let buf: &'static mut [u8] = vec![0u8; 32].leak();
+        let maddr = buf.as_ptr() as u32;
+        let ch = DmaRxMap::usart1_rx(&chip).channel;
+        let _rx = RingBufferedRx::new(&chip, usart, buf).unwrap();
+
+        // PADDR = the RDATA address; MADDR = buffer ptr; CNT = len.
+        assert_eq!(
+            Reg32::new(DMA0_BASE, ch_paddr(ch)).read(),
+            usart.rdata_addr(),
+            "CHxPADDR = USART RDATA address"
+        );
+        assert_eq!(
+            Reg32::new(DMA0_BASE, ch_maddr(ch)).read(),
+            maddr,
+            "CHxMADDR = buffer"
+        );
+        assert_eq!(Reg32::new(DMA0_BASE, ch_cnt(ch)).read(), 32, "CHxCNT = len");
+
+        // CHCTL: circular + mem-incr + half/full IRQ + CHEN (all set after configure).
+        let ctl = Reg32::new(DMA0_BASE, ch_ctl(ch)).read();
+        assert_eq!(ctl & CMEN, CMEN, "CMEN (circular) set");
+        assert_eq!(ctl & MNAGA, MNAGA, "memory-increment set");
+        assert_eq!(
+            ctl & (FTFIE | HTFIE),
+            FTFIE | HTFIE,
+            "half+full IRQ enabled"
+        );
+        assert_eq!(ctl & CHEN, CHEN, "CHEN set (channel started)");
+        // DIR = 0 (periph->mem), PNAGA = 0 (peripheral fixed), widths 0 (8-bit).
+        assert_eq!(ctl & (1 << 4), 0, "DIR=0 periph->mem");
+        assert_eq!(ctl & (1 << 6), 0, "PNAGA=0 peripheral fixed");
+        assert_eq!(ctl & (0xF << 8), 0, "8-bit widths");
+
+        // USART: DMA reception enabled (DENR), IDLE + error interrupts on.
+        assert_eq!(
+            Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_DENR,
+            CTL2_DENR,
+            "DENR set"
+        );
+        assert_eq!(
+            Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_ERRIE,
+            CTL2_ERRIE,
+            "ERRIE set"
+        );
+        assert_eq!(
+            Reg32::new(USART_BASE, fam.ctl0).read() & CTL0_IDLEIE,
+            CTL0_IDLEIE,
+            "IDLEIE set"
+        );
+    }
+}
+
+// --- B8: read math (len - CHxCNT), advancing the cursor, wrap across the buffer end -----------
+
+#[test]
+fn b8_read_returns_len_minus_chxcnt_bytes_and_wraps() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut rx, ch, ptr) = install_ring(&fam, 8);
+
+    // The DMA "wrote" 6 bytes: CHxCNT = len - 6 = 2 (write index 6).
+    let first = [10u8, 11, 12, 13, 14, 15];
+    for (i, &b) in first.iter().enumerate() {
+        dma_write(ptr, i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 6);
+
+    let mut out = [0u8; 16];
+    let n = rx.read(&mut out).unwrap();
+    assert_eq!(n, 6, "len - CHxCNT bytes available");
+    assert_eq!(&out[..6], &first, "the bytes behind the DMA head, in order");
+
+    // Now the DMA wrote 4 more bytes, wrapping: buf[6], buf[7], buf[0], buf[1]. One full-transfer
+    // completion (wrap) fires the DMA ISR, then CHxCNT = len - 2 = 6 (write index 2 this lap).
+    dma_write(ptr, 6, 16);
+    dma_write(ptr, 7, 17);
+    dma_write(ptr, 0, 20);
+    dma_write(ptr, 1, 21);
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(ch)); // INTF full-transfer for our channel
+    fire_dma(&fam); // wrap counted
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 2);
+
+    let n = rx.read(&mut out).unwrap();
+    assert_eq!(n, 4, "4 more bytes, spanning the buffer wrap");
+    assert_eq!(
+        &out[..4],
+        &[16, 17, 20, 21],
+        "bytes read across the end of the buffer"
+    );
+}
+
+// --- B9: lap detection -> Overrun -------------------------------------------------------------
+
+#[test]
+fn b9_lap_past_cursor_is_overrun() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut rx, ch, _ptr) = install_ring(&fam, 8);
+
+    // Model the DMA lapping the cursor: two full wraps + write index 1, cursor still 0 => the head
+    // is len*2 + 1 = 17 bytes ahead of the cursor, far more than the buffer, so data was overwritten.
+    // The flag is re-set before each dispatch (the ISR clears it), so the wrap counter reaches 2.
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(ch));
+    fire_dma(&fam);
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(ch));
+    fire_dma(&fam); // wraps = 2
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 1);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        rx.read(&mut out),
+        Err(UsartError::Overrun),
+        "the DMA lapping the cursor by more than the buffer is a non-silent Overrun"
+    );
+}
+
+// --- B13: wrap boundary with a PENDING (uncounted) FTF is not a spurious Overrun --------------
+//
+// The false-positive twin of B9. At a circular wrap the hardware reloads `CHxCNT` to `len` and sets
+// `FTFIF`, but the wrap-counter ISR runs slightly later. If `read` snapshots the reloaded
+// `CHxCNT == len` with the OLD wrap count it would undercount the write index by `len`, underflow
+// `available`, and report a spurious `Overrun` though the cursor was never lapped. The fixed snapshot
+// reads the pending `FTFIF` and attributes the wrap, so `read` returns the new bytes, not `Overrun`.
+
+#[test]
+fn b13_wrap_boundary_pending_ftf_is_not_spurious_overrun() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut rx, ch, ptr) = install_ring(&fam, 8);
+
+    // First read: the DMA wrote 5 bytes (CHxCNT = len - 5); cursor advances to 5.
+    for (i, &b) in [10u8, 11, 12, 13, 14].iter().enumerate() {
+        dma_write(ptr, i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 5);
+    let mut out = [0u8; 8];
+    assert_eq!(rx.read(&mut out), Ok(5));
+    assert_eq!(&out[..5], &[10, 11, 12, 13, 14]);
+
+    // Now the lap completes (the remaining 3 bytes land at buf[5..8]); CHxCNT reloads to `len` and the
+    // channel's FTFIF is set, but the wrap-counter ISR has NOT run (the wrap counter is still 0). The
+    // DMA wrote exactly 8 bytes total vs cursor 5: it did NOT lap the cursor.
+    for (i, &b) in [15u8, 16, 17].iter().enumerate() {
+        dma_write(ptr, 5 + i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8); // reloaded to len
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(ch)); // FTF pending, ISR not yet run (wraps == 0)
+
+    // `read` must attribute the pending wrap (write index = 8) and return the 3 new bytes, NOT a
+    // spurious Overrun. `.unwrap()` asserts it is Ok (the old, buggy snapshot returned Err(Overrun)).
+    let n = rx.read(&mut out).unwrap();
+    assert_eq!(
+        n, 3,
+        "the 3 bytes of the just-completed lap, no spurious overrun"
+    );
+    assert_eq!(&out[..3], &[15, 16, 17]);
+}
+
+// --- B10: F1x0 grouped DMA demux routes Ch4, ignores Ch3 -------------------------------------
+
+#[test]
+fn b10_grouped_demux_routes_ch4_not_ch3() {
+    let fam = f1x0();
+    let _g = setup();
+    let (_rx, ch, _ptr) = install_ring(&fam, 16);
+    assert_eq!(ch, 4, "F1x0 USART1_RX is Ch4");
+
+    // Both the unrelated Ch3 and our Ch4 have a full-transfer flag pending in INTF.
+    let ch3_ftf = ftf_flag(3);
+    Reg32::new(DMA0_BASE, 0x00).write(ch3_ftf | ftf_flag(4));
+    fire_dma(&fam); // the grouped Ch3/4 vector
+
+    // Exactly one wrap counted (Ch4's), and INTC cleared ONLY Ch4's bits (GIF+FTFIF at 4*4): Ch3 was
+    // not serviced and no Ch3 event was invented.
+    assert_eq!(
+        crate::dma::wraps(),
+        1,
+        "only the Ch4 full-transfer was counted"
+    );
+    let intc = Reg32::new(DMA0_BASE, 0x04).read();
+    assert_eq!(intc & ftf_flag(4), ftf_flag(4), "Ch4 FTF cleared");
+    assert_eq!(intc & (1 << (4 * 4)), 1 << (4 * 4), "Ch4 GIF cleared");
+    assert_eq!(intc & ch3_ftf, 0, "Ch3 flags untouched (not dispatched)");
+    assert_eq!(intc & (1 << (4 * 3)), 0, "Ch3 GIF untouched");
+}
+
+// --- B11: write-back self-check fails loud, arming nothing ------------------------------------
+
+#[test]
+fn b11_self_check_failure_arms_nothing() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let buf: &'static mut [u8] = vec![0u8; 32].leak();
+    let ch = DmaRxMap::usart1_rx(&chip).channel;
+
+    // Model a non-responsive channel: writes to CHxMADDR do not stick, so the write-back self-check
+    // reads back something other than the sentinel.
+    mock::freeze(DMA0_BASE + ch_maddr(ch));
+
+    assert!(
+        matches!(
+            RingBufferedRx::new(&chip, usart, buf),
+            Err(DescriptorError::SelfCheckFailed)
+        ),
+        "a channel that does not respond fails loud"
+    );
+    // Nothing was armed: CHEN stays clear (configure_circular never ran).
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        0,
+        "no channel armed on a failed self-check"
+    );
+}
+
+// --- B12: line error stops reception; a fresh new re-arms (no auto-restart) -------------------
+
+#[test]
+fn b12_line_error_stops_reception_and_re_new_rearms() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut rx, ch, _ptr) = install_ring(&fam, 32);
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        CHEN,
+        "armed at start"
+    );
+
+    // A USART line error (ERRIE path) during background reception: stage FERR and fire the shared
+    // USART ISR, which records the sticky line error.
+    Reg32::new(USART_BASE, fam.stat).write(FERR);
+    fire(&fam);
+
+    // read surfaces the error AND stops background reception (CHEN cleared) - fail-loud, no restart.
+    let mut out = [0u8; 8];
+    assert_eq!(
+        rx.read(&mut out),
+        Err(UsartError::Framing),
+        "line error surfaced"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        0,
+        "reception stopped (channel disabled), no silent auto-restart"
+    );
+
+    // A fresh `new` re-arms: CHEN set again, and DENR/IDLEIE/ERRIE re-enabled.
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let buf2: &'static mut [u8] = vec![0u8; 32].leak();
+    let _rx2 = RingBufferedRx::new(&chip, usart, buf2).unwrap();
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        CHEN,
+        "re-armed: CHEN set"
+    );
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_DENR,
+        CTL2_DENR,
+        "DENR re-enabled"
+    );
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_ERRIE,
+        CTL2_ERRIE,
+        "ERRIE re-enabled"
+    );
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl0).read() & CTL0_IDLEIE,
+        CTL0_IDLEIE,
+        "IDLEIE re-enabled"
+    );
+}

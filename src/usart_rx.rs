@@ -1,0 +1,589 @@
+//! Interrupt-buffered USART receive: [`BufferedRx`] (G-DMA-UART Gate A).
+//!
+//! The polled USART (`usart.rs`, `serial.rs`) stays the silicon-proven low-rate path; this adds a
+//! non-blocking, IDLE-framed RX mode on top of it without spending a DMA channel. The model is
+//! embassy-stm32's `BufferedUart` RX: an ISR pushes each `RBNE` byte into a lock-free SPSC ring and
+//! the IDLE-line interrupt marks the variable-length frame boundary; the main loop drains the ring.
+//!
+//! # The shared-ISR ownership problem (and how it is solved)
+//!
+//! The USART RX vector is an argument-less `extern "C" fn` (it reaches the ISR body via
+//! [`crate::irq::call_usart_rx_handler`]), yet the body needs the USART registers and the ring. The
+//! crate already solved this for the control loop (a static handler pointer, DECISIONS.md #7) and the
+//! grouped demux (a static base). This module uses the same shape: a single `static` RX context
+//! ([`RX_USART1`]) holds the USART base + the family bit + the ring's queue pointer + the
+//! monomorphised push, and is inert until [`BufferedRx::new`] installs it. The ISR does NO per-family
+//! branching beyond reading the one already-resolved family bit (DECISIONS.md #4).
+//!
+//! # Why the ring is reconstructed per access
+//!
+//! [`heapless::spsc::Producer`] / [`Consumer`] are stateless single-field handles (`rb: &Queue`); all
+//! state (head/tail) lives in the `Queue`'s atomics, which is what makes SPSC lock-free. So the
+//! producer (ISR) and consumer (main) are each just the queue pointer, reconstructed per access from
+//! that pointer. `new`'s `assert_eq!` pins the one-pointer layout the reconstruction relies on. The
+//! ISR is the sole producer and the main loop the sole consumer, so the SPSC contract holds.
+
+use core::mem::{size_of, transmute_copy};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+
+use heapless::spsc::{Consumer, Producer, Queue};
+
+use crate::chip::Chip;
+// `IrqLayout` is used only by the NVIC-IRQ-number helpers, which are hardware-build-only.
+#[cfg(not(feature = "mock"))]
+use crate::descriptor::IrqLayout;
+use crate::error::{DescriptorError, UsartError};
+use crate::irq;
+use crate::usart::Usart;
+
+// --- the static RX context (one per supported instance; the bench needs only USART1) ----------
+
+/// Sticky line-error codes stored in [`RxSlot::line_error`] (0 = none). The buffered path surfaces a
+/// line error through the next [`BufferedRx::read`], the way the polled path surfaces it inline.
+const ERR_NONE: u8 = 0;
+const ERR_FRAMING: u8 = 1;
+const ERR_PARITY: u8 = 2;
+const ERR_OVERRUN: u8 = 3;
+
+/// The single static RX context for USART1. Every field is an atomic, so the whole `static` is
+/// `Sync` and the ISR reads it lock-free. Inert (`installed == false`, `base == 0`) until
+/// [`BufferedRx::new`] installs it, exactly like the grouped demux's base is 0 until set.
+struct RxSlot {
+    /// `true` once `new` has installed a context; the ISR is a no-op before this.
+    installed: AtomicBool,
+    /// The USART base the ISR rebuilds its handle from.
+    base: AtomicU32,
+    /// Family bit (`true` = F1x0 register model), for the IDLE/error clears.
+    is_f1x0: AtomicBool,
+    /// The application's `'static` ring, as a type-erased pointer (the producer/consumer are
+    /// reconstructed from it; see the module docs).
+    queue: AtomicPtr<()>,
+    /// The monomorphised `push_impl::<N>`, type-erased as `fn(*mut (), u8) -> bool` (same erase the
+    /// control-handler pointer uses).
+    push: AtomicPtr<()>,
+    /// Sticky ring-full overflow, surfaced as [`UsartError::Overrun`] by the next `read`.
+    overflow: AtomicBool,
+    /// Set by the ISR on an IDLE boundary, cleared only by [`BufferedRx::take_idle`] (NOT by `read`):
+    /// a library-owned latch the caller explicitly consumes, the frame-complete hint.
+    idle_seen: AtomicBool,
+    /// Sticky line error (see the `ERR_*` codes), surfaced by the next `read`.
+    line_error: AtomicU8,
+}
+
+impl RxSlot {
+    const fn new() -> Self {
+        RxSlot {
+            installed: AtomicBool::new(false),
+            base: AtomicU32::new(0),
+            is_f1x0: AtomicBool::new(false),
+            queue: AtomicPtr::new(core::ptr::null_mut()),
+            push: AtomicPtr::new(core::ptr::null_mut()),
+            overflow: AtomicBool::new(false),
+            idle_seen: AtomicBool::new(false),
+            line_error: AtomicU8::new(ERR_NONE),
+        }
+    }
+}
+
+/// The USART1 RX context. One instance: the bench (and current firmware) only buffers USART1.
+static RX_USART1: RxSlot = RxSlot::new();
+
+// --- monomorphised ring access (the type erasure boundary) ------------------------------------
+
+/// Push one byte into the ring, reconstructing the (stateless) producer from the queue pointer.
+/// Returns `false` if the ring is full. Installed into the slot as `push_impl::<N>`.
+fn push_impl<const N: usize>(q: *mut (), b: u8) -> bool {
+    let qref = q as *const Queue<u8, N>;
+    // SAFETY: `qref` is the queue pointer `new::<N>` stored; a `Producer` is one `&Queue` (the
+    // `assert_eq!` in `new` pins that layout). The ISR is the sole producer, so reconstructing a
+    // handle per call is sound (head/tail live in the queue's atomics).
+    let mut prod: Producer<'static, u8, N> = unsafe { transmute_copy(&qref) };
+    prod.enqueue(b).is_ok()
+}
+
+/// Pop one byte from the ring, reconstructing the (stateless) consumer from the queue pointer.
+fn pop_impl<const N: usize>(q: *mut ()) -> Option<u8> {
+    let qref = q as *const Queue<u8, N>;
+    // SAFETY: as `push_impl`; the main loop is the sole consumer.
+    let mut cons: Consumer<'static, u8, N> = unsafe { transmute_copy(&qref) };
+    cons.dequeue()
+}
+
+/// True if the ring has at least one buffered byte.
+fn ready_impl<const N: usize>(q: *mut ()) -> bool {
+    let qref = q as *const Queue<u8, N>;
+    // SAFETY: as `pop_impl`.
+    let cons: Consumer<'static, u8, N> = unsafe { transmute_copy(&qref) };
+    cons.ready()
+}
+
+// --- the ISR body (registered by `new`, reached via the USART1 vector slot) -------------------
+
+/// The registered ISR body: service the USART1 RX context. Reached from the `usart1_rx_isr` vector
+/// slot through [`crate::irq::call_usart_rx_handler`].
+extern "C" fn rx_irq_handler() {
+    on_usart_rx_irq(&RX_USART1);
+}
+
+/// The interrupt-buffered RX ISR logic, factored out so a host test drives it against the mock
+/// register space (the [`crate::irq::mock_vtor::dispatch`] path runs this via the registered handler).
+///
+/// Per the spec §4.2: read STAT once; clear+record any line error; drain every ready `RBNE` byte
+/// into the ring (flag overflow if full); then clear+flag IDLE. The drain is a loop, not a single
+/// read, matching the FIFO-less discipline the polled path documents.
+fn on_usart_rx_irq(slot: &RxSlot) {
+    if !slot.installed.load(Ordering::Acquire) {
+        return;
+    }
+    let u = Usart::from_parts(
+        slot.base.load(Ordering::Acquire),
+        slot.is_f1x0.load(Ordering::Acquire),
+    );
+
+    // Line error (overrun / framing / parity): record sticky + clear the family-correct way so it
+    // cannot latch and strand RX (the regression the polled path fixed, carried over).
+    let st = u.read_status();
+    if let Some(e) = st.line_error() {
+        record_line_error(slot, e);
+        u.clear_line_errors(&st);
+    }
+
+    // Drain every byte that is ready this entry.
+    loop {
+        if !u.read_status().rx_ready {
+            break;
+        }
+        let byte = u.read_rbne_byte();
+        if !push_byte(slot, byte) {
+            slot.overflow.store(true, Ordering::Release);
+            break;
+        }
+    }
+
+    // IDLE boundary: clear it the family-correct way and flag it for the reader.
+    if u.idle_flag() {
+        u.clear_idle();
+        slot.idle_seen.store(true, Ordering::Release);
+    }
+}
+
+/// Record a line error stickily, keeping the FIRST one seen (precedence matches
+/// [`crate::usart::Status::line_error`]: overrun, then framing, then parity).
+fn record_line_error(slot: &RxSlot, e: UsartError) {
+    let code = match e {
+        UsartError::Overrun => ERR_OVERRUN,
+        UsartError::Framing => ERR_FRAMING,
+        UsartError::Parity => ERR_PARITY,
+        _ => ERR_NONE,
+    };
+    if code != ERR_NONE {
+        let _ =
+            slot.line_error
+                .compare_exchange(ERR_NONE, code, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// Push through the slot's installed (type-erased) producer.
+fn push_byte(slot: &RxSlot, b: u8) -> bool {
+    let q = slot.queue.load(Ordering::Acquire);
+    let p = slot.push.load(Ordering::Acquire);
+    if q.is_null() || p.is_null() {
+        return false;
+    }
+    // SAFETY: `p` is the `push_impl::<N>` fn pointer `new` stored (erased as `*mut ()`, the same way
+    // the control-handler pointer is erased), and `q` is the matching queue pointer.
+    let push: fn(*mut (), u8) -> bool = unsafe { transmute_copy(&p) };
+    push(q, b)
+}
+
+fn decode_error(code: u8) -> UsartError {
+    match code {
+        ERR_FRAMING => UsartError::Framing,
+        ERR_PARITY => UsartError::Parity,
+        _ => UsartError::Overrun,
+    }
+}
+
+// --- shared RX-context install + NVIC unmask --------------------------------------------------
+
+/// Install the static USART RX context and register the shared `usart1_rx_isr` body. Both
+/// [`BufferedRx`] (with a real ring `queue`/`push`) and [`RingBufferedRx`] (with null `queue`/`push`:
+/// under DMA the ISR's RBNE drain never runs, only its IDLE + line-error path) use this, so the IDLE
+/// latch and line-error sticky live in one place (section 3.2 / 5.3).
+fn install_usart_ctx(usart: &Usart, queue: *mut (), push: *mut ()) {
+    let slot = &RX_USART1;
+    slot.base.store(usart.base(), Ordering::Release);
+    slot.is_f1x0.store(usart.is_f1x0(), Ordering::Release);
+    slot.queue.store(queue, Ordering::Release);
+    slot.push.store(push, Ordering::Release);
+    slot.overflow.store(false, Ordering::Release);
+    slot.idle_seen.store(false, Ordering::Release);
+    slot.line_error.store(ERR_NONE, Ordering::Release);
+    slot.installed.store(true, Ordering::Release);
+    irq::register_usart_rx_handler(rx_irq_handler);
+}
+
+/// The USART1 IRQ number for `chip`'s family (the vector differs: 28 on F1x0, 38 on F10x). Used only
+/// to drive the NVIC, so it is hardware-build-only.
+#[cfg(not(feature = "mock"))]
+#[inline]
+fn usart_irq_num(chip: &Chip) -> usize {
+    match chip.irq() {
+        IrqLayout::F1x0Grouped => irq::F1X0_USART1_IRQ,
+        IrqLayout::F10xSeparate => irq::F10X_USART1_IRQ,
+    }
+}
+
+/// The DMA-RX IRQ number for `chip`'s family (separate `DMA0_Channel5` = 16 on F10x, grouped
+/// `DMA_Channel3_4` = 11 on F1x0). Hardware-build-only (drives the NVIC).
+#[cfg(not(feature = "mock"))]
+#[inline]
+fn dma_irq_num(chip: &Chip) -> usize {
+    match chip.irq() {
+        IrqLayout::F1x0Grouped => irq::F1X0_DMA_CH3_4_IRQ,
+        IrqLayout::F10xSeparate => irq::F10X_DMA0_CH5_IRQ,
+    }
+}
+
+// --- NVIC interrupt number (hardware build only) ----------------------------------------------
+
+/// A device IRQ number as a [`cortex_m::interrupt::InterruptNumber`] for [`NVIC::unmask`]. This is the
+/// first place the crate drives the NVIC (the firmware owns enabling its interrupts).
+#[cfg(not(feature = "mock"))]
+#[derive(Clone, Copy)]
+struct IrqNum(u16);
+
+#[cfg(not(feature = "mock"))]
+// SAFETY: the value is a GD SPL `IRQn_Type` number (USART1 / DMA channel), a valid device IRQ number.
+unsafe impl cortex_m::interrupt::InterruptNumber for IrqNum {
+    #[inline]
+    fn number(self) -> u16 {
+        self.0
+    }
+}
+
+/// Unmask a device IRQ in the NVIC. Hardware only: there is no NVIC under `cargo test`, where the host
+/// suite fires the ISR via `mock_vtor::dispatch` instead.
+#[cfg(not(feature = "mock"))]
+#[inline]
+fn nvic_unmask(irq_num: usize) {
+    // SAFETY: the RAM vector table routing this IRQ is the caller's pre-`new` responsibility; unmasking
+    // now is what first allows the IRQ to fire.
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(IrqNum(irq_num as u16));
+    }
+}
+
+// --- the public type --------------------------------------------------------------------------
+
+/// Interrupt-buffered, IDLE-framed USART receiver (G-DMA-UART Gate A).
+///
+/// Built from an already-brought-up [`Usart`] (consuming it: the RX path now owns that instance's RX
+/// interrupt). The ISR fills a `'static` SPSC ring the application owns (DECISIONS.md #10: buffers are
+/// application code, not a HAL default); [`read`](BufferedRx::read) drains it non-blocking. No DMA
+/// channel is spent, so this is the cheap option for moderate-rate framed-protocol RX.
+pub struct BufferedRx {
+    /// The application ring, type-erased (the consumer is reconstructed from this per `read`).
+    queue: *mut (),
+    /// Monomorphised pop / ready for this ring's `N` (concrete fn pointers; no erasure needed since
+    /// they live in non-generic fields set by the generic `new`).
+    pop: fn(*mut ()) -> Option<u8>,
+    ready: fn(*mut ()) -> bool,
+}
+
+impl BufferedRx {
+    /// Install interrupt-buffered RX on a brought-up `usart`, using `storage` as the `'static` ring.
+    ///
+    /// Performs, in order: install the static RX context (USART base + family bit + the ring); enable
+    /// `RBNEIE` + `IDLEIE` on the USART; register the ISR body; then unmask the USART IRQ in the NVIC.
+    /// The application must have flipped `VTOR` to the RAM table (the [`crate::irq::install`] contract)
+    /// BEFORE calling this, since `new` is the thing that enables the IRQ the table must already
+    /// route. `N` is the ring capacity word (the ring holds `N - 1` bytes, per `heapless`).
+    pub fn new<const N: usize>(
+        chip: &Chip,
+        usart: Usart,
+        storage: &'static mut Queue<u8, N>,
+    ) -> Result<BufferedRx, DescriptorError> {
+        // The type erasure reconstructs the producer/consumer from the queue pointer, which is sound
+        // only because a `heapless` producer/consumer is exactly one pointer. Pin that here.
+        assert_eq!(
+            size_of::<Producer<'static, u8, N>>(),
+            size_of::<*mut ()>(),
+            "heapless Producer must be one pointer for the RX ISR type erasure"
+        );
+
+        let queue = storage as *mut Queue<u8, N> as *mut ();
+
+        // 1. Install the shared RX context (base + family bit + this ring's queue + monomorphised push)
+        //    and register the ISR body the USART1 vector routes to.
+        install_usart_ctx(&usart, queue, push_impl::<N> as *mut ());
+
+        // 2. Enable the RX interrupt sources on the USART.
+        usart.listen_rbne();
+        usart.listen_idle();
+
+        // 3. Unmask the USART IRQ in the NVIC (hardware only).
+        let _ = chip;
+        #[cfg(not(feature = "mock"))]
+        nvic_unmask(usart_irq_num(chip));
+
+        Ok(BufferedRx {
+            queue,
+            pop: pop_impl::<N>,
+            ready: ready_impl::<N>,
+        })
+    }
+
+    /// Drain buffered bytes into `buf`; returns the count (0 if the ring is currently empty,
+    /// non-blocking). A sticky condition is surfaced FIRST as an `Err`, then cleared, so the next
+    /// `read` resumes draining:
+    /// - [`UsartError::Overrun`]: the ring filled (a byte was dropped) or the USART raised `ORERR`.
+    /// - [`UsartError::Framing`] / [`UsartError::Parity`]: a line error the ISR cleared so it cannot
+    ///   latch.
+    ///
+    /// `Ok(0)` means "nothing buffered right now", never an error (matching the `try_read_byte`
+    /// contract that the empty case is not a failure).
+    ///
+    /// `read` does NOT touch the IDLE latch: the frame boundary is consumed only by
+    /// [`take_idle`](BufferedRx::take_idle), so a drain-then-check poll loop cannot race the boundary
+    /// away (the caller owns when the latch is consumed, not the byte path).
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
+        let slot = &RX_USART1;
+
+        // Surface a sticky condition first (overflow as Overrun, then any line error), clearing it.
+        if slot.overflow.swap(false, Ordering::AcqRel) {
+            return Err(UsartError::Overrun);
+        }
+        let code = slot.line_error.swap(ERR_NONE, Ordering::AcqRel);
+        if code != ERR_NONE {
+            return Err(decode_error(code));
+        }
+
+        let mut n = 0;
+        while n < buf.len() {
+            match (self.pop)(self.queue) {
+                Some(b) => {
+                    buf[n] = b;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(n)
+    }
+
+    /// True if at least one byte is buffered (the `embedded-io` `ReadReady` shape).
+    pub fn ready(&self) -> bool {
+        (self.ready)(self.queue)
+    }
+
+    /// Atomically read-and-clear the IDLE latch: returns `true` exactly once per IDLE boundary the
+    /// ISR has flagged since the previous `take_idle`, and consumes it. This is the frame-complete
+    /// hint, and it is the ONLY thing that clears the latch ([`read`](BufferedRx::read) does not), so
+    /// the natural pattern is sound without any read-gating discipline by the caller:
+    ///
+    /// ```ignore
+    /// let n = rx.read(&mut buf[len..])?;   // drain whatever is buffered
+    /// len += n;
+    /// if rx.take_idle() && len > 0 {       // boundary consumed: this frame is complete
+    ///     // ... handle the frame ...
+    /// }
+    /// ```
+    ///
+    /// Because the latch persists across `read` calls until taken, an IDLE that the ISR serviced in
+    /// the same entry as the final bytes (or between two polls) is still observed on the next
+    /// `take_idle`, not silently eaten.
+    pub fn take_idle(&self) -> bool {
+        RX_USART1.idle_seen.swap(false, Ordering::AcqRel)
+    }
+}
+
+// --- DMA-ring mode: RingBufferedRx (circular DMA + IDLE) --------------------------------------
+
+/// DMA-ring USART receiver (G-DMA-UART Gate B): a circular DMA continuously refills a `'static` byte
+/// buffer while the CPU does no per-byte work; [`read`](RingBufferedRx::read) drains bytes behind the
+/// live DMA write position (`len - CHxCNT`). The IDLE boundary (shared USART ISR) and lap-overrun are
+/// surfaced explicitly. This is the low-CPU high-rate mode; [`take_idle`](RingBufferedRx::take_idle)
+/// gives the same frame-complete hint as [`BufferedRx`].
+pub struct RingBufferedRx {
+    map: crate::dma::DmaRxMap,
+    /// The application-owned `'static` DMA buffer (the DMA writes it; the CPU only reads bytes strictly
+    /// behind the live write index, section 6).
+    buf: *mut u8,
+    len: usize,
+    /// Monotonic count of bytes the application has consumed (the read cursor). `% len` is the buffer
+    /// position; comparing it to `wraps * len + (len - CHxCNT)` detects a lapped (overwritten) cursor.
+    cursor: u64,
+}
+
+impl RingBufferedRx {
+    /// Arm circular DMA RX on a brought-up `usart`, writing into `dma_buf` (section 5.1). In order:
+    /// resolve [`DmaRxMap`](crate::dma::DmaRxMap); enable the DMA clock; **write-back self-check** (fail
+    /// loud if the channel does not respond, arming nothing); program the channel (PADDR = RDATA,
+    /// MADDR = buf, CNT = len, circular, half+full IRQ) and start it (`CHEN` last, after a Release
+    /// fence); on the USART set `DENR` + `IDLEIE` + `ERRIE`; install the shared RX context + the DMA-RX
+    /// context; unmask both IRQs. The caller must have flipped `VTOR` to the RAM table first.
+    ///
+    /// `dma_buf` length must fit `CHxCNT` (<= 65535) and be non-empty; an out-of-range length is a
+    /// [`DescriptorError::Unsupported`]. A failed self-check is [`DescriptorError::SelfCheckFailed`].
+    pub fn new(
+        chip: &Chip,
+        usart: Usart,
+        dma_buf: &'static mut [u8],
+    ) -> Result<RingBufferedRx, DescriptorError> {
+        let len = dma_buf.len();
+        if len == 0 || len > u16::MAX as usize {
+            return Err(DescriptorError::Unsupported);
+        }
+        let buf = dma_buf.as_mut_ptr();
+
+        // 1. Resolve the DMA mapping for this family.
+        let map = crate::dma::DmaRxMap::usart1_rx(chip);
+
+        // 2. Enable the DMA controller clock.
+        crate::clock::enable_dma(chip.rcu_base()?);
+
+        // 2a. Stop any channel that may still be running (re-arming after a prior `new`): a live channel
+        //     must not be poked by the self-check's `CHxMADDR` write, which would briefly point its
+        //     writes at the sentinel address. Disable it first; the line is quiescent at re-arm time.
+        map.disable();
+
+        // 3. Write-back self-check (fail-loud): confirm the resolved channel responds before arming.
+        if !map.self_check() {
+            return Err(DescriptorError::SelfCheckFailed);
+        }
+
+        // 4-5. Program + start the channel (CHEN last, Release fence inside).
+        // SAFETY: `buf` points at the caller's `'static` `dma_buf` of `len` bytes, which outlives the
+        // channel (the `&'static mut` contract); the DMA writes it while we only read behind its head.
+        unsafe { map.configure_circular(usart.rdata_addr(), buf as u32, len as u16) };
+
+        // 6. USART: route bytes to DMA, raise the IDLE boundary, raise line errors.
+        usart.enable_dma_rx();
+        usart.listen_idle();
+        usart.listen_errors();
+
+        // Install the shared RX context (no SPSC ring under DMA: the ISR's RBNE drain never runs, since
+        // the DMA controller's RDATA read auto-clears RBNE; only its IDLE + line-error path is used).
+        install_usart_ctx(&usart, core::ptr::null_mut(), core::ptr::null_mut());
+        // Install the DMA-RX context (wrap counter) + register the DMA ISR body.
+        crate::dma::install(&map);
+
+        // 7. Unmask both the DMA-channel and the USART IRQ (hardware only).
+        let _ = chip;
+        #[cfg(not(feature = "mock"))]
+        {
+            nvic_unmask(dma_irq_num(chip));
+            nvic_unmask(usart_irq_num(chip));
+        }
+
+        Ok(RingBufferedRx {
+            map,
+            buf,
+            len,
+            cursor: 0,
+        })
+    }
+
+    /// A consistent snapshot of (effective wrap count, remaining) for the live DMA write position.
+    ///
+    /// Two hazards at a circular wrap, both handled:
+    /// 1. A wrap the ISR HAS counted landing mid-snapshot: re-read the wrap counter around the rest and
+    ///    retry on a change (`w1 == w2`).
+    /// 2. A wrap the ISR has NOT yet counted: at the wrap, hardware reloads `CHxCNT` to `len` and sets
+    ///    the channel's `FTFIF`, but the wrap-counter ISR runs slightly later. If the snapshot reads the
+    ///    reloaded `CHxCNT == len` with the old wrap count, `write_total` would undercount by `len`,
+    ///    underflow `available`, and report a SPURIOUS overrun though the cursor was never lapped. So the
+    ///    snapshot also reads the pending `FTFIF` and attributes that wrap (`+1`) to the position. The
+    ///    `CHxCNT` re-read (`rem_b <= rem_a`) rejects a reload that slipped in after the flag read.
+    #[inline]
+    fn snapshot(&self) -> (u32, u16) {
+        loop {
+            let w1 = crate::dma::wraps();
+            let rem_a = self.map.remaining();
+            let ftf = self.map.ftf_pending();
+            let rem_b = self.map.remaining();
+            let w2 = crate::dma::wraps();
+            if w1 != w2 {
+                continue; // a counted wrap landed during the snapshot: retry
+            }
+            if ftf {
+                // An uncounted wrap is pending; `rem_b` (read after the flag) reflects the new lap.
+                return (w1 + 1, rem_b);
+            }
+            if rem_b <= rem_a {
+                // No wrap in progress (`CHxCNT` only counted down): consistent.
+                return (w1, rem_b);
+            }
+            // `CHxCNT` increased (a reload) but the flag was read clear just before it: retry so the
+            // next pass observes `FTFIF` set and attributes the wrap.
+        }
+    }
+
+    /// Drain bytes that have arrived since the last read (between the cursor and the live DMA write
+    /// position `len - CHxCNT`), into `buf`; returns the count, 0 if none (non-blocking).
+    ///
+    /// Fail-loud surfaces, each clearing its condition:
+    /// - A USART line error (the `ERRIE` path, recorded by the shared ISR) returns its
+    ///   [`UsartError`] and **stops background reception** (disables the channel); the caller must
+    ///   `new` again to resume (section 5.4, no silent auto-restart).
+    /// - A lapped cursor (the DMA wrote more than `len` bytes ahead of the cursor: bytes were
+    ///   overwritten before being read) returns [`UsartError::Overrun`] and resyncs the cursor to the
+    ///   freshest position so subsequent reads continue (section 5.2).
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
+        // Line error first (fail-loud): stop reception and surface; caller re-`new`s.
+        let code = RX_USART1.line_error.swap(ERR_NONE, Ordering::AcqRel);
+        if code != ERR_NONE {
+            self.map.disable();
+            return Err(decode_error(code));
+        }
+
+        let (wraps, rem) = self.snapshot();
+        // Live monotonic write position: full laps + this lap's progress (CHxCNT counts down from len).
+        let write_total = wraps as u64 * self.len as u64 + (self.len as u64 - rem as u64);
+        let available = write_total - self.cursor;
+
+        // Lap-overrun: the head passed the cursor by more than a full buffer (section 5.2).
+        if available > self.len as u64 {
+            self.cursor = write_total; // drop the overwritten data; resume from the live position
+            return Err(UsartError::Overrun);
+        }
+
+        let n = core::cmp::min(available as usize, buf.len());
+        // Section 6: the buffer reads must not be hoisted before the CHxCNT snapshot above.
+        core::sync::atomic::compiler_fence(Ordering::Acquire);
+        for (i, slot) in buf.iter_mut().enumerate().take(n) {
+            let pos = ((self.cursor + i as u64) % self.len as u64) as usize;
+            // SAFETY: `pos < len`, within the `'static` buffer; the byte is strictly behind the live
+            // DMA write index, so it is fully written and not being overwritten now (section 6).
+            *slot = unsafe { core::ptr::read_volatile(self.buf.add(pos)) };
+        }
+        self.cursor += n as u64;
+        Ok(n)
+    }
+
+    /// Atomically read-and-clear the IDLE latch (the frame-complete hint), exactly as
+    /// [`BufferedRx::take_idle`]: the IDLE boundary is delivered by the shared USART IRQ (section 5.3),
+    /// so the DMA-ring reader uses the same latch to know a variable-length frame just ended.
+    pub fn take_idle(&self) -> bool {
+        RX_USART1.idle_seen.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Reset the static RX context and the registered handler (host-test teardown between cases).
+#[cfg(feature = "mock")]
+pub fn reset_for_test() {
+    let slot = &RX_USART1;
+    slot.installed.store(false, Ordering::Release);
+    slot.base.store(0, Ordering::Release);
+    slot.is_f1x0.store(false, Ordering::Release);
+    slot.queue.store(core::ptr::null_mut(), Ordering::Release);
+    slot.push.store(core::ptr::null_mut(), Ordering::Release);
+    slot.overflow.store(false, Ordering::Release);
+    slot.idle_seen.store(false, Ordering::Release);
+    slot.line_error.store(ERR_NONE, Ordering::Release);
+    irq::clear_usart_rx_handler();
+}
+
+#[cfg(test)]
+mod tests;

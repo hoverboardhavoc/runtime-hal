@@ -104,6 +104,23 @@ pub const F10X_EXTI5_9_IRQ: usize = 23;
 /// F10x `EXTI10_15_IRQn`.
 pub const F10X_EXTI10_15_IRQ: usize = 40;
 
+/// F1x0 `USART1_IRQn` (the bench port USART1, PA2/PA3): the vector the interrupt-buffered RX
+/// ([`crate::usart_rx::BufferedRx`]) routes through. From the GD SPL `IRQn_Type` (`gd32f1x0.h:159`),
+/// the same authority as the timer/ADC IRQ consts above.
+pub const F1X0_USART1_IRQ: usize = 28;
+/// F10x `USART1_IRQn` (`gd32f10x.h:159`). Note the SAME logical USART1 sits on a DIFFERENT vector
+/// number per family (28 vs 38), so the layout-specific `build_table` arm picks the right slot.
+pub const F10X_USART1_IRQ: usize = 38;
+
+/// F10x `DMA0_Channel5_IRQn` (`gd32f10x.h:135`): on F10x the DMA channel carrying `USART1_RX` (Ch5)
+/// has its OWN vector (separate-vector layout). The DMA-ring RX ([`crate::usart_rx::RingBufferedRx`])
+/// routes through it.
+pub const F10X_DMA0_CH5_IRQ: usize = 16;
+/// F1x0 `DMA_Channel3_4_IRQn` (`gd32f1x0.h:143`): channels 3 and 4 SHARE one vector (grouped layout),
+/// so `USART1_RX` (Ch4 on F1x0) arrives here alongside Ch3 and the handler demuxes by reading DMA
+/// `INTF` (the DMA twin of the grouped advanced-timer vector).
+pub const F1X0_DMA_CH3_4_IRQ: usize = 11;
+
 // --- TIMER0 interrupt-flag register (INTF, offset 0x10) for the grouped demux ------------------
 //
 // The F1x0 combined handler routes its bundled sub-sources by reading TIMER0_INTF (gd32f1x0_timer.h:
@@ -237,6 +254,84 @@ pub fn on_systick() {
     call_tick_handler();
 }
 
+// --- Static USART RX handler registration (G-DMA-UART Gate A) ---------------------------------
+//
+// The USART1 RX vector routes through this pair, exactly the way the ADC vector routes through
+// `call_control_handler`. The interrupt-buffered RX ([`crate::usart_rx::BufferedRx`]) registers its
+// `'static` ISR body at bring-up via [`register_usart_rx_handler`]; the `usart1_rx_isr` slot
+// ([`build_table`]) calls through it via [`call_usart_rx_handler`], with a no-op default
+// ([`default_usart_rx_handler`]) guarding the pre-registration window. The ISR body (reading the
+// USART, filling the ring) lives in `usart_rx`, not here, so this module stays the substrate.
+
+/// The no-op default that guards the pre-registration window (mirrors [`default_control_handler`]).
+pub extern "C" fn default_usart_rx_handler() {}
+
+/// The registered USART RX handler pointer. `AtomicPtr` so registration is one atomic store and the
+/// ISR read is lock-free; starts at the no-op default.
+static USART_RX_HANDLER: AtomicPtr<()> = AtomicPtr::new(default_usart_rx_handler as *mut ());
+
+/// Register the interrupt-buffered RX `'static` ISR body (G-DMA-UART). Called once by
+/// [`crate::usart_rx::BufferedRx::new`], before it unmasks the USART IRQ. Replaces the no-op default.
+/// Symmetric with [`register_control_handler`].
+#[inline]
+pub fn register_usart_rx_handler(handler: ControlHandler) {
+    USART_RX_HANDLER.store(handler as *mut (), Ordering::Release);
+}
+
+/// Reset the registered USART RX handler back to the no-op default (host tests / clean teardown).
+#[inline]
+pub fn clear_usart_rx_handler() {
+    USART_RX_HANDLER.store(default_usart_rx_handler as *mut (), Ordering::Release);
+}
+
+/// Call the registered USART RX handler (or the no-op default if none is registered yet). The
+/// `usart1_rx_isr` slot calls through this.
+#[inline]
+pub fn call_usart_rx_handler() {
+    let p = USART_RX_HANDLER.load(Ordering::Acquire);
+    // SAFETY: `p` is always either `default_usart_rx_handler` or a `'static` fn the RX bring-up
+    // registered via `register_usart_rx_handler`; both are valid `extern "C" fn()` pointers.
+    let f: ControlHandler = unsafe { core::mem::transmute::<*mut (), ControlHandler>(p) };
+    f();
+}
+
+// --- Static DMA-RX handler registration (G-DMA-UART Gate B) ------------------------------------
+//
+// The DMA-channel vector that carries USART1_RX (its own vector on F10x, the grouped Ch3/4 vector on
+// F1x0) routes through this pair, mirroring the USART RX pair above. The DMA-ring RX
+// ([`crate::usart_rx::RingBufferedRx`]) registers a `'static` handler ([`crate::dma`]) that reads the
+// DMA `INTF`, services only the resolved channel's flags (the demux), and counts buffer wraps.
+
+/// The no-op default that guards the pre-registration window (mirrors [`default_usart_rx_handler`]).
+pub extern "C" fn default_dma_rx_handler() {}
+
+/// The registered DMA-RX handler pointer. `AtomicPtr`, starts at the no-op default.
+static DMA_RX_HANDLER: AtomicPtr<()> = AtomicPtr::new(default_dma_rx_handler as *mut ());
+
+/// Register the DMA-ring RX `'static` ISR body (G-DMA-UART). Called by
+/// [`crate::usart_rx::RingBufferedRx::new`] before it unmasks the DMA IRQ. Replaces the no-op default.
+#[inline]
+pub fn register_dma_rx_handler(handler: ControlHandler) {
+    DMA_RX_HANDLER.store(handler as *mut (), Ordering::Release);
+}
+
+/// Reset the registered DMA-RX handler back to the no-op default (host tests / clean teardown).
+#[inline]
+pub fn clear_dma_rx_handler() {
+    DMA_RX_HANDLER.store(default_dma_rx_handler as *mut (), Ordering::Release);
+}
+
+/// Call the registered DMA-RX handler (or the no-op default if none is registered yet). The
+/// `dma_rx_isr` slot calls through this.
+#[inline]
+pub fn call_dma_rx_handler() {
+    let p = DMA_RX_HANDLER.load(Ordering::Acquire);
+    // SAFETY: `p` is always either `default_dma_rx_handler` or a `'static` fn the RX bring-up
+    // registered via `register_dma_rx_handler`; both are valid `extern "C" fn()` pointers.
+    let f: ControlHandler = unsafe { core::mem::transmute::<*mut (), ControlHandler>(p) };
+    f();
+}
+
 // --- The owned RAM vector table (DECISIONS.md #6) ---------------------------------------------
 
 /// The owned RAM vector table (DECISIONS.md #6): an alignment-correct `static` in a dedicated
@@ -281,6 +376,10 @@ pub fn build_table(layout: IrqLayout) -> [usize; MAX_VECTORS] {
             t[SYSTEM_VECTORS + F1X0_EXTI0_1_IRQ] = handler_addr(exti_isr);
             t[SYSTEM_VECTORS + F1X0_EXTI2_3_IRQ] = handler_addr(exti_isr);
             t[SYSTEM_VECTORS + F1X0_EXTI4_15_IRQ] = handler_addr(exti_isr);
+            // The interrupt-buffered RX vector (USART1 = IRQ 28 on F1x0).
+            t[SYSTEM_VECTORS + F1X0_USART1_IRQ] = handler_addr(usart1_rx_isr);
+            // The DMA-ring RX vector: grouped DMA Ch3/4 = IRQ 11 on F1x0 (the handler demuxes Ch4).
+            t[SYSTEM_VECTORS + F1X0_DMA_CH3_4_IRQ] = handler_addr(dma_rx_isr);
         }
         IrqLayout::F10xSeparate => {
             t[SYSTEM_VECTORS + F10X_ADC0_1_IRQ] = handler_addr(adc_isr);
@@ -296,6 +395,10 @@ pub fn build_table(layout: IrqLayout) -> [usize; MAX_VECTORS] {
             }
             t[SYSTEM_VECTORS + F10X_EXTI5_9_IRQ] = handler_addr(exti_isr);
             t[SYSTEM_VECTORS + F10X_EXTI10_15_IRQ] = handler_addr(exti_isr);
+            // The interrupt-buffered RX vector (USART1 = IRQ 38 on F10x).
+            t[SYSTEM_VECTORS + F10X_USART1_IRQ] = handler_addr(usart1_rx_isr);
+            // The DMA-ring RX vector: separate DMA0 Ch5 = IRQ 16 on F10x.
+            t[SYSTEM_VECTORS + F10X_DMA0_CH5_IRQ] = handler_addr(dma_rx_isr);
         }
     }
 
@@ -344,6 +447,22 @@ extern "C" fn systick_handler() {
 /// the registered handler so the wiring is in place.
 extern "C" fn adc_isr() {
     call_control_handler();
+}
+
+/// The USART1 RX vector body (F1x0 IRQ 28 / F10x IRQ 38): route to the registered interrupt-buffered
+/// RX handler, exactly mirroring how [`adc_isr`] routes to [`call_control_handler`]. The handler
+/// (which fills the ring from the USART) lives in [`crate::usart_rx`]; until it is registered this is
+/// a safe no-op.
+extern "C" fn usart1_rx_isr() {
+    call_usart_rx_handler();
+}
+
+/// The DMA-RX vector body (F10x `DMA0_Channel5` IRQ 16 / F1x0 grouped `DMA_Channel3_4` IRQ 11): route
+/// to the registered DMA-ring RX handler ([`crate::dma`]), which reads DMA `INTF` and services only the
+/// resolved `USART1_RX` channel (the demux that ignores the other grouped channel on F1x0). Until that
+/// handler is registered this is a safe no-op.
+extern "C" fn dma_rx_isr() {
+    call_dma_rx_handler();
 }
 
 /// The advanced-timer capture/compare-channel vector body (separate on both layouts).

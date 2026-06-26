@@ -24,6 +24,10 @@ pub mod descriptor;
 /// MEASURES the per-instance advanced-timer / ADC counts by a benign scratch write-back, reads the
 /// flash density, and synthesizes the [`McuDescriptor`] the rest of the HAL is built on.
 pub mod detect;
+/// DMA channel driver for the circular USART RX (G-DMA-UART Gate B): [`dma::DmaRxMap`] resolves which
+/// controller/channel/IRQ carries `USART1_RX` per family and programs the circular periph->mem
+/// transfer; the DMA-ring receiver ([`usart_rx::RingBufferedRx`]) sits on top.
+pub mod dma;
 pub mod error;
 /// FMC flash erase/program driver ([`fmc::Fmc`]): the family-aware on-target flash primitive (page
 /// erase + halfword program at absolute addresses), with the unlock/command/BUSY-poll critical
@@ -48,6 +52,10 @@ pub mod spi;
 pub mod timebase;
 pub mod timer;
 pub mod usart;
+/// Interrupt-buffered, IDLE-framed USART receive (G-DMA-UART Gate A): [`usart_rx::BufferedRx`] fills
+/// a `'static` SPSC ring from the RX interrupt and drains it non-blocking, without spending a DMA
+/// channel. The polled path ([`serial::Serial`]) is unchanged.
+pub mod usart_rx;
 /// Free (independent) watchdog bring-up (G-WDG): the FWDGT/IWDG on the LSI/IRC40K
 /// ([`watchdog::FreeWatchdog`]). Resolve-once handle + per-pass [`watchdog::FreeWatchdog::feed`];
 /// one model parameterised by base, no per-family register branch.
@@ -83,6 +91,7 @@ pub use detect::{
 // feature, for the in-tree detection-acceptance bench firmware that must introspect detection.
 #[cfg(feature = "detect-internals")]
 pub use detect::{family_capability, synthesize, Family};
+pub use dma::DmaRxMap;
 pub use error::{
     AdcError, BringUpError, ClockError, DescriptorError, DetectError, FmcError, I2cError, PwmError,
     SpiError, UsartError, WatchdogError,
@@ -106,6 +115,7 @@ pub use timebase::{reload_for, Timebase, TimebaseError};
 pub use timer::arming::ArmGate;
 pub use timer::{ComplementaryPwm, PwmController, PwmHandle, PwmTimer};
 pub use usart::{compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel};
+pub use usart_rx::{BufferedRx, RingBufferedRx};
 pub use watchdog::{
     clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,
     PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,

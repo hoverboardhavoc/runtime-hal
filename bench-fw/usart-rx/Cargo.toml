@@ -1,0 +1,28 @@
+[package]
+name = "bench-fw-usart-rx"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "On-silicon S1 validator for the interrupt-buffered USART RX (G-DMA-UART Gate A): ONE binary, runtime-detected role (F10x=master, F1x0=slave), USART1 PA2/PA3 @115200 8N1 cross-wired, drives runtime-hal's BufferedRx as the receiver, pulses PB9 on a correct 16-byte frame + IDLE boundary, and publishes a fixed RAM result block readable over SWD."
+
+[dependencies]
+# runtime-hal in its normal (real volatile MMIO, no_std) build: NOT the `mock` feature.
+runtime-hal = { path = "../..", default-features = false }
+embedded-hal = "1.0"
+# BufferedRx's ring is an application-owned heapless SPSC queue (DECISIONS.md #10).
+heapless = "0.8"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-usart-rx"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

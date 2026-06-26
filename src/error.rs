@@ -29,6 +29,13 @@ pub enum DescriptorError {
     /// A routing entry point was handed a pin role it does not handle (e.g. a non-SPI
     /// [`crate::gpio::PinRole`] passed to [`crate::Chip::route_spi_pin`]).
     UnsupportedRole,
+    /// A configuration value is outside the range this driver supports (e.g. a DMA-ring buffer length
+    /// of 0 or above the 16-bit `CHxCNT` limit).
+    Unsupported,
+    /// A peripheral bring-up self-check failed: a benign scratch write-back did not stick, so the
+    /// resolved base/clock is wrong (the DMA-ring write-back self-check, section 5.1 step 3). Bring-up
+    /// fails loud rather than arming a channel that does not respond.
+    SelfCheckFailed,
 }
 
 /// The runtime-detection boot entry's failure surface.

@@ -133,12 +133,18 @@ mod backend {
 /// [`mock::reset`] into the middle of it.
 #[cfg(feature = "mock")]
 pub mod backend {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// Size of the simulated register window, in bytes. Generous for M1's handful of peripherals.
     pub const SPACE_BYTES: usize = 1 << 16;
 
     static SPACE: Mutex<[u8; SPACE_BYTES]> = Mutex::new([0u8; SPACE_BYTES]);
+
+    /// A single "non-responsive" word index whose writes are dropped, modelling a register that does
+    /// not stick (a disabled-clock / wrong-base channel). `usize::MAX` = none. Used by the DMA-ring
+    /// write-back self-check test (host case B11); reset clears it.
+    static FROZEN: AtomicUsize = AtomicUsize::new(usize::MAX);
 
     /// Serializes whole test cases that seed-then-assert against the shared `SPACE`. The
     /// per-access `SPACE` lock is dropped between each `read`/`write`, so a case that seeds a
@@ -162,8 +168,11 @@ pub mod backend {
     /// Write a 16-bit little-endian value to the mock register backing store.
     #[inline]
     pub fn write16(addr: u32, value: u16) {
-        let mut s = SPACE.lock().unwrap();
         let i = idx(addr);
+        if i == FROZEN.load(Ordering::Relaxed) {
+            return; // non-responsive register: the write does not stick
+        }
+        let mut s = SPACE.lock().unwrap();
         let b = value.to_le_bytes();
         s[i] = b[0];
         s[i + 1] = b[1];
@@ -178,8 +187,11 @@ pub mod backend {
     /// Write a 32-bit little-endian value to the mock register backing store.
     #[inline]
     pub fn write32(addr: u32, value: u32) {
-        let mut s = SPACE.lock().unwrap();
         let i = idx(addr);
+        if i == FROZEN.load(Ordering::Relaxed) {
+            return; // non-responsive register: the write does not stick
+        }
+        let mut s = SPACE.lock().unwrap();
         let b = value.to_le_bytes();
         s[i] = b[0];
         s[i + 1] = b[1];
@@ -189,8 +201,16 @@ pub mod backend {
 
     /// Test helpers for the backing array.
     pub mod mock {
-        use super::{idx, SPACE, SPACE_BYTES, TEST_SERIAL};
+        use super::{idx, FROZEN, SPACE, SPACE_BYTES, TEST_SERIAL};
+        use std::sync::atomic::Ordering;
         use std::sync::MutexGuard;
+
+        /// Mark the word at `addr` as non-responsive: subsequent writes to it are dropped (reads see
+        /// the prior value, default 0), modelling a register that does not stick. Cleared by
+        /// [`reset`]. One frozen word at a time (the DMA self-check test needs exactly one).
+        pub fn freeze(addr: u32) {
+            FROZEN.store(idx(addr), Ordering::Relaxed);
+        }
 
         /// Acquire the whole-case serialization lock. Hold the returned guard for the duration of
         /// a test that seeds the register space and later asserts it, so concurrent cases do not
@@ -200,8 +220,10 @@ pub mod backend {
             TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
         }
 
-        /// Zero the whole simulated register space (call at the start of a test case).
+        /// Zero the whole simulated register space (call at the start of a test case). Also clears any
+        /// frozen (non-responsive) word.
         pub fn reset() {
+            FROZEN.store(usize::MAX, Ordering::Relaxed);
             let mut s = SPACE.lock().unwrap();
             *s = [0u8; SPACE_BYTES];
         }

@@ -239,6 +239,17 @@ pub fn enable_gpio_port(
     Ok(())
 }
 
+/// Enable the DMA controller clock (`RCU_AHBEN` `DMAEN`/`DMA0EN`, bit 0).
+///
+/// Family-independent: the single DMA controller used by the USART1_RX DMA-ring RX is `DMA0` at
+/// `0x4002_0000` on both families, and its clock is `RCU_AHBEN` bit 0 on both
+/// (`gd32f10x_rcu.h:238` `RCU_AHBEN_DMA0EN` / `gd32f1x0_rcu.h:184` `RCU_AHBEN_DMAEN`), so no path
+/// branch is needed (unlike the GPIO/USART enables, which live on different registers per family).
+pub fn enable_dma(rcu_base: u32) {
+    const AHBEN_DMAEN: u32 = 1 << 0;
+    Reg32::new(rcu_base, AHBEN).modify(AHBEN_DMAEN, AHBEN_DMAEN);
+}
+
 /// Enable the peripheral clock for an I2C instance under the selected clock path.
 ///
 /// `i2c_label` must be an `I2c0/1` label. Both instances live on **APB1EN** on both families
