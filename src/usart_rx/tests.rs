@@ -641,10 +641,10 @@ fn b8_read_returns_len_minus_chxcnt_bytes_and_wraps() {
     );
 }
 
-// --- B9: lap detection -> Overrun -------------------------------------------------------------
+// --- B9: lap detection -> RingOverrun (recoverable in place, distinct from the disabling Overrun) --
 
 #[test]
-fn b9_lap_past_cursor_is_overrun() {
+fn b9_lap_past_cursor_is_ring_overrun() {
     let fam = f10x();
     let _g = setup();
     let (mut rx, ch, _ptr) = install_ring(&fam, 8);
@@ -659,10 +659,21 @@ fn b9_lap_past_cursor_is_overrun() {
     Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 1);
 
     let mut out = [0u8; 16];
+    // The lap is a non-silent loss signal, but RECOVERABLE in place: it is `RingOverrun`, NOT the
+    // channel-disabling `Overrun` the ERRIE path raises (b12b). The channel must stay live so the very
+    // next read keeps draining.
     assert_eq!(
         rx.read(&mut out),
-        Err(UsartError::Overrun),
-        "the DMA lapping the cursor by more than the buffer is a non-silent Overrun"
+        Err(UsartError::RingOverrun),
+        "the DMA lapping the cursor by more than the buffer is a non-silent, in-place RingOverrun"
+    );
+    // Channel still live: after the resync, the next read returns the freshest bytes (no re-arm). Stage
+    // a fresh lap's worth of progress (CHxCNT = len - 2 within the current lap) and confirm draining
+    // continues rather than the channel being dead.
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 3);
+    assert!(
+        rx.read(&mut out).is_ok(),
+        "RingOverrun leaves the channel live: reads keep draining without a re-arm"
     );
 }
 
@@ -821,6 +832,39 @@ fn b12_line_error_stops_reception_and_re_new_rearms() {
         Reg32::new(USART_BASE, fam.ctl0).read() & CTL0_IDLEIE,
         CTL0_IDLEIE,
         "IDLEIE re-enabled"
+    );
+}
+
+// --- B12b: an ERRIE *overrun* line error returns the DISABLING `Overrun`, distinct from a lap ----
+
+#[test]
+fn b12b_errie_overrun_disables_channel_and_is_overrun_not_ring_overrun() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut rx, ch, _ptr) = install_ring(&fam, 32);
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        CHEN,
+        "armed at start"
+    );
+
+    // A USART ORERR (overrun) line error on the ERRIE path: the shared ISR records it sticky. Unlike
+    // the b9 lap-overrun, this is a HARDWARE overrun that the read path treats as channel-disabling.
+    Reg32::new(USART_BASE, fam.stat).write(ORERR);
+    fire(&fam);
+
+    let mut out = [0u8; 8];
+    // It surfaces as the channel-disabling `Overrun` (NOT `RingOverrun`): the two overrun conditions
+    // map to distinct values so the caller re-arms here but recovers in place after a lap.
+    assert_eq!(
+        rx.read(&mut out),
+        Err(UsartError::Overrun),
+        "an ERRIE overrun is the disabling `Overrun`, not the in-place `RingOverrun`"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        0,
+        "the ERRIE overrun disabled the channel (caller must re-arm)"
     );
 }
 

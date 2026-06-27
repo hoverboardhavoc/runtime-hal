@@ -66,7 +66,22 @@ pub enum DetectError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsartError {
     /// Receive overrun (a byte arrived before the previous one was read).
+    ///
+    /// On the DMA-ring path ([`crate::usart_rx::RingBufferedRx::read`]) this is the
+    /// **channel-disabling** overrun: a USART/ERRIE overrun the shared ISR recorded, which the read
+    /// path surfaces AFTER disabling the DMA channel (no silent auto-restart). The caller must re-arm
+    /// (`new` again) to resume reception. This is DISTINCT from [`RingOverrun`](Self::RingOverrun),
+    /// the in-place-recoverable lap-overrun. (On the interrupt path
+    /// [`crate::usart_rx::BufferedRx::read`] it is the recoverable ring-full overflow.)
     Overrun,
+    /// DMA-ring lap-overrun: the circular DMA write head passed the read cursor by more than a full
+    /// buffer, so some unread bytes were overwritten before [`crate::usart_rx::RingBufferedRx::read`]
+    /// drained them. **Recoverable in place**: `read` has already resynced the cursor to the freshest
+    /// data and the DMA channel stays live, so the caller may keep reading (the lost bytes are gone,
+    /// but reception continues). This is the non-silent signal that data was dropped; it is reported
+    /// separately from [`Overrun`](Self::Overrun) so a caller can tell "keep going, you lost some" from
+    /// "the channel is dead, re-arm". Only the DMA-ring `read` raises it.
+    RingOverrun,
     /// Framing error (stop bit not seen / line noise broke the frame).
     Framing,
     /// Parity error.
@@ -80,9 +95,11 @@ impl embedded_io::Error for UsartError {
         // embedded-io has no dedicated overrun/framing/parity kinds, so the recoverable
         // line conditions fold into `Other` per the trait's guidance.
         match self {
-            UsartError::Overrun | UsartError::Framing | UsartError::Parity | UsartError::Other => {
-                embedded_io::ErrorKind::Other
-            }
+            UsartError::Overrun
+            | UsartError::RingOverrun
+            | UsartError::Framing
+            | UsartError::Parity
+            | UsartError::Other => embedded_io::ErrorKind::Other,
         }
     }
 }

@@ -626,13 +626,18 @@ impl RingBufferedRx {
     /// Drain bytes that have arrived since the last read (between the cursor and the live DMA write
     /// position `len - CHxCNT`), into `buf`; returns the count, 0 if none (non-blocking).
     ///
-    /// Fail-loud surfaces, each clearing its condition:
-    /// - A USART line error (the `ERRIE` path, recorded by the shared ISR) returns its
-    ///   [`UsartError`] and **stops background reception** (disables the channel); the caller must
-    ///   `new` again to resume (section 5.4, no silent auto-restart).
+    /// Fail-loud surfaces, each clearing its condition. The two are DISTINCT error values so the
+    /// caller can tell the channel-dead case from the keep-going case (a conflated single value is a
+    /// trap: it makes an in-place-recoverable lap indistinguishable from a disabled channel):
+    /// - A USART line error (the `ERRIE` path, recorded by the shared ISR: overrun / framing / parity)
+    ///   returns its mapped [`UsartError`] (`Overrun` / `Framing` / `Parity`) and **stops background
+    ///   reception** (disables the channel); the caller must `new` again to resume (section 5.4, no
+    ///   silent auto-restart).
     /// - A lapped cursor (the DMA wrote more than `len` bytes ahead of the cursor: bytes were
-    ///   overwritten before being read) returns [`UsartError::Overrun`] and resyncs the cursor to the
-    ///   freshest position so subsequent reads continue (section 5.2).
+    ///   overwritten before being read) returns [`UsartError::RingOverrun`] and resyncs the cursor to
+    ///   the freshest position, **leaving the channel live** so subsequent reads continue (section
+    ///   5.2). Recoverable in place: the caller drops the lost bytes and keeps reading, it does NOT
+    ///   re-arm.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
         // Line error first (fail-loud): stop reception and surface; caller re-`new`s. Reads THIS
         // instance's shared RX slot (the module's IDLE/error path is independent of USART1's).
@@ -647,10 +652,12 @@ impl RingBufferedRx {
         let write_total = wraps as u64 * self.len as u64 + (self.len as u64 - rem as u64);
         let available = write_total - self.cursor;
 
-        // Lap-overrun: the head passed the cursor by more than a full buffer (section 5.2).
+        // Lap-overrun: the head passed the cursor by more than a full buffer (section 5.2). Recoverable
+        // in place (the channel stays live), so it is `RingOverrun`, NOT the channel-disabling
+        // `Overrun` the ERRIE path above returns.
         if available > self.len as u64 {
             self.cursor = write_total; // drop the overwritten data; resume from the live position
-            return Err(UsartError::Overrun);
+            return Err(UsartError::RingOverrun);
         }
 
         let n = core::cmp::min(available as usize, buf.len());
