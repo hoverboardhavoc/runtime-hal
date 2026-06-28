@@ -429,16 +429,36 @@ pub fn call_dma_rx_handler2() {
 // --- The owned RAM vector table (DECISIONS.md #6) ---------------------------------------------
 
 /// The owned RAM vector table (DECISIONS.md #6): an alignment-correct `static` in a dedicated
-/// section. The Cortex-M `VTOR` requires the table to be aligned to a power of two at least as
-/// large as the table; `MAX_VECTORS * 4 = 360` bytes rounds up to 512, so a 1024-byte alignment is
-/// safe for the whole table. `#[no_mangle]` + the section let the linker place it in RAM; the
-/// flash table still covers reset + the first exceptions until [`install`] flips `VTOR`.
-#[repr(C, align(1024))]
+/// section. The Cortex-M `VTOR` requires the table to be aligned to a power of two at least as large
+/// as the table: `MAX_VECTORS * 4 = 360` bytes rounds up to **512**, so the table is `align(512)` (the
+/// `align(R) >= TBLOFF` rule, the exact power-of-two granule).
+///
+/// Aligning to 512 (not 1024) reclaims 1 KiB of RAM from the universal firmware's single
+/// `RamVectorTable` static (its `VECTORS`): 512 B because the struct size is padded to its alignment
+/// (1024 -> 512), plus 512 B because the linker no longer pads the preceding RAM up to a 1024-byte
+/// boundary. That 1 KiB goes to the 8 KiB-RAM image's stack, which the deep `store` flash-write path
+/// needs (a too-small stack overflows into `.bss` and corrupts the ISR state). It is one half of a
+/// **two-part** stack-overflow fix that together keep the peak under the region; neither is sufficient
+/// alone: this `align(512)` (region 3004 -> 4028 B) AND the firmware's `store::MAX_RECORD = 272`
+/// (peak 4820 -> 3044 B). (The detect-probe table is a SEPARATE `align(1024)` `AlignedVectorTable` in
+/// [`crate::detect`], unaffected by this.) `#[no_mangle]` + the section let the linker place it in RAM;
+/// the flash table still covers reset + the first exceptions until [`install`] flips `VTOR`.
+#[repr(C, align(512))]
 pub struct RamVectorTable {
     /// The vector slots (slot 0 reserved for the initial SP value the hardware reads; slots 1..15
     /// the system exceptions; 16.. the external IRQs).
     pub slots: [usize; MAX_VECTORS],
 }
+
+// VTOR alignment guard: on the 32-bit target each slot is 4 bytes, and the table base must be aligned
+// to a power of two >= its byte size. `align(512)` is valid only while the table fits in 512 bytes
+// (<= 128 slots); if MAX_VECTORS ever exceeds that, bump align(..) to the next power of two or VTOR
+// would reject the (then-unaligned) table base. (Asserted on the slot COUNT so it is the same on the
+// 32-bit firmware target and the 64-bit host test build.)
+const _: () = assert!(
+    MAX_VECTORS <= 128,
+    "RamVectorTable exceeds its 512-byte VTOR alignment; bump align(..) to the next power of two"
+);
 
 /// Build the RAM vector table contents for the given [`IrqLayout`], as plain data (so it is
 /// host-testable slot-by-slot). Every slot defaults to [`default_isr`]; the layout then overwrites
