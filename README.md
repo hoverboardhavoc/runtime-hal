@@ -1,5 +1,10 @@
 # runtime-hal
 
+> ⚠️ **Work in progress, not properly tested.** Beware of
+> [shoot-through](https://en.wikipedia.org/wiki/Shoot-through): a bug in the dead-time or hot path can
+> turn both FETs of a half-bridge on at once, shorting the DC bus and destroying FETs (and possibly the
+> battery). Bench it on a current-limited supply and check the gate waveforms before driving power electronics.
+
 A runtime HAL for STM32F1-compatible Cortex-M3 MCUs (the GD32 F1x0 / F10x parts and their relatives).
 ONE binary boots on any supported chip and uses HEURISTICS to detect the MCU family and measure its
 peripheral capabilities at runtime, then drives the correct register model. There is no compile-time
