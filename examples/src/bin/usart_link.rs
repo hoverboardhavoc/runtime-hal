@@ -75,18 +75,6 @@ const LINK_BAUD: u32 = 115_200;
 /// Counted in short ticks rather than one blocking delay so the FIFO-less RX keeps draining.
 const SEND_PERIOD_TICKS: u32 = 500;
 
-/// The clock the example runs at: the 8 MHz reset IRC8M, no PLL. We never call `configure_tree`, so
-/// the chip stays here; the USART BRR is computed for this clock (8e6 / 115200 = 0x45, the M1 value).
-/// It is NOT a clock-tree to program, only the source of truth for `Serial::new`'s BAUD math.
-const RESET_8M: ClockConfig = ClockConfig {
-    sysclk_hz: 8_000_000,
-    wait_states: 0,
-    source: ClockSource::Irc8m,
-    pll_mul: 2, // unused (no PLL brought up); a legal placeholder value.
-    ahb_psc: 1,
-    apb1_psc: 1,
-    apb2_psc: 1,
-};
 
 #[entry]
 fn main() -> ! {
@@ -110,7 +98,8 @@ fn main() -> ! {
     //    packed `(port << 4) | pin` byte: the application passes the named pins.
     let serial = Serial::new(
         &chip,
-        &RESET_8M,
+        // The 8 MHz reset tree: never configure_tree'd, only the BAUD-math source of truth.
+        &ClockConfig::RESET_8M,
         PeriphLabel::Usart1,
         (gpioa.pa2, gpioa.pa3),
         LINK_BAUD,

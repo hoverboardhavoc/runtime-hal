@@ -11,7 +11,8 @@
 //! 4. `gpio::configure_af` the TX/RX pins (from the code-level `UsartConfig`) using the chip's gpio
 //!    path.
 //! 5. `usart::Usart::bring_up(&chip, &clock, &UsartConfig{ .. })` with a code-constructed
-//!    `ClockConfig` + `UsartConfig`, wrapped in `UsartSerial`.
+//!    `ClockConfig` + `UsartConfig`; the handshake drives the handle's polled byte primitives
+//!    (`write_byte` / `try_read_byte`) directly.
 //!
 //! The two families diverge by the DETECTED chip, not by a compile-time chip ifdef in the bring-up
 //! logic. The peripheral config (USART1, PA2/PA3, 115200, 8N1) and the clock tree are constructed in

@@ -108,6 +108,23 @@ impl ClockConfig {
         apb2_psc: 1,
     };
 
+    /// The 8 MHz power-on-reset tree (bare IRC8M, no PLL): the state the chip already boots in, so a
+    /// consumer that names this NEVER calls `configure_tree` - the constant is only the source of
+    /// truth for baud math and SysTick delays at the reset clock (the proven module bring-up clock:
+    /// the CC2541's 9600 divides cleanly from 8 MHz). A named convenience opted into by name, NOT a
+    /// hidden HAL default; the single owner of the value the bench images used to re-declare
+    /// verbatim. `pll_mul` is a legal in-range value that nothing consults (no PLL path runs);
+    /// prescalers /1 describe the reset state.
+    pub const RESET_8M: ClockConfig = ClockConfig {
+        sysclk_hz: 8_000_000,
+        wait_states: 0,
+        source: ClockSource::Irc8m,
+        pll_mul: 2,
+        ahb_psc: 1,
+        apb1_psc: 1,
+        apb2_psc: 1,
+    };
+
     /// Validate this config against the chip-bound ranges the clock `path` declares (DECISIONS.md
     /// #10 / DR-1 mitigation). The selector owns the register model AND the legal-range table; this
     /// keeps the chip-bound FACTS in the HAL and the application's CHOICE in code.
