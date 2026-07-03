@@ -25,15 +25,21 @@
 //! local AUGMENTED copy of the descriptor for the console bring-up only. The detected `Chip` the
 //! firmware holds is unchanged.
 
-use crate::addr::PeriphLabel;
-use crate::chip::Chip;
-use crate::clock::{self, ClockConfig, ClockSource};
-use crate::config::{Oversampling, UsartConfig, UsartFrame};
-use crate::error::DescriptorError;
-use crate::gpio::{self, PinRole};
-use crate::usart::Usart;
+use crate::clock::{ClockConfig, ClockSource};
 
-use super::Family;
+// The console bring-up itself (and everything only it uses) is compiled only under the gate; see
+// `apply_defaults`'s GATE-PIN GUARD.
+#[cfg(any(feature = "mock", feature = "yes-console-on-pa9-pa10"))]
+use {
+    super::Family,
+    crate::addr::PeriphLabel,
+    crate::chip::Chip,
+    crate::clock,
+    crate::config::{Oversampling, UsartConfig, UsartFrame},
+    crate::error::DescriptorError,
+    crate::gpio::{self, PinRole},
+    crate::usart::Usart,
+};
 
 /// The bare-IRC8M default clock (DF-2): 8 MHz, 0 wait states, no PLL. The fallback stays on the
 /// reset clock rather than bringing up a PLL that could fail. `pll_mul`/prescalers are filled with
@@ -82,8 +88,15 @@ pub const CONSOLE_PINS_ASSUMED: bool = true;
 /// HAL-internal (`pub(crate)`): it takes the internal [`Family`] discriminator, so it cannot be a
 /// caller surface while the silicon-purity principle keeps `Family` out of the public API. It is the
 /// retained section-6 default console bring-up, exercised by the host tests; nothing else in-crate
-/// calls it, hence `#[allow(dead_code)]` for the non-test lib build.
-#[allow(dead_code)]
+/// calls it.
+///
+/// **GATE-PIN GUARD (debt-paydown slice 9):** PA9/PA10 are FET gate pins on the 6-FET hoverboard
+/// boards (`specs/l3.md` pin safety denies them), so this function is COMPILED OUT of every real
+/// (non-mock) build unless the explicit `yes-console-on-pa9-pa10` feature opts in - the
+/// wfi-lock-repro gating pattern, protective only. The mock host build keeps it (its tests pin the
+/// register sequence; no real pin exists on the host).
+#[cfg(any(feature = "mock", feature = "yes-console-on-pa9-pa10"))]
+#[allow(dead_code)] // mock builds keep it for the host tests; nothing non-test calls it
 pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, DescriptorError> {
     let _ = family; // the register model is carried by chip.clock(); family is for logging only.
     let path = chip.clock();
@@ -121,8 +134,9 @@ pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, Descr
 
 /// A copy of `chip` with the shared USART0 base added, for the console bring-up. The detected chip
 /// the firmware holds is untouched (it stays byte-for-byte equal to the per-family constant). Only
-/// [`apply_defaults`] uses it; `#[allow(dead_code)]` for the non-test lib build (see that fn).
-#[allow(dead_code)]
+/// [`apply_defaults`] uses it (and shares its gate; see that fn's GATE-PIN GUARD).
+#[cfg(any(feature = "mock", feature = "yes-console-on-pa9-pa10"))]
+#[allow(dead_code)] // see apply_defaults
 fn with_usart0(chip: &Chip) -> Chip {
     let mut desc = *chip.descriptor();
     desc.addrs.set(PeriphLabel::Usart0, USART0_BASE);

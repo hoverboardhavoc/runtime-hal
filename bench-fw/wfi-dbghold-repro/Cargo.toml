@@ -6,6 +6,8 @@ publish = false
 description = "A/B partner to wfi-lock-repro: identical (marker + loop{wfi}) EXCEPT it sets the GD32F1x0 DBG_CTL0 sleep-hold bits (SLP_HOLD/DSLP_HOLD/STB_HOLD) before sleeping. If this does NOT lock SWD after a power-cycle while the plain wfi-lock-repro does, the DBGMCU debug-hold bits are the fix that lets firmware sleep without locking out the debugger."
 
 [dependencies]
+# The debug-hold primitive under test (debug_hold_on_sleep): this repro is its silicon validator.
+runtime-hal = { path = "../..", default-features = false }
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"

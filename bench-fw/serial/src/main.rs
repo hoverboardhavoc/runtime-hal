@@ -23,7 +23,6 @@ use core::ptr::addr_of_mut;
 
 use cortex_m_rt::entry;
 use embedded_io::{Read, ReadReady, Write};
-use heapless::spsc::Queue;
 use panic_halt as _;
 
 use runtime_hal::{
@@ -32,7 +31,7 @@ use runtime_hal::{
     descriptor::ClockPath,
     detect_chip,
     irq::{install, RamVectorTable, MAX_VECTORS},
-    BufferedRx, Chip, PeriphLabel, PolledSerial, RingBufferedRx, SplitSerial, Usart,
+    BufferedRx, Chip, PeriphLabel, PolledSerial, RingBufferedRx, RxRing, SplitSerial, Usart,
 };
 
 const CLOCK: ClockConfig = ClockConfig::REFERENCE_72M_IRC8M;
@@ -88,7 +87,7 @@ static mut VECTORS: RamVectorTable = RamVectorTable {
     slots: [0; MAX_VECTORS],
 };
 static mut DMA_BUF: [u8; DMA_CAP] = [0; DMA_CAP];
-static mut RING: Queue<u8, RING_N> = Queue::new();
+static RING: RxRing<RING_N> = RxRing::new();
 
 fn dma_buf() -> &'static mut [u8] {
     // SAFETY: 'static; one RingBufferedRx is active at a time (stages are sequential).
@@ -316,10 +315,7 @@ fn run_slave(chip: &Chip, usart1: Usart) -> ! {
     // Stage 2: the interrupt adapter (release the DMA ring, arm BufferedRx on the same half).
     let (tx, ring) = s1.into_parts();
     let rx = ring.release();
-    // SAFETY: RING is a 'static, used only as this receiver's SPSC buffer.
-    let buffered = match BufferedRx::new(chip, rx, PeriphLabel::Usart1, unsafe {
-        &mut *addr_of_mut!(RING)
-    }) {
+    let buffered = match BufferedRx::new(chip, rx, PeriphLabel::Usart1, &RING) {
         Ok(b) => b,
         Err(_) => halt(),
     };

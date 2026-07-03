@@ -15,18 +15,21 @@
 //! the monomorphised push, and is inert until [`BufferedRx::new`] installs it. The ISR does NO
 //! per-family branching beyond reading the one already-resolved family bit (DECISIONS.md #4).
 //!
-//! # Why the ring is reconstructed per access
+//! # The ring is HAL-owned ([`RxRing`]), all ops on `&self`
 //!
-//! [`heapless::spsc::Producer`] / [`Consumer`] are stateless single-field handles (`rb: &Queue`); all
-//! state (head/tail) lives in the `Queue`'s atomics, which is what makes SPSC lock-free. So the
-//! producer (ISR) and consumer (main) are each just the queue pointer, reconstructed per access from
-//! that pointer. `new`'s `assert_eq!` pins the one-pointer layout the reconstruction relies on. The
-//! ISR is the sole producer and the main loop the sole consumer, so the SPSC contract holds.
+//! The ISR side reaches the ring through a type-erased pointer in the static slot, so the ring's
+//! operations must be callable from a SHARED reference reconstructed from that pointer. A
+//! third-party queue whose producer/consumer handles must be `split()` out cannot do that without
+//! either aliasing `&mut` (UB) or transmuting the crate's PRIVATE handle layout (what this module
+//! did before debt-paydown slice 9: `transmute_copy` of a queue pointer into a
+//! `heapless::spsc::Producer`, sound only while that crate kept its handle a single pointer). So
+//! the HAL owns a minimal SPSC ring instead: head/tail atomics + an `UnsafeCell` buffer, every op
+//! (`push`/`pop`/`ready`) on `&self`, the layout OURS. The ISR is the sole pusher and the main
+//! loop the sole popper (the SPSC contract); the erasure is a plain `&*(ptr as *const RxRing<N>)`
+//! shared-reference reconstruction with no layout assumption beyond our own type.
 
-use core::mem::{size_of, transmute_copy};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
-
-use heapless::spsc::{Consumer, Producer, Queue};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 use crate::addr::PeriphLabel;
 use crate::chip::Chip;
@@ -157,33 +160,100 @@ pub fn supports_rx(chip: &Chip, selector: PeriphLabel) -> bool {
     resolve_instance(chip, selector).is_ok()
 }
 
-// --- monomorphised ring access (the type erasure boundary) ------------------------------------
+// --- the HAL-owned SPSC ring -------------------------------------------------------------------
 
-/// Push one byte into the ring, reconstructing the (stateless) producer from the queue pointer.
-/// Returns `false` if the ring is full. Installed into the slot as `push_impl::<N>`.
-fn push_impl<const N: usize>(q: *mut (), b: u8) -> bool {
-    let qref = q as *const Queue<u8, N>;
-    // SAFETY: `qref` is the queue pointer `new::<N>` stored; a `Producer` is one `&Queue` (the
-    // `assert_eq!` in `new` pins that layout). The ISR is the sole producer, so reconstructing a
-    // handle per call is sound (head/tail live in the queue's atomics).
-    let mut prod: Producer<'static, u8, N> = unsafe { transmute_copy(&qref) };
-    prod.enqueue(b).is_ok()
+/// The application-owned `'static` RX ring a [`BufferedRx`] fills: a minimal lock-free SPSC byte
+/// ring, HAL-owned so the ISR-side type erasure rests on OUR layout guarantees, not a third-party
+/// crate's private handle layout (debt-paydown slice 9; the predecessor transmuted
+/// `heapless::spsc::Producer`'s single-pointer layout).
+///
+/// Capacity: `N - 1` usable bytes (one slot distinguishes full from empty), matching the previous
+/// `heapless` semantics, so existing ring sizings keep their meaning. Single-producer (the RX ISR)
+/// / single-consumer (the main loop); every operation takes `&self` (the state lives in the
+/// atomics), which is exactly what lets both sides work through shared references reconstructed
+/// from a type-erased pointer.
+pub struct RxRing<const N: usize> {
+    /// Producer index (next write position). Written only by the ISR side.
+    head: AtomicUsize,
+    /// Consumer index (next read position). Written only by the main-loop side.
+    tail: AtomicUsize,
+    /// The byte storage. A cell: the producer writes `buf[head]` while the consumer reads
+    /// `buf[tail]`, never the same index (guarded by the index protocol below).
+    buf: UnsafeCell<[u8; N]>,
 }
 
-/// Pop one byte from the ring, reconstructing the (stateless) consumer from the queue pointer.
+// SAFETY: all shared mutation goes through the head/tail atomics; the buffer cell is accessed only
+// at indices the protocol makes exclusive (producer writes at `head` before publishing it with a
+// Release store; the consumer reads at `tail` only after an Acquire load of `head` shows the byte
+// published). Single-producer/single-consumer by contract (the ISR vs the owning thread).
+unsafe impl<const N: usize> Sync for RxRing<N> {}
+
+impl<const N: usize> RxRing<N> {
+    /// An empty ring (usable capacity `N - 1`).
+    #[allow(clippy::new_without_default)]
+    pub const fn new() -> Self {
+        RxRing {
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            buf: UnsafeCell::new([0; N]),
+        }
+    }
+
+    /// Producer side (the RX ISR): append one byte; `false` if the ring is full.
+    fn push(&self, b: u8) -> bool {
+        let head = self.head.load(Ordering::Relaxed); // own index
+        let next = (head + 1) % N;
+        if next == self.tail.load(Ordering::Acquire) {
+            return false; // full: overwriting would corrupt the unread byte at `tail`
+        }
+        // SAFETY: `head` is exclusively the producer's write slot until the Release store below
+        // publishes it; the consumer never reads past the published head.
+        unsafe { (*self.buf.get())[head] = b };
+        self.head.store(next, Ordering::Release);
+        true
+    }
+
+    /// Consumer side (the main loop): take the oldest byte, if any.
+    fn pop(&self) -> Option<u8> {
+        let tail = self.tail.load(Ordering::Relaxed); // own index
+        if tail == self.head.load(Ordering::Acquire) {
+            return None; // empty
+        }
+        // SAFETY: `head != tail`, so `buf[tail]` was fully written before the producer's Release
+        // store of `head` (paired with the Acquire load above); the producer never writes at `tail`.
+        let b = unsafe { (*self.buf.get())[tail] };
+        self.tail.store((tail + 1) % N, Ordering::Release);
+        Some(b)
+    }
+
+    /// True if at least one byte is buffered. Consumes nothing.
+    fn ready(&self) -> bool {
+        self.tail.load(Ordering::Acquire) != self.head.load(Ordering::Acquire)
+    }
+}
+
+// --- monomorphised ring access (the type erasure boundary) ------------------------------------
+
+/// Push one byte into the ring (the ISR side). Installed into the slot as `push_impl::<N>`.
+fn push_impl<const N: usize>(q: *mut (), b: u8) -> bool {
+    // SAFETY: `q` is the `&'static RxRing<N>` pointer `new::<N>` stored (valid for 'static); a
+    // shared reference to a `Sync` type, no layout assumption beyond our own.
+    let ring: &RxRing<N> = unsafe { &*(q as *const RxRing<N>) };
+    ring.push(b)
+}
+
+/// Pop one byte from the ring (the main-loop side).
 fn pop_impl<const N: usize>(q: *mut ()) -> Option<u8> {
-    let qref = q as *const Queue<u8, N>;
-    // SAFETY: as `push_impl`; the main loop is the sole consumer.
-    let mut cons: Consumer<'static, u8, N> = unsafe { transmute_copy(&qref) };
-    cons.dequeue()
+    // SAFETY: as `push_impl`.
+    let ring: &RxRing<N> = unsafe { &*(q as *const RxRing<N>) };
+    ring.pop()
 }
 
 /// True if the ring has at least one buffered byte.
 fn ready_impl<const N: usize>(q: *mut ()) -> bool {
-    let qref = q as *const Queue<u8, N>;
-    // SAFETY: as `pop_impl`.
-    let cons: Consumer<'static, u8, N> = unsafe { transmute_copy(&qref) };
-    cons.ready()
+    // SAFETY: as `push_impl`.
+    let ring: &RxRing<N> = unsafe { &*(q as *const RxRing<N>) };
+    ring.ready()
 }
 
 // --- the ISR bodies (one per instance, each reached via its own vector slot) -------------------
@@ -266,9 +336,10 @@ fn push_byte(slot: &RxSlot, b: u8) -> bool {
     if q.is_null() || p.is_null() {
         return false;
     }
-    // SAFETY: `p` is the `push_impl::<N>` fn pointer `new` stored (erased as `*mut ()`, the same way
-    // the control-handler pointer is erased), and `q` is the matching queue pointer.
-    let push: fn(*mut (), u8) -> bool = unsafe { transmute_copy(&p) };
+    // SAFETY: `p` is the `push_impl::<N>` fn pointer `new` stored, erased as `*mut ()` exactly the
+    // way the irq.rs handler pointers are (DECISIONS.md #7: a fn pointer round-trips through the
+    // AtomicPtr, our own erasure, no foreign layout involved); `q` is the matching ring pointer.
+    let push = unsafe { core::mem::transmute::<*mut (), fn(*mut (), u8) -> bool>(p) };
     push(q, b)
 }
 
@@ -398,26 +469,18 @@ impl BufferedRx {
     /// `RBNEIE` + `IDLEIE` on the USART; register the ISR body; then unmask the USART IRQ in the NVIC.
     /// The application must have flipped `VTOR` to the RAM table (the [`crate::irq::install`] contract)
     /// BEFORE calling this, since `new` is the thing that enables the IRQ the table must already
-    /// route. `N` is the ring capacity word (the ring holds `N - 1` bytes, per `heapless`).
+    /// route. `N` is the ring capacity word (the ring holds `N - 1` bytes, [`RxRing`]).
     pub fn new<const N: usize>(
         chip: &Chip,
         rx: UsartRx,
         instance: PeriphLabel,
-        storage: &'static mut Queue<u8, N>,
+        storage: &'static RxRing<N>,
     ) -> Result<BufferedRx, DescriptorError> {
         // Resolve the instance selector to a slot + vector (fail-loud on F1x0 module / unknown label),
         // before touching any hardware (`uart-rx-multi-instance.md` item 4).
         let inst = resolve_instance(chip, instance)?;
 
-        // The type erasure reconstructs the producer/consumer from the queue pointer, which is sound
-        // only because a `heapless` producer/consumer is exactly one pointer. Pin that here.
-        assert_eq!(
-            size_of::<Producer<'static, u8, N>>(),
-            size_of::<*mut ()>(),
-            "heapless Producer must be one pointer for the RX ISR type erasure"
-        );
-
-        let queue = storage as *mut Queue<u8, N> as *mut ();
+        let queue = storage as *const RxRing<N> as *mut ();
 
         // 1. Install this instance's RX slot (base + family bit + this ring's queue + monomorphised
         //    push) and register the ISR body the instance's vector routes to.

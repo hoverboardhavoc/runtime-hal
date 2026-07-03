@@ -65,7 +65,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use cortex_m::peripheral::{scb::Exception, SCB};
+use cortex_m::peripheral::SCB;
 
 use super::{Family, FLASH_DENSITY_ADDR};
 
@@ -325,13 +325,39 @@ pub struct Detected {
 /// why [`FAULT_SKIP_WIDTH`] is 4. If the access faults, the handler advances the stacked PC past this
 /// `LDR` and returns; the returned value is then meaningless (the caller checks `FAULTED` first).
 ///
+/// **The instruction width is PINNED by inline asm** (debt-paydown slice 9): the load is an explicit
+/// `ldr.w` (the `.w` qualifier FORCES the 32-bit Thumb-2 encoding; the assembler rejects it if the
+/// wide form were unavailable), so [`FAULT_SKIP_WIDTH`] `= 4` is an encoding fact, not codegen luck.
+/// The previous `read_volatile::<u32>` relied on the compiler never choosing a 16-bit `LDR` lowering
+/// (legal for low registers + small offsets), which would silently break the stacked-PC fixup on a
+/// toolchain bump. The asm block keeps volatile semantics (no `pure`), reads only, no stack.
+///
 /// # Safety
 /// `addr` is a candidate peripheral base; the read is wrapped by the armed BusFault handler so a
 /// fault on the wrong-family (reserved) base is caught instead of escalating.
+#[cfg(target_arch = "arm")]
 #[inline(never)]
 fn probe_read32(addr: u32) -> u32 {
+    let value: u32;
     // SAFETY: the access is bounded by the armed fault harness (EXPECTING_FAULT + the BusFault
     // handler). A fault here is caught and turned into the family-negative signal.
+    unsafe {
+        core::arch::asm!(
+            "ldr.w {value}, [{addr}]",
+            addr = in(reg) addr,
+            value = out(reg) value,
+            options(nostack, readonly),
+        );
+    }
+    value
+}
+
+/// Host stub for [`probe_read32`] (mock / non-`arm` builds): the probe never runs on the host, and
+/// the `ldr.w` asm does not assemble there; a plain volatile read keeps the crate compiling.
+#[cfg(not(target_arch = "arm"))]
+#[inline(never)]
+fn probe_read32(addr: u32) -> u32 {
+    // SAFETY: never executed on the host (the probe paths are silicon-only); see the arm variant.
     unsafe { core::ptr::read_volatile(addr as *const u32) }
 }
 
@@ -350,6 +376,31 @@ fn rcu_set_bit(reg_off: u32, bit: u32) {
 }
 
 // --- the ordered probe (DF-T4, spec section 4.2) ----------------------------------------------
+
+/// `SHCSR.BUSFAULTENA` (ARMv7-M B3.2.13, System Handler Control and State Register @`0xE000_ED24`,
+/// bit 17): the dedicated-BusFault-handler enable the probe arms around each candidate read.
+const SHCSR_BUSFAULTENA: u32 = 1 << 17;
+
+/// RMW `SHCSR.BUSFAULTENA` through the raw SCB register view, returning the PRIOR state.
+///
+/// Deliberately `&*SCB::PTR`, never `cortex_m::Peripherals::steal()` (DECISIONS.md #13): the HAL
+/// must not consume cortex-m's one-shot `TAKEN` flag, so the application's `Peripherals::take()`
+/// works regardless of whether it runs before or after `detect_chip`. This is the same raw access
+/// shape the BusFault handler itself already uses ([`bus_fault_entry`]); single-core bring-up
+/// context, no concurrent SHCSR user.
+fn shcsr_set_busfaultena(enable: bool) -> bool {
+    // SAFETY: SCB::PTR is the architectural SCB block; RMW of one bit in single-core bring-up.
+    unsafe {
+        let scb = &*SCB::PTR;
+        let prev = scb.shcsr.read();
+        if enable {
+            scb.shcsr.write(prev | SHCSR_BUSFAULTENA);
+        } else {
+            scb.shcsr.write(prev & !SHCSR_BUSFAULTENA);
+        }
+        prev & SHCSR_BUSFAULTENA != 0
+    }
+}
 
 /// Run the ordered GPIO+RCU family probe ONCE inside the fault-safe harness and, once a family is
 /// known, MEASURE the per-instance counts, returning the fully-populated [`Detected`] (or `None` if
@@ -378,18 +429,16 @@ pub fn run() -> Option<Detected> {
     // is the application's (copied from the active table).
     let family = with_probe_vector_table(|| {
         // Enable the dedicated BusFault handler so a precise reserved-read fault traps to it (not
-        // HardFault). Remember the prior state so we can restore it.
-        // SAFETY: bring-up context, single core, no concurrent SCB users; we restore below.
-        let mut scb = unsafe { cortex_m::Peripherals::steal().SCB };
-        let bf_was_enabled = scb.is_enabled(Exception::BusFault);
-        scb.enable(Exception::BusFault);
+        // HardFault). Remember the prior state so we can restore it. Raw SHCSR RMW, never steal()
+        // (DECISIONS.md #13: detect must not consume the one-shot TAKEN flag).
+        let bf_was_enabled = shcsr_set_busfaultena(true);
 
         let family = probe_family();
 
         // Restore the prior BUSFAULTENA state. The probe handler is strictly boot-temporary.
         if !bf_was_enabled {
             // Undo our enable so we leave SHCSR as we found it.
-            scb.disable(Exception::BusFault);
+            shcsr_set_busfaultena(false);
         }
         // The probe leaves the shared atomics disarmed.
         EXPECTING_FAULT.store(false, Ordering::SeqCst);
@@ -483,12 +532,8 @@ fn probe_candidate(base: u32) -> Option<u32> {
 /// [`disarm_busfault`] passing the returned value, and must run inside [`with_probe_vector_table`] so
 /// a probe fault reaches the HAL-internal [`bus_fault_entry`].
 pub fn arm_busfault() -> bool {
-    // SAFETY: bring-up context, single core, no concurrent SCB users; the caller restores via
-    // disarm_busfault.
-    let mut scb = unsafe { cortex_m::Peripherals::steal().SCB };
-    let was_enabled = scb.is_enabled(Exception::BusFault);
-    scb.enable(Exception::BusFault);
-    was_enabled
+    // Raw SHCSR RMW (never steal(), DECISIONS.md #13); the caller restores via disarm_busfault.
+    shcsr_set_busfaultena(true)
 }
 
 /// Restore `SHCSR.BUSFAULTENA` to the state [`arm_busfault`] reported (`prev`). If BusFault was not
@@ -499,10 +544,9 @@ pub fn arm_busfault() -> bool {
 /// Bring-up / single-core context only; mutates `SHCSR`. Pass the exact value [`arm_busfault`]
 /// returned.
 pub fn disarm_busfault(prev: bool) {
-    // SAFETY: as arm_busfault; restoring the prior state.
-    let mut scb = unsafe { cortex_m::Peripherals::steal().SCB };
+    // Raw SHCSR RMW (never steal(), DECISIONS.md #13): restore the prior state.
     if !prev {
-        scb.disable(Exception::BusFault);
+        shcsr_set_busfaultena(false);
     }
     // Leave the shared probe window disarmed (a real fault after the sweep is a genuine error).
     EXPECTING_FAULT.store(false, Ordering::SeqCst);

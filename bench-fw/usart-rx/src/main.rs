@@ -238,8 +238,7 @@ fn reprogram_split(tx: UsartTx, rx: UsartRx, baud: u32) -> (UsartTx, UsartRx) {
 mod single {
     use super::*;
     use embedded_hal::digital::OutputPin;
-    use heapless::spsc::Queue;
-    use runtime_hal::BufferedRx;
+    use runtime_hal::{BufferedRx, RxRing};
 
     /// S2 high-rate stress baud: APB1/16 = 36 MHz / 16 = 2.25 Mbit/s (`USART_BAUD` 0x10, 0%
     /// divisor error), the F1-series USART maximum on the proven 72 MHz tree.
@@ -313,9 +312,10 @@ mod single {
 
     const MAGIC: u32 = 0x5332_5242;
 
-    /// The two application-owned `'static` SPSC rings (S1 `BufferedRx`, one per instance).
-    static mut RING_U1: Queue<u8, 64> = Queue::new();
-    static mut RING_MOD: Queue<u8, 64> = Queue::new();
+    /// The two application-owned `'static` SPSC rings (S1 `BufferedRx`, one per instance). All ops
+    /// are `&self` (the HAL-owned `RxRing`), so plain statics, no `static mut`.
+    static RING_U1: RxRing<64> = RxRing::new();
+    static RING_MOD: RxRing<64> = RxRing::new();
 
     macro_rules! st {
         ($field:ident, $val:expr) => {
@@ -456,17 +456,12 @@ mod single {
         let (u1_tx, u1_rx) = usart1.split();
         let (u2_tx, u2_rx) = usart2.split();
 
-        // SAFETY: each ring is a 'static, used only as this receiver's SPSC buffer.
-        let mut rx_u1 = match BufferedRx::new(chip, u1_rx, PeriphLabel::Usart1, unsafe {
-            &mut *addr_of_mut!(RING_U1)
-        }) {
+        let mut rx_u1 = match BufferedRx::new(chip, u1_rx, PeriphLabel::Usart1, &RING_U1) {
             Ok(r) => r,
             Err(_) => halt(),
         };
-        // SAFETY: as above. Module BufferedRx is F10x-only; on F1x0 this fails loud.
-        let mut rx_mod = match BufferedRx::new(chip, u2_rx, PeriphLabel::Usart2, unsafe {
-            &mut *addr_of_mut!(RING_MOD)
-        }) {
+        // Module BufferedRx is F10x-only; on F1x0 this fails loud.
+        let mut rx_mod = match BufferedRx::new(chip, u2_rx, PeriphLabel::Usart2, &RING_MOD) {
             Ok(r) => r,
             Err(_) => halt(),
         };

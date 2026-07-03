@@ -23,9 +23,9 @@ use crate::irq::{install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ};
 use crate::reg::{mock, Reg32};
 use crate::serial::{PolledSerial, SplitSerial};
 use crate::usart::Usart;
-use crate::usart_rx::{BufferedRx, RingBufferedRx};
+use crate::usart_rx::{BufferedRx, RingBufferedRx, RxRing};
 use embedded_io::{Error, ErrorKind, Read, ReadReady, Write, WriteReady};
-use heapless::spsc::Queue;
+
 use std::boxed::Box;
 use std::sync::MutexGuard;
 use std::vec;
@@ -450,7 +450,7 @@ fn split_write_goes_out_the_tx_half() {
 fn split_buffered<const N: usize>() -> SplitSerial<BufferedRx> {
     let c = chip();
     let (tx, rx) = bring_up().split();
-    let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
+    let storage: &'static RxRing<N> = Box::leak(Box::new(RxRing::new()));
     let b = BufferedRx::new(&c, rx, PeriphLabel::Usart1, storage).unwrap();
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
     SplitSerial::new(tx, b)

@@ -78,8 +78,9 @@ const SEND_PERIOD_TICKS: u32 = 500;
 
 #[entry]
 fn main() -> ! {
-    // Take the core peripherals to claim SysTick for the loop delay. `detect_chip()` uses
-    // `cortex_m::Peripherals::steal()` internally for its probe, so this `take()` still succeeds.
+    // Take the core peripherals (the application owns take(), DECISIONS.md #13: the HAL uses raw
+    // register views internally and never consumes the one-shot flag, so ordering vs detect_chip
+    // is unconstrained).
     let cp = cortex_m::Peripherals::take().unwrap();
 
     // 1. Detect the chip at runtime (family probe + peripheral-presence measurement). A part matching

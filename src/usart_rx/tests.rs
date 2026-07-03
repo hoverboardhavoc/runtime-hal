@@ -8,7 +8,7 @@
 //! drain loop terminates); each staged byte is one dispatch, mirroring the polled serial RX tests.
 #![cfg(feature = "mock")]
 
-use super::{reset_for_test, supports_rx, BufferedRx, RingBufferedRx};
+use super::{reset_for_test, supports_rx, BufferedRx, RingBufferedRx, RxRing};
 use crate::addr::{AddrTable, PeriphLabel};
 use crate::chip::Chip;
 use crate::clock::ClockConfig;
@@ -22,7 +22,7 @@ use crate::irq::{
 };
 use crate::reg::{mock, Reg32};
 use crate::usart::Usart;
-use heapless::spsc::Queue;
+
 use std::sync::MutexGuard;
 
 /// The bench USART1 base in the mock window (the offsets within it are what assertions key on).
@@ -126,7 +126,7 @@ fn setup() -> MutexGuard<'static, ()> {
 fn install<const N: usize>(fam: &Fam) -> BufferedRx {
     let chip = chip_for(fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
-    let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
+    let storage: &'static RxRing<N> = Box::leak(Box::new(RxRing::new()));
     let rx = BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, storage).unwrap();
     install_mock(fam.irq, RAM_ADDR);
     rx
@@ -160,7 +160,7 @@ fn module_cfg() -> UsartConfig {
 /// can install both instances before one flip).
 fn bring_up_module<const N: usize>(chip: &Chip) -> BufferedRx {
     let usart = Usart::bring_up(chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
-    let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
+    let storage: &'static RxRing<N> = Box::leak(Box::new(RxRing::new()));
     BufferedRx::new(chip, usart.split().1, PeriphLabel::Usart2, storage).unwrap()
 }
 
@@ -382,7 +382,7 @@ fn b15_two_instances_live_no_slot_or_vector_collision() {
 
     // USART1 BufferedRx (slot 0, vector 38) and module BufferedRx (slot 1, vector 39), both live.
     let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
-    let s1: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let s1: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
     let mut rx1 = BufferedRx::new(&chip, u1.split().1, PeriphLabel::Usart1, s1).unwrap();
     let mut rxm = bring_up_module::<8>(&chip);
     install_mock(fam.irq, RAM_ADDR);
@@ -425,7 +425,7 @@ fn b16_module_instance_on_f1x0_is_unsupported() {
     let _g = setup();
     let chip = chip_for(&fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
-    let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let storage: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
     assert_eq!(
         BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart2, storage).map(|_| ()),
         Err(DescriptorError::Unsupported),
@@ -441,7 +441,7 @@ fn b17_unknown_instance_selector_is_rejected() {
     let _g = setup();
     let chip = chip_for(&fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
-    let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let storage: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
     // USART0 is a real label but not a supported buffered-RX instance (only USART1 + the module are).
     assert_eq!(
         BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart0, storage).map(|_| ()),
@@ -1013,7 +1013,7 @@ fn buffered_release_quiesces_and_the_half_rearms() {
     let _g = setup();
     let chip = chip_for(&fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
-    let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let storage: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
     let mut rx = BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, storage).unwrap();
     install_mock(fam.irq, RAM_ADDR);
 
@@ -1037,7 +1037,7 @@ fn buffered_release_quiesces_and_the_half_rearms() {
     );
 
     // The returned half re-arms and receives again.
-    let storage2: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let storage2: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
     let mut rx2 = BufferedRx::new(&chip, half, PeriphLabel::Usart1, storage2).unwrap();
     stage_byte(&fam, 0xB2);
     fire(&fam);

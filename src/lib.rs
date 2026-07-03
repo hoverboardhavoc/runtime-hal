@@ -16,6 +16,7 @@ mod afio;
 pub mod chip;
 pub mod clock;
 pub mod config;
+pub mod dbg;
 /// SysTick-based blocking delay implementing the `embedded-hal` 1.0 `DelayNs` trait
 /// ([`delay::Delay`]).
 pub mod delay;
@@ -90,6 +91,7 @@ pub use detect::{
 // `Family` / `synthesize` are detection internals: the default public API never names a chip family
 // (silicon purity). They are re-exported at the crate root ONLY behind the `detect-internals`
 // feature, for the in-tree detection-acceptance bench firmware that must introspect detection.
+pub use dbg::debug_hold_on_sleep;
 #[cfg(feature = "detect-internals")]
 pub use detect::{family_capability, synthesize, Family};
 pub use dma::DmaRxMap;
@@ -118,7 +120,7 @@ pub use timer::{ComplementaryPwm, PwmController, PwmHandle, PwmTimer};
 pub use usart::{
     compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel, UsartRx, UsartTx,
 };
-pub use usart_rx::{supports_rx, BufferedRx, RingBufferedRx};
+pub use usart_rx::{supports_rx, BufferedRx, RingBufferedRx, RxRing};
 pub use watchdog::{
     clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,
     PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,

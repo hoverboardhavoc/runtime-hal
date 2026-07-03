@@ -22,6 +22,13 @@ embedded-hal-mock = "0.11"
 proptest = "1"
 
 [features]
+# PROTECTIVE GATE (debt-paydown slice 9): the boot-console default bring-up
+# (`detect::bringup::apply_defaults`) configures **PA9/PA10 as USART0** - on the 6-FET hoverboard
+# boards those are FET GATE pins (specs/l3.md pin safety denies them). Nothing in production calls
+# it; it stays compiled ONLY for the mock host tests, and a real (non-mock) build must opt in
+# explicitly, the same way bench-fw/wfi-lock-repro demands its yes-lock-this-board feature:
+#     --features yes-console-on-pa9-pa10
+yes-console-on-pa9-pa10 = []
 # `mock` is a dev / host-test feature only (DECISIONS.md #8: features never gate a family path).
 # It enables std for host tests and switches the Reg accessor to a backing-array backend so tests
 # can read/write the "register space" without real MMIO. The normal build is real volatile MMIO.
