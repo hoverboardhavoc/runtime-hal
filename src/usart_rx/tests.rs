@@ -115,6 +115,9 @@ fn bench_cfg() -> UsartConfig {
 fn setup() -> MutexGuard<'static, ()> {
     let g = mock::lock();
     mock::reset();
+    // The DMA silicon rule the DMA cases depend on: writing INTC (0x04) clears the written bits in
+    // INTF (0x00). Declared by the harness (mock::reset cleared any prior registration).
+    mock::w1c_pair(DMA0_BASE + 0x04, DMA0_BASE);
     reset_for_test();
     crate::dma::reset_for_test();
     mock_vtor::reset();
@@ -137,8 +140,11 @@ fn stage_byte(fam: &Fam, b: u8) {
 }
 
 /// Stage a ready RBNE byte at an arbitrary USART base (so the module instance's register space, at
-/// `MODULE_BASE`, can be driven independently of USART1's).
+/// `MODULE_BASE`, can be driven independently of USART1's). Registers the silicon rule the staged
+/// state depends on: a data-register read clears `STAT.RBNE` (the harness declares the device
+/// behavior; the driver under test does not manufacture it).
 fn stage_byte_at(base: u32, fam: &Fam, b: u8) {
+    mock::read_clears(base + fam.data, base + fam.stat, RBNE);
     Reg32::new(base, fam.data).write(b as u32);
     Reg32::new(base, fam.stat).write(RBNE);
 }

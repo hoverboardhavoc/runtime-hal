@@ -122,29 +122,82 @@ mod backend {
     }
 }
 
-/// Host-test backing-array backend (`mock` feature).
+/// Host-test backing-map backend (`mock` feature).
 ///
-/// A single flat byte array stands in for the register space; addresses index into it modulo the
-/// span. Accesses are little-endian (the GD32 is little-endian and the frame is LE per
-/// DECISIONS.md #3), so width strictness is exact at the byte level: a `Reg32::write` lays down
-/// four bytes that two `Reg16` reads then observe, and vice-versa. Each access takes a short mutex
-/// so the array is internally consistent; a case that seeds the space and later asserts it holds
-/// [`mock::lock`] for its whole duration so the cargo test runner's threads do not interleave a
-/// [`mock::reset`] into the middle of it.
+/// A sparse byte map stands in for the FULL 32-bit register space, keyed by the exact address, so
+/// distinct peripherals can NEVER alias (the old fixed 64 KiB array indexed by `addr & 0xFFFF`
+/// collapsed e.g. F1x0 GPIOA `0x4800_0000`, the DMA `INTF` `0x4002_0000`, and flash `0x0800_0000`
+/// onto one index; debt-paydown slice 10). Unwritten addresses read 0, matching the old zeroed
+/// array. Accesses are little-endian (the GD32 is little-endian), so width strictness is exact at
+/// the byte level: a `Reg32::write` lays down four bytes that two `Reg16` reads then observe, and
+/// vice-versa. Each access takes a short mutex so the map is internally consistent; a case that
+/// seeds the space and later asserts it holds [`mock::lock`] for its whole duration so the cargo
+/// test runner's threads do not interleave a [`mock::reset`] into the middle of it.
+///
+/// The backend models NO silicon behavior of its own: device side effects (a read-clears-flag
+/// register, a write-1-to-clear pair) exist only as RULES a test harness registers
+/// ([`mock::read_clears`] / [`mock::w1c_pair`]), so the code under test never manufactures the
+/// behavior its tests observe (the old in-driver `cfg(mock)` side effects are gone).
 #[cfg(feature = "mock")]
 pub mod backend {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    /// Size of the simulated register window, in bytes. Generous for M1's handful of peripherals.
-    pub const SPACE_BYTES: usize = 1 << 16;
+    static SPACE: Mutex<BTreeMap<u32, u8>> = Mutex::new(BTreeMap::new());
 
-    static SPACE: Mutex<[u8; SPACE_BYTES]> = Mutex::new([0u8; SPACE_BYTES]);
-
-    /// A single "non-responsive" word index whose writes are dropped, modelling a register that does
-    /// not stick (a disabled-clock / wrong-base channel). `usize::MAX` = none. Used by the DMA-ring
+    /// A single "non-responsive" address whose writes are dropped, modelling a register that does
+    /// not stick (a disabled-clock / wrong-base channel). `u64::MAX` = none. Used by the DMA-ring
     /// write-back self-check test (host case B11); reset clears it.
-    static FROZEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static FROZEN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    /// Test-registered read side effects: `(read_addr, clear_addr, mask)` - a read at `read_addr`
+    /// clears `mask` at `clear_addr` (e.g. the GD32 USART's data-register read clearing
+    /// `STAT.RBNE`). Registered by the test harness that stages the device state; cleared by
+    /// [`mock::reset`].
+    static READ_CLEARS: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+
+    /// Test-registered write-1-to-clear pairs: `(w1c_addr, target_addr)` - writing `v` to
+    /// `w1c_addr` clears bits `v` at `target_addr` (e.g. the GD32 DMA `INTC` clearing `INTF`).
+    static W1C_PAIRS: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+    #[inline]
+    fn get(map: &BTreeMap<u32, u8>, addr: u32) -> u8 {
+        *map.get(&addr).unwrap_or(&0)
+    }
+    #[inline]
+    fn put(map: &mut BTreeMap<u32, u8>, addr: u32, b: u8) {
+        map.insert(addr, b);
+    }
+    /// Apply the registered read side effects for `addr` (rules lock taken BEFORE the space lock,
+    /// the fixed order every path uses).
+    fn apply_read_rules(map: &mut BTreeMap<u32, u8>, rules: &[(u32, u32, u32)], addr: u32) {
+        for &(read_addr, clear_addr, mask) in rules {
+            if read_addr == addr {
+                for i in 0..4u32 {
+                    let m = (mask >> (8 * i)) as u8;
+                    if m != 0 {
+                        let cur = get(map, clear_addr + i);
+                        put(map, clear_addr + i, cur & !m);
+                    }
+                }
+            }
+        }
+    }
+    /// Apply the registered W1C pairs for a write of `value` at `addr`.
+    fn apply_w1c_rules(map: &mut BTreeMap<u32, u8>, pairs: &[(u32, u32)], addr: u32, value: u32) {
+        for &(w1c_addr, target) in pairs {
+            if w1c_addr == addr {
+                for i in 0..4u32 {
+                    let m = (value >> (8 * i)) as u8;
+                    if m != 0 {
+                        let cur = get(map, target + i);
+                        put(map, target + i, cur & !m);
+                    }
+                }
+            }
+        }
+    }
 
     /// Serializes whole test cases that seed-then-assert against the shared `SPACE`. The
     /// per-access `SPACE` lock is dropped between each `read`/`write`, so a case that seeds a
@@ -153,55 +206,61 @@ pub mod backend {
     /// the (multi-threaded by default) cargo test runner.
     static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
-    #[inline]
-    fn idx(addr: u32) -> usize {
-        (addr as usize) & (SPACE_BYTES - 1)
-    }
-
     /// Read a 16-bit little-endian value from the mock register backing store.
     #[inline]
     pub fn read16(addr: u32) -> u16 {
-        let s = SPACE.lock().unwrap();
-        let i = idx(addr);
-        u16::from_le_bytes([s[i], s[i + 1]])
+        let rules = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
+        let v = u16::from_le_bytes([get(&s, addr), get(&s, addr + 1)]);
+        apply_read_rules(&mut s, &rules, addr);
+        v
     }
     /// Write a 16-bit little-endian value to the mock register backing store.
     #[inline]
     pub fn write16(addr: u32, value: u16) {
-        let i = idx(addr);
-        if i == FROZEN.load(Ordering::Relaxed) {
+        if addr as u64 == FROZEN.load(Ordering::Relaxed) {
             return; // non-responsive register: the write does not stick
         }
-        let mut s = SPACE.lock().unwrap();
+        let pairs = W1C_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
         let b = value.to_le_bytes();
-        s[i] = b[0];
-        s[i + 1] = b[1];
+        put(&mut s, addr, b[0]);
+        put(&mut s, addr + 1, b[1]);
+        apply_w1c_rules(&mut s, &pairs, addr, value as u32);
     }
     /// Read a 32-bit little-endian value from the mock register backing store.
     #[inline]
     pub fn read32(addr: u32) -> u32 {
-        let s = SPACE.lock().unwrap();
-        let i = idx(addr);
-        u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]])
+        let rules = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
+        let v = u32::from_le_bytes([
+            get(&s, addr),
+            get(&s, addr + 1),
+            get(&s, addr + 2),
+            get(&s, addr + 3),
+        ]);
+        apply_read_rules(&mut s, &rules, addr);
+        v
     }
     /// Write a 32-bit little-endian value to the mock register backing store.
     #[inline]
     pub fn write32(addr: u32, value: u32) {
-        let i = idx(addr);
-        if i == FROZEN.load(Ordering::Relaxed) {
+        if addr as u64 == FROZEN.load(Ordering::Relaxed) {
             return; // non-responsive register: the write does not stick
         }
-        let mut s = SPACE.lock().unwrap();
+        let pairs = W1C_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
         let b = value.to_le_bytes();
-        s[i] = b[0];
-        s[i + 1] = b[1];
-        s[i + 2] = b[2];
-        s[i + 3] = b[3];
+        put(&mut s, addr, b[0]);
+        put(&mut s, addr + 1, b[1]);
+        put(&mut s, addr + 2, b[2]);
+        put(&mut s, addr + 3, b[3]);
+        apply_w1c_rules(&mut s, &pairs, addr, value);
     }
 
-    /// Test helpers for the backing array.
+    /// Test helpers for the backing map.
     pub mod mock {
-        use super::{idx, FROZEN, SPACE, SPACE_BYTES, TEST_SERIAL};
+        use super::{FROZEN, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS};
         use std::sync::atomic::Ordering;
         use std::sync::MutexGuard;
 
@@ -209,7 +268,27 @@ pub mod backend {
         /// the prior value, default 0), modelling a register that does not stick. Cleared by
         /// [`reset`]. One frozen word at a time (the DMA self-check test needs exactly one).
         pub fn freeze(addr: u32) {
-            FROZEN.store(idx(addr), Ordering::Relaxed);
+            FROZEN.store(addr as u64, Ordering::Relaxed);
+        }
+
+        /// Register a device READ side effect: a read at `read_addr` clears `mask` at `clear_addr`
+        /// (e.g. the GD32 USART data-register read clearing `STAT.RBNE`). The test harness that
+        /// stages device state declares the device behavior; the drivers under test never
+        /// manufacture it. Cleared by [`reset`].
+        pub fn read_clears(read_addr: u32, clear_addr: u32, mask: u32) {
+            let mut r = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
+            if !r.contains(&(read_addr, clear_addr, mask)) {
+                r.push((read_addr, clear_addr, mask));
+            }
+        }
+
+        /// Register a write-1-to-clear pair: writing `v` to `w1c_addr` clears bits `v` at
+        /// `target_addr` (e.g. the GD32 DMA `INTC` clearing `INTF`). Cleared by [`reset`].
+        pub fn w1c_pair(w1c_addr: u32, target_addr: u32) {
+            let mut p = W1C_PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+            if !p.contains(&(w1c_addr, target_addr)) {
+                p.push((w1c_addr, target_addr));
+            }
         }
 
         /// Acquire the whole-case serialization lock. Hold the returned guard for the duration of
@@ -220,18 +299,23 @@ pub mod backend {
             TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
         }
 
-        /// Zero the whole simulated register space (call at the start of a test case). Also clears any
-        /// frozen (non-responsive) word.
+        /// Zero the whole simulated register space (call at the start of a test case). Also clears
+        /// any frozen (non-responsive) word and every registered device rule.
         pub fn reset() {
-            FROZEN.store(usize::MAX, Ordering::Relaxed);
-            let mut s = SPACE.lock().unwrap();
-            *s = [0u8; SPACE_BYTES];
+            FROZEN.store(u64::MAX, Ordering::Relaxed);
+            READ_CLEARS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            W1C_PAIRS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
+            s.clear();
         }
 
         /// Peek a single byte (for assertions about width/endianness).
         pub fn peek_byte(addr: u32) -> u8 {
-            let s = SPACE.lock().unwrap();
-            s[idx(addr)]
+            let s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
+            *s.get(&addr).unwrap_or(&0)
         }
     }
 }

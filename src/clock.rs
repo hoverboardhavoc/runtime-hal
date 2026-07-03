@@ -463,7 +463,8 @@ fn gpio_enable_bit(path: ClockPath, port: PeriphLabel) -> Result<EnableBit, Desc
                 PeriphLabel::Gpiob => 3,
                 PeriphLabel::Gpioc => 4,
                 PeriphLabel::Gpiod => 5,
-                PeriphLabel::Gpioe => 6,
+                // (PEEN, bit 6, exists in APB2EN but the crate carries no Gpioe label: the bench
+                // parts do not bond port E and F1x0 has none.)
                 PeriphLabel::Gpiof => 7,
                 _ => return Err(DescriptorError::UnknownSelector),
             };
@@ -476,8 +477,7 @@ fn gpio_enable_bit(path: ClockPath, port: PeriphLabel) -> Result<EnableBit, Desc
                 PeriphLabel::Gpiob => 18,
                 PeriphLabel::Gpioc => 19,
                 PeriphLabel::Gpiod => 20,
-                // F1x0 has no port E.
-                PeriphLabel::Gpioe => return Err(DescriptorError::SelectorAddrMismatch),
+                // (No PEEN on F1x0 at all - and no Gpioe label in the crate.)
                 PeriphLabel::Gpiof => 22,
                 _ => return Err(DescriptorError::UnknownSelector),
             };
@@ -486,40 +486,35 @@ fn gpio_enable_bit(path: ClockPath, port: PeriphLabel) -> Result<EnableBit, Desc
     }
 }
 
-/// The enable register + bit for an I2C instance (both families: I2C0 = APB1EN bit 21,
-/// I2C1 = APB1EN bit 22).
+/// The enable register + bit for an I2C instance (both families: I2C0 = APB1EN bit 21; the crate
+/// carries no second I2C label).
 fn i2c_enable_bit(i2c: PeriphLabel) -> Result<EnableBit, DescriptorError> {
     match i2c {
         PeriphLabel::I2c0 => Ok(EnableBit {
             reg: APB1EN,
             bit: 21,
         }),
-        PeriphLabel::I2c1 => Ok(EnableBit {
-            reg: APB1EN,
-            bit: 22,
-        }),
         _ => Err(DescriptorError::UnknownSelector),
     }
 }
 
-/// The enable register + bit for a SPI instance (both families: SPI0 = APB2EN bit 12,
-/// SPI1 = APB1EN bit 14).
+/// The enable register + bit for a SPI instance. NOTE the F10x/F1x0 divergence the `Spi0` label
+/// hides: F10x SPI0 is on APB2 (bit 12); the F1x0 single SPI block is an APB1 peripheral but its
+/// enable ALSO sits in APB2EN bit 12 on that family's RCU map - the shared arm is correct for
+/// both. (The crate carries no second SPI label.)
 fn spi_enable_bit(spi: PeriphLabel) -> Result<EnableBit, DescriptorError> {
     match spi {
         PeriphLabel::Spi0 => Ok(EnableBit {
             reg: APB2EN,
             bit: 12,
         }),
-        PeriphLabel::Spi1 => Ok(EnableBit {
-            reg: APB1EN,
-            bit: 14,
-        }),
         _ => Err(DescriptorError::UnknownSelector),
     }
 }
 
-/// The enable register + bit for an ADC instance (both families: ADC0 = APB2EN bit 9,
-/// ADC1 = APB2EN bit 10; the F1x0 single ADC is the unnumbered bit 9, mapped to `Adc0`).
+/// The enable register + bit for an ADC instance (ADC0 = APB2EN bit 9, ADC1 = bit 10, ADC2 = bit
+/// 15 - the F10x high-density third instance the probe's ADC sweep already keys on; the F1x0
+/// single ADC is the unnumbered bit 9, mapped to `Adc0`).
 fn adc_enable_bit(adc: PeriphLabel) -> Result<EnableBit, DescriptorError> {
     match adc {
         PeriphLabel::Adc0 => Ok(EnableBit {
@@ -529,6 +524,10 @@ fn adc_enable_bit(adc: PeriphLabel) -> Result<EnableBit, DescriptorError> {
         PeriphLabel::Adc1 => Ok(EnableBit {
             reg: APB2EN,
             bit: 10,
+        }),
+        PeriphLabel::Adc2 => Ok(EnableBit {
+            reg: APB2EN,
+            bit: 15,
         }),
         _ => Err(DescriptorError::UnknownSelector),
     }

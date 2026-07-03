@@ -77,7 +77,7 @@ pub(crate) use synth::{family_capability, synthesize, Family};
 /// feature without the items being reachable through the (public) `detect` module by default.
 mod synth {
     use super::{family_model, Detected, McuDescriptor, PageSize, PeriphLabel};
-    use super::{ADC1_BASE, F10X_K2_THRESHOLD_KIB, TIMER7_BASE};
+    use super::{ADC1_BASE, ADC2_BASE, F10X_K2_THRESHOLD_KIB, TIMER7_BASE};
 
     /// The MCU family the probe resolves. A single family determination fixes all four
     /// register-model selectors and the base-address table (the constant `family_model` facts).
@@ -120,7 +120,8 @@ mod synth {
             addrs: model
                 .addrs
                 .with(detected.adv_timers >= 2, PeriphLabel::Timer7, TIMER7_BASE)
-                .with(detected.adc_count >= 2, PeriphLabel::Adc1, ADC1_BASE),
+                .with(detected.adc_count >= 2, PeriphLabel::Adc1, ADC1_BASE)
+                .with(detected.adc_count >= 3, PeriphLabel::Adc2, ADC2_BASE),
             flash_page: flash_page_for(detected.family, detected.flash_kib),
             // Retain the raw density (KiB) as the flash extent the FMC driver bounds writes against
             // (`Chip::flash_size_bytes` = `flash_kib * 1024`); a pure read at detect, never written.
@@ -162,6 +163,13 @@ const TIMER7_BASE: u32 = 0x4001_3400;
 /// only when a second ADC is measured, so single-ADC parts resolve `Adc1` as `MissingBase`.
 const ADC1_BASE: u32 = 0x4001_2800;
 
+/// ADC2 base on the F10x high-density parts (SPL `gd32f10x_adc.h:46`: `ADC2 = ADC_BASE + 0x1800` =
+/// `0x4001_3C00` - NOT contiguous with ADC1; it sits past the APB2 timer/USART block). Carried by
+/// [`synthesize`] only when a THIRD ADC is measured (the probe's `ADC_BASES[2]` scratch test, e.g.
+/// the 12-FET's GD32F103RC), so every other part resolves `Adc2` as `MissingBase`. Data only; no
+/// driver work rides on it.
+const ADC2_BASE: u32 = 0x4001_3C00;
+
 // --- the constant per-family facts (the register-model selectors + base-address table) --------
 //
 // These hold ONLY the truly-constant facts shared by every part of a family: the four register-model
@@ -198,6 +206,11 @@ const fn family_model(family: Family) -> FamilyModel {
     match family {
         Family::F10x => {
             let mut addrs = AddrTable::new();
+            // USART0 (ST USART1) on APB2 at 0x4001_3800 on BOTH families (gd32f10x_usart.h:48 /
+            // the F1x0 memory map): promoted into the family models (todo A1), killing the
+            // with_usart0 copy-and-inject helper. Its default pins (PA9/PA10) are gate pins on the
+            // 6-FET boards; carrying the BASE is data, not a bring-up.
+            addrs.set(PeriphLabel::Usart0, 0x4001_3800);
             addrs.set(PeriphLabel::Usart1, 0x4000_4400);
             // USART2 (ST USART3) is F10x-only, on APB1 at base 0x4000_4400 + 0x400; F1x0 has no
             // USART2 (its F1x0 arm below carries no base, so it resolves MissingBase(Usart2)).
@@ -229,6 +242,8 @@ const fn family_model(family: Family) -> FamilyModel {
         }
         Family::F1x0 => {
             let mut addrs = AddrTable::new();
+            // USART0 at the same APB2 base as F10x (see the F10x arm's note).
+            addrs.set(PeriphLabel::Usart0, 0x4001_3800);
             addrs.set(PeriphLabel::Usart1, 0x4000_4400);
             // F1x0 GPIO ports: AHB, GPIOA at 0x4800_0000, 0x400 per-port stride (GPIOC = +0x800,
             // GPIOD = +0xC00, GPIOF = +0x1400). F1x0 has no port E (the AHBEN PEEN bit is the gap),

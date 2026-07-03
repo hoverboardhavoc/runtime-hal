@@ -8,7 +8,8 @@
 //! # The shared-ISR ownership problem (and how it is solved)
 //!
 //! The USART RX vector is an argument-less `extern "C" fn` (it reaches the ISR body via
-//! [`crate::irq::call_usart_rx_handler`]), yet the body needs the USART registers and the ring. The
+//! `irq::call_usart_rx_handler`, crate-internal), yet the body needs the USART registers and the
+//! ring. The
 //! crate already solved this for the control loop (a static handler pointer, DECISIONS.md #7) and the
 //! grouped demux (a static base). This module uses the same shape: a `static` RX context (a slot in
 //! [`RX_SLOTS`], one per instance) holds the USART base + the family bit + the ring's queue pointer +
@@ -293,13 +294,14 @@ fn unclaim_impl<const N: usize>(q: *mut ()) {
 // --- the ISR bodies (one per instance, each reached via its own vector slot) -------------------
 
 /// The registered ISR body for USART1 (slot 0). Reached from the `usart1_rx_isr` vector slot through
-/// [`crate::irq::call_usart_rx_handler`].
+/// `irq::call_usart_rx_handler` (crate-internal).
 extern "C" fn rx_irq_handler() {
     on_usart_rx_irq(&RX_SLOTS[0]);
 }
 
 /// The registered ISR body for the module USART (slot 1, F10x-only). Reached from the
-/// `module_usart_rx_isr` vector slot through [`crate::irq::call_usart_rx_handler2`]. Independent of
+/// `module_usart_rx_isr` vector slot through the crate-internal `irq::call_usart_rx_handler2`.
+/// Independent of
 /// [`rx_irq_handler`] so the two instances never touch each other's slot (item 1/2 coexistence).
 extern "C" fn module_rx_irq_handler() {
     on_usart_rx_irq(&RX_SLOTS[1]);

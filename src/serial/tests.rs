@@ -63,6 +63,9 @@ fn ftf_flag(ch: u8) -> u32 {
 fn setup() -> MutexGuard<'static, ()> {
     let g = mock::lock();
     mock::reset();
+    // The DMA silicon rule the split-adapter DMA cases depend on: writing INTC (0x04) clears the
+    // written bits in INTF (0x00). Declared by the harness.
+    mock::w1c_pair(DMA0_BASE + 0x04, DMA0_BASE);
     crate::usart_rx::reset_for_test();
     crate::dma::reset_for_test();
     mock_vtor::reset();
@@ -448,6 +451,9 @@ fn split_write_goes_out_the_tx_half() {
 
 /// A `SplitSerial<BufferedRx>` over the bench USART (interrupt path, ring capacity word `N`).
 fn split_buffered<const N: usize>() -> SplitSerial<BufferedRx> {
+    // The ISR's drain loop depends on the silicon rule that a data-register read clears RBNE;
+    // declare it for this suite's F10x offsets (the harness owns the device model).
+    mock::read_clears(USART_BASE + DATA_OFF, USART_BASE + STAT_OFF, STAT_RBNE);
     let c = chip();
     let (tx, rx) = bring_up().split();
     let storage: &'static RxRing<N> = Box::leak(Box::new(RxRing::new()));

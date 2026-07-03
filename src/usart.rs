@@ -828,14 +828,10 @@ impl UsartRegs {
     /// progress.
     #[inline]
     pub(crate) fn read_rbne_byte(&self) -> u8 {
-        let b = (Reg32::new(self.base, self.model.rx_data).read() & 0xFF) as u8;
-        // The host-test backend is a passive backing array with no UART core, so a data-register
-        // read does NOT auto-clear RBNE the way silicon does. Model that side effect under `mock`
-        // so the ISR drain loop terminates after the staged byte; on real MMIO the hardware cleared
-        // RBNE on the read above and this is not compiled in.
-        #[cfg(feature = "mock")]
-        self.stat().modify(STAT_RBNE, 0);
-        b
+        // On silicon the data-register read auto-clears RBNE (the FIFO-less RX register empties);
+        // the host tests model that as a registered mock rule (`mock::read_clears`), never here -
+        // the driver manufactures none of the behavior its tests observe.
+        (Reg32::new(self.base, self.model.rx_data).read() & 0xFF) as u8
     }
 }
 

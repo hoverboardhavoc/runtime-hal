@@ -11,11 +11,15 @@
 use crate::descriptor::{ClockPath, GpioPath};
 use crate::error::DescriptorError;
 
-/// Peripheral labels the M1 milestone resolves.
+/// Peripheral labels the HAL resolves.
 ///
 /// `#[repr(u8)]` and contiguous from 0 so the discriminant doubles as the index into
-/// [`AddrTable`]'s backing array. Extend toward the end as later milestones add peripherals;
-/// keep the order stable so the index stays meaningful.
+/// [`AddrTable`]'s backing array. The old cross-build index-stability invariant died with the CBOR
+/// descriptor (the table is built and consumed inside one binary now), so the numbering is simply
+/// kept contiguous. One label = one resolvable base (debt-paydown slice 10): every variant here
+/// has a base populated in a family model (or count-conditionally by `synthesize`); speculative
+/// labels with no populatable base (the old `Gpioe`/`I2c1`/`Spi1`) were deleted rather than left
+/// dead-ending in `MissingBase`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriphLabel {
@@ -33,56 +37,49 @@ pub enum PeriphLabel {
     Gpioc = 5,
     /// GPIO port D base.
     Gpiod = 6,
-    /// GPIO port E base.
-    Gpioe = 7,
+    // (No `Gpioe`: F1x0 has no port E at all, and the F10x bench parts, 48/64-pin, do not bond it -
+    // no populatable base, so no label; debt-paydown slice 10.)
     /// GPIO port F base.
-    Gpiof = 8,
+    Gpiof = 7,
     /// Reset & clock unit base (GD `RCU` / ST `RCC`); one base, the clock path owns the offsets.
-    Rcu = 9,
-    // --- M2 (T1) cold-path additions. APPENDED after `Rcu` so the M1 discriminants (0..=9) and
-    // their `AddrTable` indices stay stable (T1 index-stability invariant). The CBOR `addrs` key
-    // range grows from 0..=9 to 0..=15 additively (DECISIONS.md #3).
+    Rcu = 8,
     /// I2C0 (the on-board IMU link on the bench F130; classic event-based block on both families).
-    I2c0 = 10,
-    /// I2C1 (F10x second instance; F1x0 has only the single I2C block, mapped as `I2c0`).
-    I2c1 = 11,
+    /// (No `I2c1`: no consumer exists or is planned for a second I2C; the label was speculative.)
+    I2c0 = 9,
     /// SPI0 (on APB2 on F10x; F1x0's single SPI block is mapped as `Spi0`).
-    Spi0 = 12,
-    /// SPI1 (on APB1 on F10x).
-    Spi1 = 13,
+    /// (No `Spi1`: as `I2c1`, speculative with no consumer.)
+    Spi0 = 10,
     /// ADC0 (both families; F1x0's single ADC is `Adc0`).
-    Adc0 = 14,
-    /// ADC1 (F10x second ADC; M2 brings up `Adc0` single on both, `Adc1` carried for completeness).
-    Adc1 = 15,
-    // --- M3 (T1) hot-path additions. APPENDED after the M2 labels so the M1/M2 discriminants
-    // (0..=15) and their `AddrTable` indices stay stable (the index-stability invariant). The CBOR
-    // `addrs` key range grows from 0..=15 to 0..=17 additively (DECISIONS.md #3).
+    Adc0 = 11,
+    /// ADC1 (F10x second ADC; carried count-conditionally: `synthesize` populates it iff the probe
+    /// measured `adc_count >= 2`).
+    Adc1 = 12,
+    /// ADC2 (the F10x high-density third ADC, e.g. the 12-FET's GD32F103RC; SPL `gd32f10x_adc.h:46`
+    /// `ADC2 = ADC_BASE + 0x1800` = `0x4001_3C00`). Carried count-conditionally like [`Self::Adc1`]:
+    /// populated iff the probe measured `adc_count >= 3`, so the measured third ADC is resolvable
+    /// in the model instead of a count with no label (debt-paydown slice 10).
+    Adc2 = 13,
     /// TIMER0 (the advanced timer driving the complementary PWM bridge; ST `TIM1`). On APB2 at
     /// `0x4001_2C00` on both families. The motor hot path's PWM timer.
-    Timer0 = 16,
+    Timer0 = 14,
     /// TIMER7 (the second advanced timer on parts that declare `adv_timers == 2`; ST `TIM8`).
-    /// Carried for completeness; the reference F1x0 board has only `Timer0`.
-    Timer7 = 17,
-    // --- G-WDG addition. APPENDED after `Timer7` so the M1/M2/M3 discriminants (0..=17) and their
-    // `AddrTable` indices stay stable (the index-stability invariant). Additive, DECISIONS.md #3.
+    /// Populated count-conditionally by `synthesize` (`adv_timers >= 2`).
+    Timer7 = 15,
     /// FWDGT (the free / independent watchdog; ST `IWDG`). On APB1 at `0x4000_3000` on BOTH families.
     /// The register block is identical on both, so one model parameterised by this base drives it.
-    Fwdgt = 18,
-    // --- G3 (general PWM) addition. APPENDED after `Fwdgt` so the M1/M2/M3/G-WDG discriminants
-    // (0..=18) and their `AddrTable` indices stay stable (the index-stability invariant). Additive,
-    // DECISIONS.md #3.
+    Fwdgt = 16,
     /// TIMER1 (a GENERAL-purpose level-0 timer, NOT the advanced bridge; ST `TIM2`). On APB1 at
     /// `0x4000_0000` on BOTH families (`GD32F10x_User_Manual` memory map line 1853:
     /// `0x4000 0000 - 0x4000 03FF TIMER1`; `GD32F1x0_User_Manual` 15.2 "General level0 timer
     /// (TIMERx, x=1, 2)"). Its PWM register block (CTL0/CHCTL0/CHCTL2/PSC/CAR/CHxCV) has the same
     /// offsets as the advanced TIMER0 in [`crate::timer`], MINUS the bridge-only fields. The
     /// cold-path general-PWM target ([`crate::pwm`]).
-    Timer1 = 19,
+    Timer1 = 17,
 }
 
 impl PeriphLabel {
     /// Number of labels; the [`AddrTable`] capacity.
-    pub const COUNT: usize = 20;
+    pub const COUNT: usize = 18;
 
     /// Index of this label into the address-table backing array.
     #[inline]
@@ -99,7 +96,6 @@ impl PeriphLabel {
                 | PeriphLabel::Gpiob
                 | PeriphLabel::Gpioc
                 | PeriphLabel::Gpiod
-                | PeriphLabel::Gpioe
                 | PeriphLabel::Gpiof
         )
     }
@@ -107,19 +103,22 @@ impl PeriphLabel {
     /// True for an `I2Cx` label (M2 T1).
     #[inline]
     pub const fn is_i2c(self) -> bool {
-        matches!(self, PeriphLabel::I2c0 | PeriphLabel::I2c1)
+        matches!(self, PeriphLabel::I2c0)
     }
 
     /// True for a `SPIx` label (M2 T1).
     #[inline]
     pub const fn is_spi(self) -> bool {
-        matches!(self, PeriphLabel::Spi0 | PeriphLabel::Spi1)
+        matches!(self, PeriphLabel::Spi0)
     }
 
     /// True for an `ADCx` label (M2 T1).
     #[inline]
     pub const fn is_adc(self) -> bool {
-        matches!(self, PeriphLabel::Adc0 | PeriphLabel::Adc1)
+        matches!(
+            self,
+            PeriphLabel::Adc0 | PeriphLabel::Adc1 | PeriphLabel::Adc2
+        )
     }
 
     /// True for an advanced-timer label (M3 T1): `Timer0` / `Timer7`.
@@ -307,7 +306,6 @@ impl AddrTable {
             PeriphLabel::Gpiob,
             PeriphLabel::Gpioc,
             PeriphLabel::Gpiod,
-            PeriphLabel::Gpioe,
             PeriphLabel::Gpiof,
         ] {
             if let Some(base) = self.get(label) {
@@ -349,9 +347,9 @@ impl AddrTable {
 
     /// Validate that an I2C label's base sits in the APB1 I2C window (M2 T1).
     ///
-    /// Both `I2c0` and `I2c1` are on APB1 on both families (the F1x0 single I2C block is `I2c0`).
-    /// A base outside the window is [`DescriptorError::SelectorAddrMismatch`]; a non-I2C label is
-    /// [`DescriptorError::UnknownSelector`]. The bus tasks (T6/T7) consume this at parse time.
+    /// `I2c0` is on APB1 on both families (the F1x0 single I2C block is `I2c0`; there is no second
+    /// I2C label). A base outside the window is [`DescriptorError::SelectorAddrMismatch`]; a
+    /// non-I2C label is [`DescriptorError::UnknownSelector`].
     pub fn check_i2c_base(&self, i2c: PeriphLabel) -> Result<(), DescriptorError> {
         if !i2c.is_i2c() {
             return Err(DescriptorError::UnknownSelector);
@@ -366,27 +364,19 @@ impl AddrTable {
 
     /// Validate that a SPI label's base sits on the bus that instance belongs to (M2 T1).
     ///
-    /// On F10x, `Spi0` is on APB2 and `Spi1` is on APB1. The F1x0 single SPI block sits on APB1,
-    /// and is mapped to the `Spi0` label, so a `Spi0` base in either the APB2 SPI0 window or the
-    /// APB1 SPI window is accepted (the family is not known here, only the label and base). A base
-    /// outside both windows is [`DescriptorError::SelectorAddrMismatch`]; a non-SPI label is
-    /// [`DescriptorError::UnknownSelector`].
+    /// On F10x `Spi0` is on APB2; the F1x0 single SPI block sits on APB1 and is mapped to the same
+    /// `Spi0` label, so a `Spi0` base in either the APB2 SPI0 window or the APB1 SPI window is
+    /// accepted (the family is not known here, only the label and base; there is no second SPI
+    /// label). A base outside both windows is [`DescriptorError::SelectorAddrMismatch`]; a non-SPI
+    /// label is [`DescriptorError::UnknownSelector`].
     pub fn check_spi_base(&self, spi: PeriphLabel) -> Result<(), DescriptorError> {
-        let base = match spi {
-            PeriphLabel::Spi0 => {
-                let b = self.get(spi).ok_or(DescriptorError::MissingBase(spi))?;
-                let (lo2, hi2) = ranges::SPI0_APB2;
-                let (lo1, hi1) = ranges::SPI_APB1;
-                if (b >= lo2 && b < hi2) || (b >= lo1 && b < hi1) {
-                    return Ok(());
-                }
-                return Err(DescriptorError::SelectorAddrMismatch);
-            }
-            PeriphLabel::Spi1 => self.get(spi).ok_or(DescriptorError::MissingBase(spi))?,
-            _ => return Err(DescriptorError::UnknownSelector),
-        };
-        let (lo, hi) = ranges::SPI_APB1;
-        if base >= lo && base < hi {
+        if !spi.is_spi() {
+            return Err(DescriptorError::UnknownSelector);
+        }
+        let b = self.get(spi).ok_or(DescriptorError::MissingBase(spi))?;
+        let (lo2, hi2) = ranges::SPI0_APB2;
+        let (lo1, hi1) = ranges::SPI_APB1;
+        if (b >= lo2 && b < hi2) || (b >= lo1 && b < hi1) {
             Ok(())
         } else {
             Err(DescriptorError::SelectorAddrMismatch)
@@ -395,7 +385,7 @@ impl AddrTable {
 
     /// Validate that an ADC label's base sits in the APB2 ADC window (M2 T1).
     ///
-    /// Both `Adc0` and `Adc1` are on APB2 on both families (the F1x0 single ADC is `Adc0`). A base
+    /// Every ADC label (`Adc0`/`Adc1`/`Adc2`) is on APB2 (the F1x0 single ADC is `Adc0`). A base
     /// outside the window is [`DescriptorError::SelectorAddrMismatch`]; a non-ADC label is
     /// [`DescriptorError::UnknownSelector`].
     pub fn check_adc_base(&self, adc: PeriphLabel) -> Result<(), DescriptorError> {
@@ -471,10 +461,10 @@ mod tests {
     use super::*;
 
     /// The M1 index-stability invariant (T1): the M1 discriminants and their [`AddrTable`] indices
-    /// must NOT have shifted when M2 appended the cold-path labels. A shift would silently
-    /// re-key every existing descriptor blob's `addrs` map.
+    /// The discriminants are contiguous from 0 and `index()` doubles as the discriminant (the
+    /// AddrTable indexing invariant; nothing persists these numbers across builds anymore).
     #[test]
-    fn m1_discriminants_are_stable() {
+    fn discriminants_are_contiguous_and_index_matches() {
         assert_eq!(PeriphLabel::Usart0 as u8, 0);
         assert_eq!(PeriphLabel::Usart1 as u8, 1);
         assert_eq!(PeriphLabel::Usart2 as u8, 2);
@@ -482,39 +472,29 @@ mod tests {
         assert_eq!(PeriphLabel::Gpiob as u8, 4);
         assert_eq!(PeriphLabel::Gpioc as u8, 5);
         assert_eq!(PeriphLabel::Gpiod as u8, 6);
-        assert_eq!(PeriphLabel::Gpioe as u8, 7);
-        assert_eq!(PeriphLabel::Gpiof as u8, 8);
-        assert_eq!(PeriphLabel::Rcu as u8, 9);
-        // M2 labels APPENDED after Rcu.
-        assert_eq!(PeriphLabel::I2c0 as u8, 10);
-        assert_eq!(PeriphLabel::I2c1 as u8, 11);
-        assert_eq!(PeriphLabel::Spi0 as u8, 12);
-        assert_eq!(PeriphLabel::Spi1 as u8, 13);
-        assert_eq!(PeriphLabel::Adc0 as u8, 14);
-        assert_eq!(PeriphLabel::Adc1 as u8, 15);
-        // M3 labels APPENDED after Adc1.
-        assert_eq!(PeriphLabel::Timer0 as u8, 16);
-        assert_eq!(PeriphLabel::Timer7 as u8, 17);
-        // G-WDG label APPENDED after Timer7.
-        assert_eq!(PeriphLabel::Fwdgt as u8, 18);
-        // G3 (general PWM) label APPENDED after Fwdgt.
-        assert_eq!(PeriphLabel::Timer1 as u8, 19);
-        // index() doubles as the discriminant.
-        assert_eq!(PeriphLabel::Rcu.index(), 9);
-        assert_eq!(PeriphLabel::Adc1.index(), 15);
-        assert_eq!(PeriphLabel::Timer0.index(), 16);
-        assert_eq!(PeriphLabel::Timer7.index(), 17);
-        assert_eq!(PeriphLabel::Fwdgt.index(), 18);
-        assert_eq!(PeriphLabel::Timer1.index(), 19);
-        // COUNT grew to cover the new labels.
-        assert_eq!(PeriphLabel::COUNT, 20);
+        assert_eq!(PeriphLabel::Gpiof as u8, 7);
+        assert_eq!(PeriphLabel::Rcu as u8, 8);
+        assert_eq!(PeriphLabel::I2c0 as u8, 9);
+        assert_eq!(PeriphLabel::Spi0 as u8, 10);
+        assert_eq!(PeriphLabel::Adc0 as u8, 11);
+        assert_eq!(PeriphLabel::Adc1 as u8, 12);
+        assert_eq!(PeriphLabel::Adc2 as u8, 13);
+        assert_eq!(PeriphLabel::Timer0 as u8, 14);
+        assert_eq!(PeriphLabel::Timer7 as u8, 15);
+        assert_eq!(PeriphLabel::Fwdgt as u8, 16);
+        assert_eq!(PeriphLabel::Timer1 as u8, 17);
+        assert_eq!(PeriphLabel::Rcu.index(), 8);
+        assert_eq!(PeriphLabel::Timer1.index(), 17);
+        assert_eq!(PeriphLabel::COUNT, 18);
     }
 
     #[test]
     fn class_helpers() {
-        assert!(PeriphLabel::I2c0.is_i2c() && PeriphLabel::I2c1.is_i2c());
-        assert!(PeriphLabel::Spi0.is_spi() && PeriphLabel::Spi1.is_spi());
-        assert!(PeriphLabel::Adc0.is_adc() && PeriphLabel::Adc1.is_adc());
+        assert!(PeriphLabel::I2c0.is_i2c());
+        assert!(PeriphLabel::Spi0.is_spi());
+        assert!(
+            PeriphLabel::Adc0.is_adc() && PeriphLabel::Adc1.is_adc() && PeriphLabel::Adc2.is_adc()
+        );
         assert!(PeriphLabel::Timer0.is_timer() && PeriphLabel::Timer7.is_timer());
         assert!(PeriphLabel::Fwdgt.is_fwdgt());
         assert!(PeriphLabel::Timer1.is_general_timer());
@@ -607,13 +587,11 @@ mod tests {
     fn check_i2c_base_accepts_apb1_window() {
         let mut t = AddrTable::new();
         t.set(PeriphLabel::I2c0, 0x4000_5400); // I2C0
-        t.set(PeriphLabel::I2c1, 0x4000_5800); // I2C1
         assert_eq!(t.check_i2c_base(PeriphLabel::I2c0), Ok(()));
-        assert_eq!(t.check_i2c_base(PeriphLabel::I2c1), Ok(()));
     }
 
     #[test]
-    fn check_i2c_base_rejects_out_of_window_and_non_i2c() {
+    fn check_i2c_base_rejects_out_of_window_missing_and_non_i2c() {
         let mut t = AddrTable::new();
         t.set(PeriphLabel::I2c0, 0x4001_3000); // a SPI0 base, wrong window
         assert_eq!(
@@ -624,9 +602,10 @@ mod tests {
             t.check_i2c_base(PeriphLabel::Rcu),
             Err(DescriptorError::UnknownSelector)
         );
+        let empty = AddrTable::new();
         assert_eq!(
-            t.check_i2c_base(PeriphLabel::I2c1),
-            Err(DescriptorError::MissingBase(PeriphLabel::I2c1))
+            empty.check_i2c_base(PeriphLabel::I2c0),
+            Err(DescriptorError::MissingBase(PeriphLabel::I2c0))
         );
     }
 
@@ -639,13 +618,10 @@ mod tests {
         // F1x0: the single SPI block on APB1, mapped as Spi0; also accepted.
         t.set(PeriphLabel::Spi0, 0x4000_3800);
         assert_eq!(t.check_spi_base(PeriphLabel::Spi0), Ok(()));
-        // SPI1 on APB1.
-        t.set(PeriphLabel::Spi1, 0x4000_3800);
-        assert_eq!(t.check_spi_base(PeriphLabel::Spi1), Ok(()));
-        // SPI1 in the APB2 SPI0 window is a mismatch.
-        t.set(PeriphLabel::Spi1, 0x4001_3000);
+        // A base outside both SPI windows is a mismatch.
+        t.set(PeriphLabel::Spi0, 0x4001_2400); // the ADC window
         assert_eq!(
-            t.check_spi_base(PeriphLabel::Spi1),
+            t.check_spi_base(PeriphLabel::Spi0),
             Err(DescriptorError::SelectorAddrMismatch)
         );
         assert_eq!(

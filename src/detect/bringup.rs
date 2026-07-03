@@ -19,11 +19,9 @@
 //!
 //! # USART0 base
 //!
-//! The synthesized descriptor (which must stay byte-for-byte equal to the per-family constants in
-//! `tests/blobs.rs`) does NOT carry a USART0 base, so this helper supplies the shared APB2 USART0
-//! base ([`USART0_BASE`], `0x4001_3800` on both families, `addr::ranges::USART_APB2`) by wrapping a
-//! local AUGMENTED copy of the descriptor for the console bring-up only. The detected `Chip` the
-//! firmware holds is unchanged.
+//! The family models carry the USART0 base directly (`0x4001_3800` on both families, promoted per
+//! todo A1), so the console bring-up resolves it through the detected `Chip` like any other
+//! peripheral; the old augmented-descriptor-copy helper is gone.
 
 use crate::clock::{ClockConfig, ClockSource};
 
@@ -56,10 +54,6 @@ pub const FALLBACK_CLOCK: ClockConfig = ClockConfig {
     apb1_psc: 1,
     apb2_psc: 1,
 };
-
-/// The shared USART0 base (APB2 at `0x4001_3800` on both families). The synthesized descriptor does
-/// not carry it, so the console bring-up supplies it here.
-pub const USART0_BASE: u32 = 0x4001_3800;
 
 /// The default console baud (DF-2: a console at 8 MHz is fine for 115200).
 pub const CONSOLE_BAUD: u32 = 115_200;
@@ -120,27 +114,15 @@ pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, Descr
     gpio::configure_af(gpioa, chip.gpio(), tx_pin, PinRole::Tx);
     gpio::configure_af(gpioa, chip.gpio(), rx_pin, PinRole::Rx);
 
-    // Bring up USART0 at 8 MHz / 115200 8N1 /16. The synthesized descriptor does not carry a USART0
-    // base, so wrap a local augmented chip that adds USART0 = 0x4001_3800 for the bring-up only.
-    let console_chip = with_usart0(chip);
+    // Bring up USART0 at 8 MHz / 115200 8N1 /16. The family models carry the USART0 base directly
+    // (promoted per todo A1), so the detected chip resolves it like any other peripheral.
     let cfg = UsartConfig {
         usart: PeriphLabel::Usart0,
         baud: CONSOLE_BAUD,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,
     };
-    Usart::bring_up(&console_chip, &FALLBACK_CLOCK, &cfg)
-}
-
-/// A copy of `chip` with the shared USART0 base added, for the console bring-up. The detected chip
-/// the firmware holds is untouched (it stays byte-for-byte equal to the per-family constant). Only
-/// [`apply_defaults`] uses it (and shares its gate; see that fn's GATE-PIN GUARD).
-#[cfg(any(feature = "mock", feature = "yes-console-on-pa9-pa10"))]
-#[allow(dead_code)] // see apply_defaults
-fn with_usart0(chip: &Chip) -> Chip {
-    let mut desc = *chip.descriptor();
-    desc.addrs.set(PeriphLabel::Usart0, USART0_BASE);
-    Chip::from_descriptor(desc)
+    Usart::bring_up(chip, &FALLBACK_CLOCK, &cfg)
 }
 
 #[cfg(all(test, feature = "mock"))]
@@ -172,9 +154,20 @@ mod tests {
     }
 
     #[test]
-    fn usart0_base_is_the_shared_apb2_base() {
-        // 0x4001_3800 on both families (addr::ranges::USART_APB2 low bound).
-        assert_eq!(USART0_BASE, crate::addr::ranges::USART_APB2.0);
+    fn usart0_base_is_carried_by_both_family_models() {
+        // 0x4001_3800 on both families (addr::ranges::USART_APB2 low bound), promoted per todo A1.
+        for fam in [Family::F10x, Family::F1x0] {
+            let chip = Chip::from_descriptor(crate::detect::synthesize(&crate::detect::Detected {
+                family: fam,
+                flash_kib: 64,
+                adv_timers: 1,
+                adc_count: 1,
+            }));
+            assert_eq!(
+                chip.base(crate::addr::PeriphLabel::Usart0).unwrap(),
+                crate::addr::ranges::USART_APB2.0
+            );
+        }
     }
 
     #[test]
@@ -185,15 +178,17 @@ mod tests {
         // apply_defaults takes the internal Family discriminator (for logging only) and brings up
         // the section-6 default IRC8M console on USART0. Exercise both families: it enables the
         // GPIOA + USART0 clocks, configures PA9/PA10, and returns Ok with the console Usart. The
-        // detected chip itself is untouched (the USART0 base is added only to a local copy).
+        // USART0 base is carried by the family model itself (promoted per todo A1; the old
+        // augmented-copy design kept the detected chip Usart0-less, which this test used to pin).
         let _g = mock::lock();
 
         mock::reset();
         let f130 = Chip::from_descriptor(descriptor_f130());
         assert!(apply_defaults(&f130, Family::F1x0).is_ok());
-        assert!(
-            f130.base(PeriphLabel::Usart0).is_err(),
-            "detected chip untouched"
+        assert_eq!(
+            f130.base(PeriphLabel::Usart0).unwrap(),
+            0x4001_3800,
+            "the family model carries the USART0 base"
         );
 
         mock::reset();

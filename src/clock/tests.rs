@@ -144,16 +144,6 @@ fn f1x0_enable_gpiof_sets_ahben_bit22() {
 }
 
 #[test]
-fn f1x0_has_no_port_e() {
-    let _g = seed_reset();
-    assert_eq!(
-        enable_gpio_port(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Gpioe),
-        Err(DescriptorError::SelectorAddrMismatch)
-    );
-    assert_eq!(read(AHBEN), 0);
-}
-
-#[test]
 fn f1x0_enable_usart1_plus_gpioa_uses_divergent_registers() {
     let _g = seed_reset();
     // The M1 sequence on F1x0: USART1 on APB1EN bit 17, but GPIOA on AHBEN bit 17 (not APB2).
@@ -180,14 +170,6 @@ fn enable_i2c0_sets_apb1en_bit21_both_families() {
     assert_eq!(read(APB1EN), 1 << 21);
     assert_eq!(read(APB2EN), 0);
     assert_eq!(read(AHBEN), 0);
-}
-
-#[test]
-fn enable_i2c1_sets_apb1en_bit22() {
-    let _g = seed_reset();
-    enable_i2c(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::I2c1).unwrap();
-    // I2C1EN = BIT(22) on APB1EN.
-    assert_eq!(read(APB1EN), 1 << 22);
 }
 
 #[test]
@@ -218,14 +200,6 @@ fn enable_spi0_sets_apb2en_bit12() {
     // SPI0EN = BIT(12) on APB2EN (both families).
     assert_eq!(read(APB2EN), 1 << 12);
     assert_eq!(read(APB1EN), 0);
-}
-
-#[test]
-fn enable_spi1_sets_apb1en_bit14() {
-    let _g = seed_reset();
-    enable_spi(RCU_BASE, ClockPath::F1x0Rcu, PeriphLabel::Spi1).unwrap();
-    // SPI1EN = BIT(14) on APB1EN.
-    assert_eq!(read(APB1EN), 1 << 14);
 }
 
 #[test]

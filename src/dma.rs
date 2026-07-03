@@ -278,13 +278,10 @@ fn service_dma_rx(ctx: &DmaRxCtx) {
         clear |= htf;
     }
     if clear != 0 {
-        // INTC: writing the flag bit clears it (same bit positions as INTF).
+        // INTC: writing the flag bit clears it (same bit positions as INTF). On silicon this write
+        // clears the matching INTF bits; the host tests model that as a registered mock W1C pair
+        // (`mock::w1c_pair`), never here.
         Reg32::new(base, DMA_INTC).write(clear);
-        // On silicon, that INTC write clears the matching `INTF` bits. The host-test backend is a
-        // passive array with no DMA core, so model that side effect under `mock` (else a later
-        // `ftf_pending` read would see the flag still set); on real MMIO the hardware did it.
-        #[cfg(feature = "mock")]
-        Reg32::new(base, DMA_INTF).modify(clear, 0);
     }
 }
 
