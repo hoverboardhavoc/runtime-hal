@@ -52,7 +52,7 @@ jobs:
           check firmware/target/thumbv7m-none-eabi/release/bench
           ( cd firmware && cargo build --release --no-default-features --features f130 )
           check firmware/target/thumbv7m-none-eabi/release/bench
-          for c in detect probe coldpath motor-verify usart-rx; do
+          for c in detect probe coldpath motor-verify usart-rx serial; do
             ( cd "bench-fw/$c" && cargo build --release )
             check "bench-fw/$c/target/thumbv7m-none-eabi/release/bench-fw-$c"
           done

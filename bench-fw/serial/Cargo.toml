@@ -1,0 +1,31 @@
+# On-silicon validator for the embedded-io serial adapters (specs/serial-adapters.md, section 5).
+# F103+F130 pair over the USART1 PA2/PA3 cross-wire at 115200, role-detected: the slave (F1x0) is
+# exercised as the receiver through SplitSerial<RingBufferedRx>, SplitSerial<BufferedRx>, and
+# PolledSerial in turn; the master (F10x) sends through PolledSerial's Write and then receives the
+# reverse stream through SplitSerial<RingBufferedRx> (Ch5). EVERY data-path byte crosses the
+# embedded-io traits (Read/ReadReady/Write); no direct backend calls. Result block at 0x2000_1F00
+# read over SWD; busy-spin, never wfi.
+[package]
+name = "bench-fw-serial"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+runtime-hal = { path = "../..", default-features = false }
+embedded-io = "0.6"
+heapless = "0.8"
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-serial"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

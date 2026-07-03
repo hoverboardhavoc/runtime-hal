@@ -477,6 +477,14 @@ impl BufferedRx {
         (self.ready)(self.queue)
     }
 
+    /// True if a sticky condition (ring overflow or a recorded line error) is pending, i.e. the next
+    /// [`read`](BufferedRx::read) will surface-and-clear it rather than return bytes. The serial
+    /// adapter's `ReadReady` counts this as "a read makes progress" (`specs/serial-adapters.md` D4).
+    pub(crate) fn condition_pending(&self) -> bool {
+        self.slot.overflow.load(Ordering::Acquire)
+            || self.slot.line_error.load(Ordering::Acquire) != ERR_NONE
+    }
+
     /// Atomically read-and-clear the IDLE latch: returns `true` exactly once per IDLE boundary the
     /// ISR has flagged since the previous `take_idle`, and consumes it. This is the frame-complete
     /// hint, and it is the ONLY thing that clears the latch ([`read`](BufferedRx::read) does not), so
@@ -713,6 +721,21 @@ impl RingBufferedRx {
     /// so the DMA-ring reader uses the same latch to know a variable-length frame just ended.
     pub fn take_idle(&self) -> bool {
         self.slot.idle_seen.swap(false, Ordering::AcqRel)
+    }
+
+    /// True if the next [`read`](RingBufferedRx::read) will make progress: bytes are available
+    /// behind the live DMA write position (the same wrap-consistent [`snapshot`](Self::snapshot)
+    /// `read` uses, so the B13 pending-wrap case never reads false-negative), or a pending
+    /// condition (a recorded line error, or a lap) that `read` would surface-and-clear. Consumes
+    /// nothing (the cursor does not advance). The `embedded-io` `ReadReady` shape
+    /// (`specs/serial-adapters.md` D4).
+    pub fn ready(&self) -> bool {
+        if self.slot.line_error.load(Ordering::Acquire) != ERR_NONE {
+            return true;
+        }
+        let (wraps, rem) = self.snapshot();
+        let write_total = wraps as u64 * self.len as u64 + (self.len as u64 - rem as u64);
+        write_total > self.cursor
     }
 }
 

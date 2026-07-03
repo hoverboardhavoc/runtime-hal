@@ -344,6 +344,13 @@ impl UsartTx {
     pub fn write_byte(&self, byte: u8) {
         self.regs.write_byte(byte);
     }
+
+    /// `TBE`: the transmit data register is empty (the `embedded-io` `WriteReady` shape for the
+    /// split adapter, `specs/serial-adapters.md`).
+    #[inline]
+    pub fn tx_empty(&self) -> bool {
+        self.regs.read_status().tx_empty
+    }
 }
 
 impl UsartRx {
@@ -755,14 +762,16 @@ impl UsartRegs {
     }
 
     /// Whether this handle uses the F1x0 (F0-style) register model (`true`) or the F10x (F1-style)
-    /// one (`false`). The RX ISR stores this one bit and rebuilds the model with [`Usart::from_parts`].
+    /// one (`false`). The RX ISR stores this one bit and rebuilds the model with
+    /// [`UsartRegs::from_parts`].
     #[inline]
     pub(crate) const fn is_f1x0(&self) -> bool {
         self.model.intc.is_some()
     }
 
     /// Rebuild a register view from the base + family bit the RX ISR context stored (the inverse of
-    /// `base` / `is_f1x0`). The model is the chip's, resolved once at bring-up. This is the one
+    /// [`UsartRegs::base`] / [`UsartRegs::is_f1x0`]). The model is the chip's, resolved once at
+    /// bring-up. This is the one
     /// sanctioned alias of a live peripheral (`specs/usart-split.md` D1/D6): it is crate-internal,
     /// reached only from the RX ISR that logically owns the RX side, and never escapes as an
     /// ownership-carrying [`Usart`].

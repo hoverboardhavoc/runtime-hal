@@ -109,7 +109,7 @@ pub use irq::{
 pub use pwm::PwmOut;
 pub use reg::{Reg16, Reg32};
 pub use regdump::{AdcInjectedRegs, RegDumpConfig, TimerRegs};
-pub use serial::{Serial, UsartSerial};
+pub use serial::{PolledSerial, RxBackend, Serial, SplitSerial};
 pub use spi::{mode_bits, prescaler_for, spi_input_clock, DataSize, Spi};
 pub use timebase::{reload_for, Timebase, TimebaseError};
 pub use timer::arming::ArmGate;
