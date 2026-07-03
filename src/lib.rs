@@ -12,6 +12,7 @@
 
 pub mod adc;
 pub mod addr;
+mod afio;
 pub mod chip;
 pub mod clock;
 pub mod config;
@@ -117,7 +118,7 @@ pub use timer::{ComplementaryPwm, PwmController, PwmHandle, PwmTimer};
 pub use usart::{
     compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel, UsartRx, UsartTx,
 };
-pub use usart_rx::{BufferedRx, RingBufferedRx};
+pub use usart_rx::{supports_rx, BufferedRx, RingBufferedRx};
 pub use watchdog::{
     clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,
     PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,

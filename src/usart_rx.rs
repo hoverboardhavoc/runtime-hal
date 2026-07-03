@@ -140,6 +140,23 @@ fn resolve_instance(chip: &Chip, selector: PeriphLabel) -> Result<RxInstance, De
     }
 }
 
+/// The public RX capability query (`specs/uart-rx-multi-instance.md`, "The public capability
+/// query"; mandated by the hoverboard firmware's `specs/l3.md`: capability answers come from the
+/// HAL model, never a baked consumer flag): can THIS chip bring up the instance-bound
+/// buffered/DMA RX path on `selector`'s USART?
+///
+/// **Pure** (no register or GPIO access) and answered from the model: it returns exactly
+/// [`resolve_instance`]`.is_ok()`, so it can never drift from what [`BufferedRx::new`] /
+/// [`RingBufferedRx::new`] will actually accept. Today: `Usart1` -> `true` on both families;
+/// `Usart2` -> `true` on F10x, `false` on F1x0 (the module USART is F10x-only); everything else
+/// (including `Usart0`) -> `false`. **`Usart0` stays `false` until the AFIO USART0-remap primitive
+/// exists** (`specs/usart-pin-remap.md`, out of scope for gate-pin adjacency: its default mapping
+/// is PA9/PA10): when that lands, `resolve_instance` grows the arm and this query updates with it
+/// automatically - the honest "not yet expressible" answer, owned here, not in a consumer table.
+pub fn supports_rx(chip: &Chip, selector: PeriphLabel) -> bool {
+    resolve_instance(chip, selector).is_ok()
+}
+
 // --- monomorphised ring access (the type erasure boundary) ------------------------------------
 
 /// Push one byte into the ring, reconstructing the (stateless) producer from the queue pointer.

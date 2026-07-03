@@ -22,7 +22,6 @@ use crate::gpio::{
     self, GpioOutput, GpioPort, InputGroup, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins,
     PortPins,
 };
-use crate::reg::Reg32;
 
 /// The chip context: built once from the parsed descriptor, it resolves a [`PeriphLabel`] to a base
 /// and carries the register-model selectors and the RCU base. This is the descriptor's chip-only
@@ -206,19 +205,11 @@ impl Chip {
     pub fn free_jtag_pins(&self) -> Result<(), DescriptorError> {
         match self.desc.gpio {
             GpioPath::ApbCrlCrh => {
-                // F10x: enable the AFIO clock, then remap SWJ to SW-only.
-                const RCU_APB2EN_OFFSET: u32 = 0x18;
-                const AFIOEN: u32 = 1 << 0;
+                // F10x: through the AFIO owner (specs/afio-ownership.md) - enable the AFIO clock,
+                // then RMW SWJ_CFG to SW-only (0b010: JTAG-DP disabled, SW-DP enabled), freeing
+                // PA15/PB3/PB4 while keeping SWD live. Every other PCF0 field is untouched.
                 let rcu = self.rcu_base()?;
-                Reg32::new(rcu, RCU_APB2EN_OFFSET).modify(AFIOEN, AFIOEN);
-
-                // AFIO_PCF0 at 0x4001_0004: SWJ_CFG = bits [26:24] = 0b010 (JTAG-DP disabled,
-                // SW-DP enabled), freeing PA15/PB3/PB4 while keeping SWD live.
-                const AFIO_BASE: u32 = 0x4001_0000;
-                const AFIO_PCF0_OFFSET: u32 = 0x04;
-                const SWJ_CFG_MASK: u32 = 0b111 << 24;
-                const SWJ_CFG_SW_ONLY: u32 = 0b010 << 24;
-                Reg32::new(AFIO_BASE, AFIO_PCF0_OFFSET).modify(SWJ_CFG_MASK, SWJ_CFG_SW_ONLY);
+                crate::afio::set_swj_sw_only(rcu);
                 Ok(())
             }
             // F1x0: no AFIO, PA15/PB3 already GPIO. The reserved region must not be written.
@@ -389,7 +380,7 @@ impl Chip {
                 // F10x: free the JTAG overlay, AFIO TIMER1 partial remap (0b01 = SPL
                 // GPIO_TIMER1_PARTIAL_REMAP0), then the CRL AF nibble.
                 self.free_jtag_pins()?;
-                gpio::remap_timer1_partial0(rcu);
+                crate::afio::remap_timer1_partial0(rcu);
                 gpio::configure_af(
                     port_base,
                     GpioPath::ApbCrlCrh,

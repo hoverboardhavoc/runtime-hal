@@ -380,35 +380,6 @@ fn f10x_gen_timer_pb3_is_af_pp_nibble() {
     assert_eq!(read(CTL1), 0);
 }
 
-#[test]
-fn f10x_remap_timer1_partial0_sets_pcf0_field_to_01_and_enables_afio() {
-    let _g = seed();
-    // The AFIO peripheral-config block lives at the fixed F10x absolute base 0x4001_0000; AFIO_PCF0
-    // is at offset 0x04. The RCU base is the F10x RCU base.
-    const RCU_BASE: u32 = 0x4002_1000;
-    const AFIO_PCF0: u32 = 0x4001_0004;
-    crate::gpio::remap_timer1_partial0(RCU_BASE);
-    // AFIO clock enabled: RCU_APB2EN (0x18) bit 0.
-    assert_eq!(Reg32::new(RCU_BASE, 0x18).read() & 1, 1);
-    // TIMER1_REMAP[9:8] = 0b01 (SPL GPIO_TIMER1_PARTIAL_REMAP0: TIMER1_CH1 -> PB3); no other PCF0
-    // bits set.
-    assert_eq!(Reg32::new(AFIO_PCF0, 0).read(), 0b01 << 8);
-}
-
-#[test]
-fn f10x_remap_timer1_partial0_preserves_swj_cfg() {
-    let _g = seed();
-    // free_jtag_pins sets SWJ_CFG (AFIO_PCF0[26:24]) = 0b010; the TIMER1 remap RMW must not disturb
-    // it (the green-LED routing frees JTAG first, then remaps TIMER1).
-    const RCU_BASE: u32 = 0x4002_1000;
-    const AFIO_PCF0: u32 = 0x4001_0004;
-    Reg32::new(AFIO_PCF0, 0).write(0b010 << 24); // pretend free_jtag_pins ran
-    crate::gpio::remap_timer1_partial0(RCU_BASE);
-    let pcf0 = Reg32::new(AFIO_PCF0, 0).read();
-    assert_eq!(pcf0 & (0b111 << 24), 0b010 << 24, "SWJ_CFG preserved");
-    assert_eq!(pcf0 & (0b11 << 8), 0b01 << 8, "TIMER1_REMAP = 01");
-}
-
 // --- general-purpose push-pull output (configure_output / set_pin / GpioOutput) ---------------
 //
 // The blinky / firmware indicator path: a plain digital output that owns the F10x/F1x0 register

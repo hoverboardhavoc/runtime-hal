@@ -8,7 +8,7 @@
 //! drain loop terminates); each staged byte is one dispatch, mirroring the polled serial RX tests.
 #![cfg(feature = "mock")]
 
-use super::{reset_for_test, BufferedRx, RingBufferedRx};
+use super::{reset_for_test, supports_rx, BufferedRx, RingBufferedRx};
 use crate::addr::{AddrTable, PeriphLabel};
 use crate::chip::Chip;
 use crate::clock::ClockConfig;
@@ -1116,4 +1116,38 @@ fn reprogram_sequence_release_rejoin_set_baud_split_rearm() {
     let ch = DmaRxMap::usart1_rx(&chip).channel;
     let _ring = RingBufferedRx::new(&chip, rx, PeriphLabel::Usart1, buf2).unwrap();
     assert_eq!(Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN, CHEN);
+}
+
+// --- supports_rx: the public capability query (uart-rx-multi-instance.md acceptance) ------------
+
+/// `supports_rx` is pure and tracks `resolve_instance` exactly: Usart1 on both families, Usart2 on
+/// F10x only, everything else (incl. the not-yet-expressible Usart0-remap) false. No mock setup is
+/// performed: a register access would panic the fresh mock lock discipline, pinning purity.
+#[test]
+fn supports_rx_answers_from_the_model() {
+    let _g = setup();
+    let f10x_chip = chip_for(&f10x());
+    let f1x0_chip = chip_for(&f1x0());
+
+    assert!(
+        supports_rx(&f10x_chip, PeriphLabel::Usart1),
+        "Usart1 on F10x"
+    );
+    assert!(
+        supports_rx(&f1x0_chip, PeriphLabel::Usart1),
+        "Usart1 on F1x0"
+    );
+    assert!(
+        supports_rx(&f10x_chip, PeriphLabel::Usart2),
+        "the module USART resolves on F10x"
+    );
+    assert!(
+        !supports_rx(&f1x0_chip, PeriphLabel::Usart2),
+        "the module USART is F10x-only (the chip-blind-flag bug this query fixes)"
+    );
+    // Usart0: false until the AFIO remap primitive exists (specs/usart-pin-remap.md).
+    assert!(!supports_rx(&f10x_chip, PeriphLabel::Usart0));
+    assert!(!supports_rx(&f1x0_chip, PeriphLabel::Usart0));
+    // A non-USART label is never RX-capable.
+    assert!(!supports_rx(&f10x_chip, PeriphLabel::Gpioa));
 }
