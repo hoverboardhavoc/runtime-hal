@@ -1151,3 +1151,98 @@ fn supports_rx_answers_from_the_model() {
     // A non-USART label is never RX-capable.
     assert!(!supports_rx(&f10x_chip, PeriphLabel::Gpioa));
 }
+
+// --- RxRing unit tests (slice-9 audit defect 3: wrap-crossing + boundary + the claim flag) ------
+
+/// FIFO order holds while the indices wrap: interleaved push/pop far past N so head/tail cross the
+/// wrap boundary repeatedly with data in flight. (N >= 2 is compile-time-enforced by
+/// `RxRing::VALID`, so no runtime case exists for the degenerate sizes.)
+#[test]
+fn rxring_fifo_survives_wrap_with_data_in_flight() {
+    let ring: RxRing<8> = RxRing::new();
+    let mut next_out = 0u8;
+    // Keep 3 bytes in flight while streaming 100 bytes through an 8-slot (7-usable) ring: every
+    // index wraps a dozen times with live data straddling the boundary.
+    for b in 0..100u8 {
+        assert!(ring.push(b), "ring never full at 3 in flight");
+        if b >= 3 {
+            assert_eq!(ring.pop(), Some(next_out), "FIFO order across wraps");
+            next_out += 1;
+        }
+    }
+    while let Some(b) = ring.pop() {
+        assert_eq!(b, next_out);
+        next_out += 1;
+    }
+    assert_eq!(next_out, 100, "every byte came out exactly once, in order");
+}
+
+/// Full/empty at the wrap point: position the indices AT the boundary (head at N-1), then assert
+/// the full ring rejects a push, drains completely, and reports empty.
+#[test]
+fn rxring_full_and_empty_at_the_wrap_point() {
+    let ring: RxRing<4> = RxRing::new(); // 3 usable
+                                         // Advance head/tail to the wrap boundary: 3 pushes + 3 pops leaves head = tail = 3 (= N-1).
+    for b in 0..3u8 {
+        assert!(ring.push(b));
+    }
+    for b in 0..3u8 {
+        assert_eq!(ring.pop(), Some(b));
+    }
+    assert!(!ring.ready(), "empty at the boundary");
+    assert_eq!(ring.pop(), None);
+
+    // Fill to capacity across the wrap (slots 3, 0, 1): the 4th push must fail (full), with the
+    // stored bytes intact and in order.
+    assert!(ring.push(10));
+    assert!(ring.push(11));
+    assert!(ring.push(12));
+    assert!(
+        !ring.push(13),
+        "full: the N-th byte is rejected, not overwritten"
+    );
+    assert!(ring.ready());
+    assert_eq!(ring.pop(), Some(10));
+    assert_eq!(ring.pop(), Some(11));
+    assert_eq!(ring.pop(), Some(12));
+    assert_eq!(ring.pop(), None, "drained");
+}
+
+/// The exclusivity claim: a second receiver on the SAME ring fails loud (two ISR producers into
+/// one ring is interleaved corruption; heapless carried this in &'static mut).
+#[test]
+#[should_panic(expected = "already claimed")]
+fn rxring_second_receiver_on_one_ring_fails_loud() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let ring: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
+
+    let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let _first = BufferedRx::new(&chip, u1.split().1, PeriphLabel::Usart1, ring).unwrap();
+    // The second receiver (the module instance, same chip) tries to share the ring: panic.
+    let u2 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
+    let _second = BufferedRx::new(&chip, u2.split().1, PeriphLabel::Usart2, ring);
+}
+
+/// `release()` gives the claim back: a released ring re-claims cleanly for a fresh receiver.
+#[test]
+fn rxring_release_returns_the_claim_for_reuse() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let ring: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
+
+    let u = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let first = BufferedRx::new(&chip, u.split().1, PeriphLabel::Usart1, ring).unwrap();
+    let half = first.release(); // releases the ring claim too
+
+    // Same ring, fresh receiver: the claim was returned, so this succeeds and receives.
+    let mut second = BufferedRx::new(&chip, half, PeriphLabel::Usart1, ring).unwrap();
+    install_mock(fam.irq, RAM_ADDR);
+    stage_byte(&fam, 0xEE);
+    fire(&fam);
+    let mut buf = [0u8; 2];
+    assert_eq!(second.read(&mut buf), Ok(1));
+    assert_eq!(buf[0], 0xEE);
+}

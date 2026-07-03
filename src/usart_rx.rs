@@ -177,6 +177,11 @@ pub struct RxRing<const N: usize> {
     head: AtomicUsize,
     /// Consumer index (next read position). Written only by the main-loop side.
     tail: AtomicUsize,
+    /// The exclusivity claim: `heapless` carried it in the type (`&'static mut Queue`), but the
+    /// `&'static RxRing` ergonomics let safe code hand ONE ring to TWO receivers (two ISR
+    /// producers = interleaved corruption), so the claim is a runtime fact instead:
+    /// [`BufferedRx::new`] takes it fail-loud, [`BufferedRx::release`] gives it back.
+    taken: AtomicBool,
     /// The byte storage. A cell: the producer writes `buf[head]` while the consumer reads
     /// `buf[tail]`, never the same index (guarded by the index protocol below).
     buf: UnsafeCell<[u8; N]>,
@@ -189,14 +194,36 @@ pub struct RxRing<const N: usize> {
 unsafe impl<const N: usize> Sync for RxRing<N> {}
 
 impl<const N: usize> RxRing<N> {
-    /// An empty ring (usable capacity `N - 1`).
+    /// Compile-time rejection of degenerate rings: `N = 0` would divide by zero in the index math
+    /// and `N = 1` is a silent zero-capacity ring (one slot distinguishes full from empty).
+    /// Referenced from [`RxRing::new`], so a bad `N` fails the BUILD of the instantiating crate;
+    /// no runtime test is possible or needed.
+    const VALID: () = assert!(N >= 2, "RxRing needs N >= 2 (usable capacity is N - 1)");
+
+    /// An empty, unclaimed ring (usable capacity `N - 1`; `N >= 2` enforced at compile time).
     #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
+        // Force the compile-time N check at every instantiation site.
+        #[allow(clippy::let_unit_value)]
+        let () = Self::VALID;
         RxRing {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            taken: AtomicBool::new(false),
             buf: UnsafeCell::new([0; N]),
         }
+    }
+
+    /// Claim exclusive receiver ownership of this ring: `true` exactly once until
+    /// [`RxRing::unclaim`]. The type-discipline replacement for `&'static mut` (see the `taken`
+    /// field docs).
+    fn claim(&self) -> bool {
+        !self.taken.swap(true, Ordering::AcqRel)
+    }
+
+    /// Release the receiver claim (the ring may be re-claimed by a fresh receiver).
+    fn unclaim(&self) {
+        self.taken.store(false, Ordering::Release);
     }
 
     /// Producer side (the RX ISR): append one byte; `false` if the ring is full.
@@ -254,6 +281,13 @@ fn ready_impl<const N: usize>(q: *mut ()) -> bool {
     // SAFETY: as `push_impl`.
     let ring: &RxRing<N> = unsafe { &*(q as *const RxRing<N>) };
     ring.ready()
+}
+
+/// Release the ring's exclusivity claim ([`BufferedRx::release`]).
+fn unclaim_impl<const N: usize>(q: *mut ()) {
+    // SAFETY: as `push_impl`.
+    let ring: &RxRing<N> = unsafe { &*(q as *const RxRing<N>) };
+    ring.unclaim();
 }
 
 // --- the ISR bodies (one per instance, each reached via its own vector slot) -------------------
@@ -450,10 +484,11 @@ fn nvic_unmask(irq_num: usize) {
 pub struct BufferedRx {
     /// The application ring, type-erased (the consumer is reconstructed from this per `read`).
     queue: *mut (),
-    /// Monomorphised pop / ready for this ring's `N` (concrete fn pointers; no erasure needed since
-    /// they live in non-generic fields set by the generic `new`).
+    /// Monomorphised pop / ready / claim-release for this ring's `N` (concrete fn pointers; no
+    /// erasure needed since they live in non-generic fields set by the generic `new`).
     pop: fn(*mut ()) -> Option<u8>,
     ready: fn(*mut ()) -> bool,
+    unclaim: fn(*mut ()),
     /// This receiver's `'static` RX slot (USART1 or the module USART): `read` / `take_idle` reference
     /// it directly, so two `BufferedRx` on different instances never touch each other's state.
     slot: &'static RxSlot,
@@ -480,6 +515,15 @@ impl BufferedRx {
         // before touching any hardware (`uart-rx-multi-instance.md` item 4).
         let inst = resolve_instance(chip, instance)?;
 
+        // Exclusivity claim (fail loud): one ring, one receiver. Two receivers pushing into one
+        // ring from two ISRs is interleaved corruption; heapless carried this in `&'static mut`,
+        // the RxRing carries it as a runtime claim released by `release()`. A double-claim is a
+        // programming error, so it panics (the `Usart::rejoin` mismatch precedent).
+        assert!(
+            storage.claim(),
+            "RxRing is already claimed by another receiver (one ring, one BufferedRx)"
+        );
+
         let queue = storage as *const RxRing<N> as *mut ();
 
         // 1. Install this instance's RX slot (base + family bit + this ring's queue + monomorphised
@@ -499,18 +543,21 @@ impl BufferedRx {
             queue,
             pop: pop_impl::<N>,
             ready: ready_impl::<N>,
+            unclaim: unclaim_impl::<N>,
             slot: inst.slot(),
             rx,
         })
     }
 
     /// Quiesce this receiver and give the RX half back (`specs/usart-split.md` D3): clear the
-    /// `RBNEIE` + `IDLEIE` interrupt sources it enabled and mark its RX slot uninstalled (a pending
-    /// IRQ finds an inert slot). The returned [`UsartRx`] re-arms via a fresh `new`, or rejoins its
-    /// TX half ([`crate::usart::Usart::rejoin`]) for reconfiguration.
+    /// `RBNEIE` + `IDLEIE` interrupt sources it enabled, mark its RX slot uninstalled (a pending
+    /// IRQ finds an inert slot), and RELEASE the ring's exclusivity claim (the [`RxRing`] may be
+    /// re-claimed by a fresh receiver). The returned [`UsartRx`] re-arms via a fresh `new`, or
+    /// rejoins its TX half ([`crate::usart::Usart::rejoin`]) for reconfiguration.
     pub fn release(self) -> UsartRx {
         self.rx.regs().unlisten_rx_irqs();
         self.slot.installed.store(false, Ordering::Release);
+        (self.unclaim)(self.queue);
         self.rx
     }
 

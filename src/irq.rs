@@ -302,7 +302,7 @@ pub fn clear_usart_rx_handler() {
 /// Call the registered USART RX handler (or the no-op default if none is registered yet). The
 /// `usart1_rx_isr` slot calls through this.
 #[inline]
-pub fn call_usart_rx_handler() {
+pub(crate) fn call_usart_rx_handler() {
     let p = USART_RX_HANDLER.load(Ordering::Acquire);
     // SAFETY: `p` is always either `default_usart_rx_handler` or a `'static` fn the RX bring-up
     // registered via `register_usart_rx_handler`; both are valid `extern "C" fn()` pointers.
@@ -341,7 +341,7 @@ pub fn clear_usart_rx_handler2() {
 /// Call the registered module-USART RX handler (or the no-op default). The `module_usart_rx_isr` slot
 /// calls through this.
 #[inline]
-pub fn call_usart_rx_handler2() {
+pub(crate) fn call_usart_rx_handler2() {
     let p = USART_RX_HANDLER2.load(Ordering::Acquire);
     // SAFETY: `p` is always either `default_usart_rx_handler2` or a `'static` fn the RX bring-up
     // registered via `register_usart_rx_handler2`; both are valid `extern "C" fn()` pointers.
