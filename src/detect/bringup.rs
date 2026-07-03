@@ -112,8 +112,6 @@ pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, Descr
     let console_chip = with_usart0(chip);
     let cfg = UsartConfig {
         usart: PeriphLabel::Usart0,
-        tx: CONSOLE_TX,
-        rx: CONSOLE_RX,
         baud: CONSOLE_BAUD,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,

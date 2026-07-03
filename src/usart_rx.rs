@@ -36,7 +36,7 @@ use crate::descriptor::ClockPath;
 use crate::descriptor::IrqLayout;
 use crate::error::{DescriptorError, UsartError};
 use crate::irq;
-use crate::usart::Usart;
+use crate::usart::{UsartRegs, UsartRx};
 
 // --- the static RX contexts (one independent slot per supported instance: USART1 + module) -----
 
@@ -194,7 +194,7 @@ fn on_usart_rx_irq(slot: &RxSlot) {
     if !slot.installed.load(Ordering::Acquire) {
         return;
     }
-    let u = Usart::from_parts(
+    let u = UsartRegs::from_parts(
         slot.base.load(Ordering::Acquire),
         slot.is_f1x0.load(Ordering::Acquire),
     );
@@ -269,10 +269,10 @@ fn decode_error(code: u8) -> UsartError {
 /// [`BufferedRx`] (with a real ring `queue`/`push`) and [`RingBufferedRx`] (with null `queue`/`push`:
 /// under DMA the ISR's RBNE drain never runs, only its IDLE + line-error path) use this, so the IDLE
 /// latch and line-error sticky live in one place (section 3.2 / 5.3).
-fn install_usart_ctx(usart: &Usart, instance: RxInstance, queue: *mut (), push: *mut ()) {
+fn install_usart_ctx(regs: &UsartRegs, instance: RxInstance, queue: *mut (), push: *mut ()) {
     let slot = instance.slot();
-    slot.base.store(usart.base(), Ordering::Release);
-    slot.is_f1x0.store(usart.is_f1x0(), Ordering::Release);
+    slot.base.store(regs.base(), Ordering::Release);
+    slot.is_f1x0.store(regs.is_f1x0(), Ordering::Release);
     slot.queue.store(queue, Ordering::Release);
     slot.push.store(push, Ordering::Release);
     slot.overflow.store(false, Ordering::Release);
@@ -353,10 +353,12 @@ fn nvic_unmask(irq_num: usize) {
 
 /// Interrupt-buffered, IDLE-framed USART receiver (G-DMA-UART Gate A).
 ///
-/// Built from an already-brought-up [`Usart`] (consuming it: the RX path now owns that instance's RX
-/// interrupt). The ISR fills a `'static` SPSC ring the application owns (DECISIONS.md #10: buffers are
-/// application code, not a HAL default); [`read`](BufferedRx::read) drains it non-blocking. No DMA
-/// channel is spent, so this is the cheap option for moderate-rate framed-protocol RX.
+/// Built from the RX half of a split [`crate::usart::Usart`] (consuming it: the RX path now owns
+/// that instance's RX interrupt; the TX half stays with its owner, `specs/usart-split.md` D3). The
+/// ISR fills a `'static` SPSC ring the application owns (DECISIONS.md #10: buffers are application
+/// code, not a HAL default); [`read`](BufferedRx::read) drains it non-blocking. No DMA channel is
+/// spent, so this is the cheap option for moderate-rate framed-protocol RX. The RX half is given
+/// back by [`release`](BufferedRx::release).
 pub struct BufferedRx {
     /// The application ring, type-erased (the consumer is reconstructed from this per `read`).
     queue: *mut (),
@@ -367,10 +369,13 @@ pub struct BufferedRx {
     /// This receiver's `'static` RX slot (USART1 or the module USART): `read` / `take_idle` reference
     /// it directly, so two `BufferedRx` on different instances never touch each other's state.
     slot: &'static RxSlot,
+    /// The consumed RX half, held for [`release`](BufferedRx::release).
+    rx: UsartRx,
 }
 
 impl BufferedRx {
-    /// Install interrupt-buffered RX on a brought-up `usart`, using `storage` as the `'static` ring.
+    /// Install interrupt-buffered RX on the RX half of a brought-up USART, using `storage` as the
+    /// `'static` ring.
     ///
     /// Performs, in order: install the static RX context (USART base + family bit + the ring); enable
     /// `RBNEIE` + `IDLEIE` on the USART; register the ISR body; then unmask the USART IRQ in the NVIC.
@@ -379,7 +384,7 @@ impl BufferedRx {
     /// route. `N` is the ring capacity word (the ring holds `N - 1` bytes, per `heapless`).
     pub fn new<const N: usize>(
         chip: &Chip,
-        usart: Usart,
+        rx: UsartRx,
         instance: PeriphLabel,
         storage: &'static mut Queue<u8, N>,
     ) -> Result<BufferedRx, DescriptorError> {
@@ -399,11 +404,11 @@ impl BufferedRx {
 
         // 1. Install this instance's RX slot (base + family bit + this ring's queue + monomorphised
         //    push) and register the ISR body the instance's vector routes to.
-        install_usart_ctx(&usart, inst, queue, push_impl::<N> as *mut ());
+        install_usart_ctx(&rx.regs(), inst, queue, push_impl::<N> as *mut ());
 
         // 2. Enable the RX interrupt sources on the USART.
-        usart.listen_rbne();
-        usart.listen_idle();
+        rx.regs().listen_rbne();
+        rx.regs().listen_idle();
 
         // 3. Unmask this instance's USART IRQ in the NVIC (hardware only).
         let _ = chip;
@@ -415,7 +420,18 @@ impl BufferedRx {
             pop: pop_impl::<N>,
             ready: ready_impl::<N>,
             slot: inst.slot(),
+            rx,
         })
+    }
+
+    /// Quiesce this receiver and give the RX half back (`specs/usart-split.md` D3): clear the
+    /// `RBNEIE` + `IDLEIE` interrupt sources it enabled and mark its RX slot uninstalled (a pending
+    /// IRQ finds an inert slot). The returned [`UsartRx`] re-arms via a fresh `new`, or rejoins its
+    /// TX half ([`crate::usart::Usart::rejoin`]) for reconfiguration.
+    pub fn release(self) -> UsartRx {
+        self.rx.regs().unlisten_rx_irqs();
+        self.slot.installed.store(false, Ordering::Release);
+        self.rx
     }
 
     /// Drain buffered bytes into `buf`; returns the count (0 if the ring is currently empty,
@@ -503,10 +519,12 @@ pub struct RingBufferedRx {
     slot: &'static RxSlot,
     /// This receiver's DMA-RX wrap-counter context index (`crate::dma::wraps`), independent per instance.
     dma_ctx: usize,
+    /// The consumed RX half, held for [`release`](RingBufferedRx::release).
+    rx: UsartRx,
 }
 
 impl RingBufferedRx {
-    /// Arm circular DMA RX on a brought-up `usart`, writing into `dma_buf` (section 5.1). In order:
+    /// Arm circular DMA RX on the RX half of a brought-up USART, writing into `dma_buf` (section 5.1). In order:
     /// resolve [`DmaRxMap`](crate::dma::DmaRxMap); enable the DMA clock; **write-back self-check** (fail
     /// loud if the channel does not respond, arming nothing); program the channel (PADDR = RDATA,
     /// MADDR = buf, CNT = len, circular, half+full IRQ) and start it (`CHEN` last, after a Release
@@ -517,7 +535,7 @@ impl RingBufferedRx {
     /// [`DescriptorError::Unsupported`]. A failed self-check is [`DescriptorError::SelfCheckFailed`].
     pub fn new(
         chip: &Chip,
-        usart: Usart,
+        rx: UsartRx,
         instance: PeriphLabel,
         dma_buf: &'static mut [u8],
     ) -> Result<RingBufferedRx, DescriptorError> {
@@ -557,17 +575,22 @@ impl RingBufferedRx {
         // 4-5. Program + start the channel (CHEN last, Release fence inside).
         // SAFETY: `buf` points at the caller's `'static` `dma_buf` of `len` bytes, which outlives the
         // channel (the `&'static mut` contract); the DMA writes it while we only read behind its head.
-        unsafe { map.configure_circular(usart.rdata_addr(), buf as u32, len as u16) };
+        unsafe { map.configure_circular(rx.regs().rdata_addr(), buf as u32, len as u16) };
 
         // 6. USART: route bytes to DMA, raise the IDLE boundary, raise line errors.
-        usart.enable_dma_rx();
-        usart.listen_idle();
-        usart.listen_errors();
+        rx.regs().enable_dma_rx();
+        rx.regs().listen_idle();
+        rx.regs().listen_errors();
 
         // Install this instance's shared RX context (no SPSC ring under DMA: the ISR's RBNE drain never
         // runs, since the DMA controller's RDATA read auto-clears RBNE; only its IDLE + line-error path
         // is used) and the per-instance DMA-RX wrap-counter context + DMA ISR body.
-        install_usart_ctx(&usart, inst, core::ptr::null_mut(), core::ptr::null_mut());
+        install_usart_ctx(
+            &rx.regs(),
+            inst,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
         crate::dma::install(&map, inst.slot_index());
 
         // 7. Unmask both the DMA-channel and the USART IRQ for this instance (hardware only).
@@ -585,7 +608,19 @@ impl RingBufferedRx {
             cursor: 0,
             slot: inst.slot(),
             dma_ctx: inst.slot_index(),
+            rx,
         })
+    }
+
+    /// Quiesce this receiver and give the RX half back (`specs/usart-split.md` D3): disable the DMA
+    /// channel, clear the `DENR` + `IDLEIE` + `ERRIE` sources it enabled, and mark its RX slot
+    /// uninstalled. The returned [`UsartRx`] re-arms via a fresh `new`, or rejoins its TX half
+    /// ([`crate::usart::Usart::rejoin`]) for reconfiguration (the bench's baud-change path).
+    pub fn release(self) -> UsartRx {
+        self.map.disable();
+        self.rx.regs().disable_dma_rx();
+        self.slot.installed.store(false, Ordering::Release);
+        self.rx
     }
 
     /// A consistent snapshot of (effective wrap count, remaining) for the live DMA write position.

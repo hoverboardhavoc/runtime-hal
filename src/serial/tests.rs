@@ -65,8 +65,6 @@ fn serial() -> UsartSerial {
     });
     let cfg = UsartConfig {
         usart: PeriphLabel::Usart1,
-        tx: 0x02,
-        rx: 0x03,
         baud: 115_200,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,

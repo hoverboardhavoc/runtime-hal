@@ -40,10 +40,11 @@ pub type Serial = UsartSerial;
 /// `embedded-io` serial endpoint over a configured [`Usart`].
 ///
 /// Construct one with the pin-handle [`UsartSerial::new`] (the headline path), or wrap a handle you
-/// brought up yourself via [`UsartSerial::from_usart`]; it borrows nothing and is `Copy`, so it can
-/// be created on demand. The blocking `Read`/`Write` impls poll the USART status flags (RBNE / TBE /
+/// brought up yourself via [`UsartSerial::from_usart`]. Like [`Usart`] it is NOT `Copy`/`Clone`
+/// (`specs/usart-split.md` D1): it IS the one handle to its peripheral, wrapped in the
+/// `embedded-io` seam. The blocking `Read`/`Write` impls poll the USART status flags (RBNE / TBE /
 /// TC) and the line-error flags (overrun / framing / parity).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct UsartSerial {
     usart: Usart,
 }
@@ -83,9 +84,10 @@ impl UsartSerial {
         Self { usart }
     }
 
-    /// The underlying [`Usart`] handle (for code that needs the register-level primitives).
+    /// Unwrap into the underlying [`Usart`] handle (for code that needs the register-level
+    /// primitives). Consumes the endpoint: the `Usart` is the one handle to the peripheral.
     #[inline]
-    pub const fn usart(&self) -> Usart {
+    pub fn into_usart(self) -> Usart {
         self.usart
     }
 }

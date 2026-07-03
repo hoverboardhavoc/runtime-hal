@@ -118,7 +118,8 @@ fn main() -> ! {
     .unwrap();
     // The raw USART handle for the polled byte primitives: drain via `try_read_byte` (which clears
     // any overrun and self-recovers, so the app needs no manual ORE handling), send via `write_byte`.
-    let usart = serial.usart();
+    // `into_usart` consumes the endpoint: the `Usart` is the one handle to the peripheral.
+    let usart = serial.into_usart();
 
     // 4. LEDs as push-pull outputs from the GPIOB split: upper = PB2, lower = PB5.
     let mut led_upper = gpiob.pb2.into_push_pull_output();

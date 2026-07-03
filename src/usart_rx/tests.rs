@@ -104,8 +104,6 @@ fn chip_for(fam: &Fam) -> Chip {
 fn bench_cfg() -> UsartConfig {
     UsartConfig {
         usart: PeriphLabel::Usart1,
-        tx: 0x02,
-        rx: 0x03,
         baud: 115_200,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,
@@ -129,7 +127,7 @@ fn install<const N: usize>(fam: &Fam) -> BufferedRx {
     let chip = chip_for(fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
     let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
-    let rx = BufferedRx::new(&chip, usart, PeriphLabel::Usart1, storage).unwrap();
+    let rx = BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, storage).unwrap();
     install_mock(fam.irq, RAM_ADDR);
     rx
 }
@@ -151,8 +149,6 @@ fn stage_byte_at(base: u32, fam: &Fam, b: u8) {
 fn module_cfg() -> UsartConfig {
     UsartConfig {
         usart: PeriphLabel::Usart2,
-        tx: 0x0A,
-        rx: 0x0B,
         baud: 115_200,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,
@@ -165,7 +161,7 @@ fn module_cfg() -> UsartConfig {
 fn bring_up_module<const N: usize>(chip: &Chip) -> BufferedRx {
     let usart = Usart::bring_up(chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
     let storage: &'static mut Queue<u8, N> = Box::leak(Box::new(Queue::new()));
-    BufferedRx::new(chip, usart, PeriphLabel::Usart2, storage).unwrap()
+    BufferedRx::new(chip, usart.split().1, PeriphLabel::Usart2, storage).unwrap()
 }
 
 fn fire(fam: &Fam) {
@@ -387,7 +383,7 @@ fn b15_two_instances_live_no_slot_or_vector_collision() {
     // USART1 BufferedRx (slot 0, vector 38) and module BufferedRx (slot 1, vector 39), both live.
     let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
     let s1: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
-    let mut rx1 = BufferedRx::new(&chip, u1, PeriphLabel::Usart1, s1).unwrap();
+    let mut rx1 = BufferedRx::new(&chip, u1.split().1, PeriphLabel::Usart1, s1).unwrap();
     let mut rxm = bring_up_module::<8>(&chip);
     install_mock(fam.irq, RAM_ADDR);
 
@@ -431,7 +427,7 @@ fn b16_module_instance_on_f1x0_is_unsupported() {
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
     let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
     assert_eq!(
-        BufferedRx::new(&chip, usart, PeriphLabel::Usart2, storage).map(|_| ()),
+        BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart2, storage).map(|_| ()),
         Err(DescriptorError::Unsupported),
         "the module USART is F10x-only; F1x0 returns DescriptorError (no silent untested mapping)"
     );
@@ -448,7 +444,7 @@ fn b17_unknown_instance_selector_is_rejected() {
     let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
     // USART0 is a real label but not a supported buffered-RX instance (only USART1 + the module are).
     assert_eq!(
-        BufferedRx::new(&chip, usart, PeriphLabel::Usart0, storage).map(|_| ()),
+        BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart0, storage).map(|_| ()),
         Err(DescriptorError::UnknownSelector),
         "an unsupported instance selector fails loud, not a silent wrong mapping"
     );
@@ -509,7 +505,7 @@ fn install_ring(fam: &Fam, len: usize) -> (RingBufferedRx, u8, *mut u8) {
     let buf: &'static mut [u8] = vec![0u8; len].leak();
     let ptr = buf.as_mut_ptr();
     let ch = DmaRxMap::usart1_rx(&chip).channel;
-    let rx = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf).unwrap();
+    let rx = RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, buf).unwrap();
     install_mock(fam.irq, RAM_ADDR);
     (rx, ch, ptr)
 }
@@ -553,12 +549,14 @@ fn b7_channel_programming_and_denr() {
         let buf: &'static mut [u8] = vec![0u8; 32].leak();
         let maddr = buf.as_ptr() as u32;
         let ch = DmaRxMap::usart1_rx(&chip).channel;
-        let _rx = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf).unwrap();
+        let rx_half = usart.split().1;
+        let rdata = rx_half.regs().rdata_addr();
+        let _rx = RingBufferedRx::new(&chip, rx_half, PeriphLabel::Usart1, buf).unwrap();
 
         // PADDR = the RDATA address; MADDR = buffer ptr; CNT = len.
         assert_eq!(
             Reg32::new(DMA0_BASE, ch_paddr(ch)).read(),
-            usart.rdata_addr(),
+            rdata,
             "CHxPADDR = USART RDATA address"
         );
         assert_eq!(
@@ -764,7 +762,7 @@ fn b11_self_check_failure_arms_nothing() {
 
     assert!(
         matches!(
-            RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf),
+            RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, buf),
             Err(DescriptorError::SelfCheckFailed)
         ),
         "a channel that does not respond fails loud"
@@ -812,7 +810,7 @@ fn b12_line_error_stops_reception_and_re_new_rearms() {
     let chip = chip_for(&fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
     let buf2: &'static mut [u8] = vec![0u8; 32].leak();
-    let _rx2 = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart1, buf2).unwrap();
+    let _rx2 = RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, buf2).unwrap();
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
         CHEN,
@@ -885,7 +883,7 @@ fn install_ring_module(len: usize) -> (RingBufferedRx, u8, *mut u8) {
     let buf: &'static mut [u8] = vec![0u8; len].leak();
     let ptr = buf.as_mut_ptr();
     let ch = DmaRxMap::module_rx().channel;
-    let rx = RingBufferedRx::new(&chip, usart, PeriphLabel::Usart2, buf).unwrap();
+    let rx = RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart2, buf).unwrap();
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
     (rx, ch, ptr)
 }
@@ -945,11 +943,11 @@ fn b20_two_dma_instances_live_no_channel_or_context_collision() {
     // context 1, vector 13), both live.
     let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
     let b1: &'static mut [u8] = vec![0u8; 16].leak();
-    let _r1 = RingBufferedRx::new(&chip, u1, PeriphLabel::Usart1, b1).unwrap();
+    let _r1 = RingBufferedRx::new(&chip, u1.split().1, PeriphLabel::Usart1, b1).unwrap();
     let ch_u1 = DmaRxMap::usart1_rx(&chip).channel;
     let um = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
     let bm: &'static mut [u8] = vec![0u8; 16].leak();
-    let _rm = RingBufferedRx::new(&chip, um, PeriphLabel::Usart2, bm).unwrap();
+    let _rm = RingBufferedRx::new(&chip, um.split().1, PeriphLabel::Usart2, bm).unwrap();
     let ch_mod = DmaRxMap::module_rx().channel;
     assert_eq!((ch_u1, ch_mod), (5, 2), "distinct channels, no collision");
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
@@ -1001,8 +999,121 @@ fn b21_module_ring_on_f1x0_is_unsupported() {
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
     let buf: &'static mut [u8] = vec![0u8; 16].leak();
     assert_eq!(
-        RingBufferedRx::new(&chip, usart, PeriphLabel::Usart2, buf).map(|_| ()),
+        RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart2, buf).map(|_| ()),
         Err(DescriptorError::Unsupported),
         "the module DMA path is F10x-only; F1x0 returns DescriptorError (no silent untested mapping)"
     );
+}
+
+// --- release / re-arm / the reprogram sequence (specs/usart-split.md section 5) ----------------
+
+#[test]
+fn buffered_release_quiesces_and_the_half_rearms() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let storage: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let mut rx = BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, storage).unwrap();
+    install_mock(fam.irq, RAM_ADDR);
+
+    // Live: the IRQ enables are set and a staged byte flows through the ISR into the ring.
+    let ctl0 = Reg32::new(USART_BASE, fam.ctl0).read();
+    assert_eq!(ctl0 & ((1 << 5) | (1 << 4)), (1 << 5) | (1 << 4));
+    stage_byte(&fam, 0xA1);
+    fire(&fam);
+    let mut buf = [0u8; 4];
+    assert_eq!(rx.read(&mut buf), Ok(1));
+    assert_eq!(buf[0], 0xA1);
+
+    // Release: RBNEIE + IDLEIE cleared (quiesced), everything else untouched.
+    let half = rx.release();
+    let ctl0 = Reg32::new(USART_BASE, fam.ctl0).read();
+    assert_eq!(ctl0 & ((1 << 5) | (1 << 4)), 0, "RBNEIE+IDLEIE cleared");
+    assert_eq!(
+        ctl0 & ((1 << 2) | (1 << 3) | (1 << 13)),
+        (1 << 2) | (1 << 3) | (1 << 13),
+        "REN+TEN+UEN untouched"
+    );
+
+    // The returned half re-arms and receives again.
+    let storage2: &'static mut Queue<u8, 8> = Box::leak(Box::new(Queue::new()));
+    let mut rx2 = BufferedRx::new(&chip, half, PeriphLabel::Usart1, storage2).unwrap();
+    stage_byte(&fam, 0xB2);
+    fire(&fam);
+    assert_eq!(rx2.read(&mut buf), Ok(1));
+    assert_eq!(buf[0], 0xB2);
+}
+
+#[test]
+fn ring_release_disables_channel_and_the_half_rearms() {
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let ch = DmaRxMap::usart1_rx(&chip).channel;
+    let buf: &'static mut [u8] = vec![0u8; 32].leak();
+    let rx = RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, buf).unwrap();
+
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        CHEN,
+        "armed: CHEN set"
+    );
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl2).read() & ((1 << 6) | (1 << 0)),
+        (1 << 6) | (1 << 0),
+        "armed: DENR + ERRIE set"
+    );
+
+    let half = rx.release();
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        0,
+        "released: channel disabled"
+    );
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl2).read() & ((1 << 6) | (1 << 0)),
+        0,
+        "released: DENR + ERRIE cleared"
+    );
+    assert_eq!(
+        Reg32::new(USART_BASE, fam.ctl0).read() & (1 << 4),
+        0,
+        "released: IDLEIE cleared"
+    );
+
+    // Re-arm on the returned half: the channel comes back up.
+    let buf2: &'static mut [u8] = vec![0u8; 32].leak();
+    let _rx2 = RingBufferedRx::new(&chip, half, PeriphLabel::Usart1, buf2).unwrap();
+    assert_eq!(Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN, CHEN);
+}
+
+#[test]
+fn reprogram_sequence_release_rejoin_set_baud_split_rearm() {
+    // The bench's baud-change path (specs/usart-split.md D4), end to end on the mock: a live DMA
+    // receiver is released, the halves rejoin, set_baud reprograms, and a fresh split re-arms.
+    let fam = f10x();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    let clock = ClockConfig::REFERENCE_72M_IRC8M;
+    let usart = Usart::bring_up(&chip, &clock, &bench_cfg()).unwrap();
+    let baud_off = 0x08; // F10x BAUD offset
+    assert_eq!(Reg32::new(USART_BASE, baud_off).read(), 313); // 115200 @ 36 MHz
+
+    let (tx, rx) = usart.split();
+    let buf: &'static mut [u8] = vec![0u8; 32].leak();
+    let ring = RingBufferedRx::new(&chip, rx, PeriphLabel::Usart1, buf).unwrap();
+
+    // Reconfigure: impossible while split (no set_baud on the halves; the type system enforces
+    // it), so release -> rejoin -> set_baud -> split -> re-arm.
+    let rx = ring.release();
+    let mut whole = Usart::rejoin(tx, rx);
+    whole.set_baud(&clock, 9_600);
+    assert_eq!(Reg32::new(USART_BASE, baud_off).read(), 3750);
+    let (_tx, rx) = whole.split();
+    let buf2: &'static mut [u8] = vec![0u8; 32].leak();
+    let ch = DmaRxMap::usart1_rx(&chip).channel;
+    let _ring = RingBufferedRx::new(&chip, rx, PeriphLabel::Usart1, buf2).unwrap();
+    assert_eq!(Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN, CHEN);
 }

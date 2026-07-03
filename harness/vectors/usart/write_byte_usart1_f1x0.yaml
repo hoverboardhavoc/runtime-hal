@@ -43,7 +43,7 @@ implementations:
       }
 
       pub fn body() {
-          let cfg = UsartConfig { usart: PeriphLabel::Usart1, tx: 0x02, rx: 0x03, baud: 115200,
+          let cfg = UsartConfig { usart: PeriphLabel::Usart1, baud: 115200,
               frame: UsartFrame::EIGHT_N_ONE, oversampling: Oversampling::By16 };
           let u = Usart::bring_up(&chip(), &ClockConfig::REFERENCE_72M_IRC8M, &cfg).unwrap();
           u.write_byte(0x41);

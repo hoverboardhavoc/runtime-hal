@@ -297,12 +297,62 @@ impl Status {
     }
 }
 
-/// A configured USART, resolved once at bring-up: the base and the register model. The polled
-/// byte primitives hang off this (DECISIONS.md #4: resolve once into a concrete handle).
+/// The crate-internal register view of a USART: the base + register model and every raw register
+/// op. `Copy`, but never public: the OWNERSHIP carriers are [`Usart`] / [`UsartTx`] / [`UsartRx`]
+/// (non-`Copy`, `specs/usart-split.md` D1/D6). The RX ISR rebuilds one of these per entry (the one
+/// documented alias; it performs only flag-clear/byte reads on the RX side it logically owns).
 #[derive(Debug, Clone, Copy)]
-pub struct Usart {
+pub(crate) struct UsartRegs {
     base: u32,
     model: UsartModel,
+}
+
+/// A configured USART, resolved once at bring-up: the register view plus the APB bus its baud
+/// generator hangs off (DECISIONS.md #4: resolve once into a concrete handle). **Not `Copy`**
+/// (DECISIONS.md #12 / `specs/usart-split.md` D1): exactly one handle exists per configured
+/// peripheral, so exclusive access is carried by the type system, not call-site convention. To
+/// drive TX and RX from different owners, [`Usart::split`]; to reconfigure, hold the whole handle
+/// ([`Usart::set_baud`], rejoining first if split).
+#[derive(Debug)]
+pub struct Usart {
+    regs: UsartRegs,
+    bus: UsartBus,
+}
+
+/// The TX half of a split [`Usart`] (`specs/usart-split.md` D2/D3): polled transmit only. Non-`Copy`
+/// like `Usart`. Reconfiguration requires rejoining with the RX half ([`Usart::rejoin`]).
+#[derive(Debug)]
+pub struct UsartTx {
+    regs: UsartRegs,
+}
+
+/// The RX half of a split [`Usart`] (`specs/usart-split.md` D2/D3). Carries no public register ops
+/// this slice: it exists to be CONSUMED by a receiver ([`crate::usart_rx::BufferedRx::new`] /
+/// [`crate::usart_rx::RingBufferedRx::new`]), which gives it back on `release`. Non-`Copy`. It is
+/// the half that carries the peripheral's [`UsartBus`] home for [`Usart::rejoin`] (the TX half
+/// carries only the register view; bus is a pure function of the instance, so one carrier is
+/// enough and neither half has a field nothing reads).
+#[derive(Debug)]
+pub struct UsartRx {
+    regs: UsartRegs,
+    bus: UsartBus,
+}
+
+impl UsartTx {
+    /// Write one byte, polling TBE then TC (the same polled-send loop as [`Usart::write_byte`]).
+    #[inline]
+    pub fn write_byte(&self, byte: u8) {
+        self.regs.write_byte(byte);
+    }
+}
+
+impl UsartRx {
+    /// The register view (crate-internal: the receivers in [`crate::usart_rx`] drive the RX-side
+    /// register ops through this).
+    #[inline]
+    pub(crate) fn regs(&self) -> UsartRegs {
+        self.regs
+    }
 }
 
 impl Usart {
@@ -405,7 +455,7 @@ impl Usart {
         frame: UsartFrame,
         oversampling: Oversampling,
     ) -> Usart {
-        let u = Usart { base, model };
+        let u = UsartRegs { base, model };
 
         // 1. Disable the peripheral before reconfiguring (usart_disable: clear UEN).
         u.ctl0().modify(model.uen(), 0);
@@ -446,9 +496,73 @@ impl Usart {
         // 5. Enable the peripheral (usart_enable: set UEN).
         u.ctl0().modify(model.uen(), model.uen());
 
-        u
+        Usart { regs: u, bus }
     }
 
+    /// Split into independently owned TX and RX halves (`specs/usart-split.md` D2). The RX half is
+    /// what a receiver ([`crate::usart_rx::BufferedRx`] / [`crate::usart_rx::RingBufferedRx`])
+    /// consumes while the TX half keeps polled transmit; reconfiguration requires rejoining
+    /// ([`Usart::rejoin`]), so it cannot race a live receiver.
+    #[inline]
+    pub fn split(self) -> (UsartTx, UsartRx) {
+        (
+            UsartTx { regs: self.regs },
+            UsartRx {
+                regs: self.regs,
+                bus: self.bus,
+            },
+        )
+    }
+
+    /// Reassemble a [`Usart`] from the two halves of a prior [`Usart::split`]. Holding both halves
+    /// proves no receiver is live, which is what makes [`Usart::set_baud`] sound
+    /// (`specs/usart-split.md` D4). Panics if the halves come from different peripherals (a
+    /// programming error; fail loud).
+    #[inline]
+    pub fn rejoin(tx: UsartTx, rx: UsartRx) -> Usart {
+        assert_eq!(
+            tx.regs.base, rx.regs.base,
+            "Usart::rejoin: halves from different peripherals"
+        );
+        Usart {
+            regs: rx.regs,
+            bus: rx.bus,
+        }
+    }
+
+    /// Reprogram the baud rate on the whole (unsplit) peripheral: disable `UEN`, program `BAUD`
+    /// from this handle's bus + `clock`, re-enable `UEN`. The frame fields are untouched. This is
+    /// the ONLY reconfiguration op, and it lives only here (`specs/usart-split.md` D4): a split
+    /// port must be rejoined first, so a live receiver can never be reprogrammed under its feet.
+    pub fn set_baud(&mut self, clock: &ClockConfig, baud: u32) {
+        let uen = self.regs.model.uen();
+        self.regs.ctl0().modify(uen, 0);
+        let uclk = usart_input_clock(clock, self.bus);
+        self.regs.baud_reg().write(compute_brr(uclk, baud) as u32);
+        self.regs.ctl0().modify(uen, uen);
+    }
+
+    /// Read the line/transfer status flags.
+    #[inline]
+    pub fn read_status(&self) -> Status {
+        self.regs.read_status()
+    }
+
+    /// Write one byte, polling for the transmit buffer to drain then for transmission to complete.
+    #[inline]
+    pub fn write_byte(&self, byte: u8) {
+        self.regs.write_byte(byte);
+    }
+
+    /// Try to read one byte without blocking, self-recovering from a receive overrun. See
+    /// [`UsartRegs::try_read_byte`] for the full contract (unchanged).
+    #[inline]
+    pub fn try_read_byte(&self) -> Result<Option<u8>, UsartError> {
+        self.regs.try_read_byte()
+    }
+}
+
+impl UsartRegs {
     #[inline]
     fn ctl0(&self) -> Reg32 {
         Reg32::new(self.base, self.model.ctl0)
@@ -647,16 +761,35 @@ impl Usart {
         self.model.intc.is_some()
     }
 
-    /// Rebuild a handle from the base + family bit the RX ISR context stored (the inverse of
-    /// [`Usart::base`] / [`Usart::is_f1x0`]). The model is the chip's, resolved once at bring-up.
+    /// Rebuild a register view from the base + family bit the RX ISR context stored (the inverse of
+    /// `base` / `is_f1x0`). The model is the chip's, resolved once at bring-up. This is the one
+    /// sanctioned alias of a live peripheral (`specs/usart-split.md` D1/D6): it is crate-internal,
+    /// reached only from the RX ISR that logically owns the RX side, and never escapes as an
+    /// ownership-carrying [`Usart`].
     #[inline]
-    pub(crate) const fn from_parts(base: u32, is_f1x0: bool) -> Usart {
+    pub(crate) const fn from_parts(base: u32, is_f1x0: bool) -> UsartRegs {
         let model = if is_f1x0 {
             UsartModel::F1X0
         } else {
             UsartModel::F10X
         };
-        Usart { base, model }
+        UsartRegs { base, model }
+    }
+
+    /// Disable the `RBNEIE` + `IDLEIE` interrupt sources (the inverse of [`UsartRegs::listen_rbne`]
+    /// + [`UsartRegs::listen_idle`]): [`crate::usart_rx::BufferedRx::release`] quiesces with this.
+    #[inline]
+    pub(crate) fn unlisten_rx_irqs(&self) {
+        self.ctl0().modify(CTL0_RBNEIE | CTL0_IDLEIE, 0);
+    }
+
+    /// Disable DMA reception + the IDLE and error interrupt sources (the inverse of the
+    /// [`RingBufferedRx`](crate::usart_rx::RingBufferedRx) bring-up trio `enable_dma_rx` +
+    /// `listen_idle` + `listen_errors`): its `release` quiesces with this.
+    #[inline]
+    pub(crate) fn disable_dma_rx(&self) {
+        self.ctl2().modify(CTL2_DENR | CTL2_ERRIE, 0);
+        self.ctl0().modify(CTL0_IDLEIE, 0);
     }
 
     /// True if the IDLE-line flag (`IDLEF`) is set.

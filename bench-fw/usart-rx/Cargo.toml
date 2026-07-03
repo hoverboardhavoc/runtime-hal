@@ -15,6 +15,12 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
 
+[features]
+# The F103+F130 pair image (F10x = sender, F1x0 = RingBufferedRx receiver): re-signs the F1x0
+# grouped-demux DMA gate with the split handles over the inter-board USART1 cross-wire. The default
+# (no-feature) image is the single-F103 intra-board S0/S1/S2 suite.
+pair = []
+
 [[bin]]
 name = "bench-fw-usart-rx"
 path = "src/main.rs"

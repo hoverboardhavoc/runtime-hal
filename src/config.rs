@@ -109,16 +109,15 @@ impl UsartFrame {
 /// One USART's application configuration (was `UsartWiring`).
 ///
 /// The chip context ([`crate::Chip`]) resolves [`Self::usart`] to a base and supplies the register
-/// model; the application supplies the pins, baud, frame, and oversampling. `tx`/`rx` are logical
-/// pins in the SPEC.md model: one byte `(port << 4) | pin` (port 0=A..5=F).
+/// model; the application supplies the baud, frame, and oversampling. **No pin fields**
+/// (`specs/usart-split.md` D5): [`crate::usart::Usart::bring_up`] programs registers only, so this
+/// config carries exactly what it reads. Pin routing's canonical models are the type-state
+/// [`crate::gpio::Pin`] path ([`crate::usart::Usart::new`]) and the explicit
+/// [`crate::Chip::route_usart_pin`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsartConfig {
     /// Which USART instance label.
     pub usart: PeriphLabel,
-    /// TX pin, `(port << 4) | pin`.
-    pub tx: u8,
-    /// RX pin, `(port << 4) | pin`.
-    pub rx: u8,
     /// Target baud rate.
     pub baud: u32,
     /// Line frame (word length / parity / stop). No baked 8N1.

@@ -81,12 +81,14 @@ fn main() -> ! {
     //    USART1 to its base; this supplies the behavior.
     let usart_cfg = UsartConfig {
         usart: PeriphLabel::Usart1,
-        tx: 0x02, // PA2
-        rx: 0x03, // PA3
         baud: 115_200,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,
     };
+    // The link pins, `(port << 4) | pin`: PA2 (TX) / PA3 (RX). Routed explicitly below (step 4);
+    // `UsartConfig` carries no pin fields (`specs/usart-split.md` D5: `bring_up` is registers-only).
+    const TX_PIN: u8 = 0x02;
+    const RX_PIN: u8 = 0x03;
 
     // 3. Resolve the RCU base and enable peripheral clocks through runtime-hal's clock path (the
     //    chip's clock selector): the USART instance, its GPIO port (GPIOA, for PA2/PA3), and GPIOB
@@ -99,9 +101,9 @@ fn main() -> ! {
 
     // 4. Configure TX/RX alternate-function through runtime-hal's public USART routing (the chip
     //    resolves the pin's port + family AF mux internally). The pin bytes are `(port << 4) | pin`.
-    chip.route_usart_pin(usart_cfg.tx, PinRole::Tx)
+    chip.route_usart_pin(TX_PIN, PinRole::Tx)
         .unwrap_or_else(|_| halt());
-    chip.route_usart_pin(usart_cfg.rx, PinRole::Rx)
+    chip.route_usart_pin(RX_PIN, PinRole::Rx)
         .unwrap_or_else(|_| halt());
 
     // Configure PB9 as a plain push-pull output indicator through runtime-hal's gpio output API.

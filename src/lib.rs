@@ -114,7 +114,9 @@ pub use spi::{mode_bits, prescaler_for, spi_input_clock, DataSize, Spi};
 pub use timebase::{reload_for, Timebase, TimebaseError};
 pub use timer::arming::ArmGate;
 pub use timer::{ComplementaryPwm, PwmController, PwmHandle, PwmTimer};
-pub use usart::{compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel};
+pub use usart::{
+    compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel, UsartRx, UsartTx,
+};
 pub use usart_rx::{BufferedRx, RingBufferedRx};
 pub use watchdog::{
     clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,

@@ -54,8 +54,6 @@ fn chip_for(path: ClockPath) -> Chip {
 fn bench_cfg() -> UsartConfig {
     UsartConfig {
         usart: PeriphLabel::Usart1,
-        tx: 0x02,
-        rx: 0x03,
         baud: 115_200,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,
@@ -427,4 +425,85 @@ proptest::proptest! {
         proptest::prop_assume!(baud <= uclk);
         proptest::prop_assert_eq!(compute_brr(uclk, baud), spl_brr_oracle(uclk, baud));
     }
+}
+
+// --- (e) split / rejoin / set_baud ownership rules (specs/usart-split.md section 5) ------------
+
+#[test]
+fn split_halves_address_the_same_peripheral_and_tx_writes() {
+    let _g = seed_reset();
+    let u = Usart::bring_up(&chip_for(ClockPath::F10xRcc), &ref_72m(), &bench_cfg()).unwrap();
+    let (tx, _rx) = u.split();
+    // Pre-seed TBE+TC so write_byte does not spin (F10x STAT 0x00, TBE BIT7, TC BIT6).
+    Reg32::new(USART_BASE, 0x00).write((1 << 7) | (1 << 6));
+    tx.write_byte(0x42);
+    // The byte landed in THIS peripheral's data register (F10x DATA 0x04): the halves alias the
+    // one configured base, not a copy.
+    assert_eq!(Reg32::new(USART_BASE, 0x04).read() & 0xFF, 0x42);
+}
+
+#[test]
+fn set_baud_reprograms_baud_and_leaves_frame_and_uen() {
+    let _g = seed_reset();
+    let off = offsets_for_path(ClockPath::F10xRcc);
+    let mut u = Usart::bring_up(&chip_for(ClockPath::F10xRcc), &ref_72m(), &bench_cfg()).unwrap();
+    assert_eq!(
+        Reg32::new(USART_BASE, off.baud).read(),
+        EXPECTED_BRR_USART1_72M_115200
+    );
+    let ctl0_before = Reg32::new(USART_BASE, off.ctl0).read();
+
+    u.set_baud(&ref_72m(), 9_600);
+
+    // BAUD = (36 MHz + 4800) / 9600 = 3750 (the SPL round-to-nearest divisor).
+    assert_eq!(Reg32::new(USART_BASE, off.baud).read(), 3750, "9600 BRR");
+    // UEN re-set, frame/enable bits untouched (the RMW disabled then re-enabled only UEN).
+    assert_eq!(
+        Reg32::new(USART_BASE, off.ctl0).read(),
+        ctl0_before,
+        "CTL0 ends exactly as it started (REN+TEN+UEN, 8N1 fields)"
+    );
+}
+
+#[test]
+fn rejoin_matching_halves_restores_reconfigurability() {
+    let _g = seed_reset();
+    let off = offsets_for_path(ClockPath::F10xRcc);
+    let u = Usart::bring_up(&chip_for(ClockPath::F10xRcc), &ref_72m(), &bench_cfg()).unwrap();
+    let (tx, rx) = u.split();
+    let mut u = Usart::rejoin(tx, rx);
+    u.set_baud(&ref_72m(), 57_600);
+    // (36 MHz + 28800) / 57600 = 625.5 -> 625.
+    assert_eq!(Reg32::new(USART_BASE, off.baud).read(), 625);
+}
+
+#[test]
+#[should_panic(expected = "different peripherals")]
+fn rejoin_of_mismatched_halves_panics() {
+    let _g = seed_reset();
+    // A chip with TWO USART instances at distinct bases.
+    let mut addrs = AddrTable::new();
+    addrs.set(PeriphLabel::Usart1, USART_BASE);
+    addrs.set(PeriphLabel::Usart2, 0x4000_4800);
+    addrs.set(PeriphLabel::Rcu, 0x4002_1000);
+    let chip = Chip::from_descriptor(McuDescriptor {
+        gpio: GpioPath::ApbCrlCrh,
+        clock: ClockPath::F10xRcc,
+        adc: AdcPath::Single,
+        irq: IrqLayout::F1x0Grouped,
+        addrs,
+        flash_page: PageSize::K1,
+        flash_kib: 64,
+        adv_timers: 1,
+        adc_count: 1,
+    });
+    let u1 = Usart::bring_up(&chip, &ref_72m(), &bench_cfg()).unwrap();
+    let cfg2 = UsartConfig {
+        usart: PeriphLabel::Usart2,
+        ..bench_cfg()
+    };
+    let u2 = Usart::bring_up(&chip, &ref_72m(), &cfg2).unwrap();
+    let (tx1, _rx1) = u1.split();
+    let (_tx2, rx2) = u2.split();
+    let _ = Usart::rejoin(tx1, rx2); // cross-peripheral rejoin: programming error, fail loud
 }
