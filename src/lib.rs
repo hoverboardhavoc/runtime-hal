@@ -38,6 +38,11 @@ pub mod fmc;
 pub mod gpio;
 pub mod i2c;
 pub mod irq;
+/// Per-chip pin-capability queries (R-CAP, `specs/pin-capability.md`): pure, descriptor-backed
+/// answers for the hoverboard board-layout validator's `Capabilities` seam - pin bonding on the
+/// detected part, advanced-timer gate pins/sets, the ADC channel behind a pin, and the
+/// hardware-I2C pair derivation. Nothing here configures or routes anything.
+pub mod pincap;
 /// General single-channel PWM on a GENERAL-purpose timer (G3): the cold-path duty setter
 /// ([`pwm::PwmOut`]) that fades an LED / drives a buzzer tone. Refuses the advanced timers, never
 /// touches the MOE/POEN gate; implements the embedded-hal 1.0 `pwm::SetDutyCycle` trait.
