@@ -392,26 +392,45 @@ fn split_dma_consumes_the_idle_latch_invisibly() {
 }
 
 #[test]
-fn split_dma_absorbs_the_disabling_errie_overrun_once() {
-    // The D3 limitation, pinned: a hardware line error under DMA (the ERRIE fail-loud path)
-    // disables the channel; the adapter absorbs the one surfaced error (counter ticks), then
-    // reads return 0 (quiescent) until the owner re-arms. No silent auto-restart.
+fn split_dma_absorbs_a_line_error_and_keeps_reading() {
+    // The always-on-link self-heal (silicon 2026-07-17) THROUGH the adapter: a hardware line error
+    // under DMA (the ERRIE path) no longer disables the channel. The adapter absorbs the one surfaced
+    // RingOverrun (counter ticks - the recovered-line-error observable), the channel stays LIVE, and
+    // later bytes still flow, with no re-arm.
     let _g = setup();
-    let (mut s, ch, _ptr) = split_ring(8);
+    let (mut s, ch, ptr) = split_ring(8);
 
+    // 3 bytes were mid-stream when the glitch hit; the resync drops them.
+    dma_write(ptr, 0, 0xAA);
+    dma_write(ptr, 1, 0xBB);
+    dma_write(ptr, 2, 0xCC);
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 3);
     set_stat(STAT_ORERR); // the shared ISR records the line error for the DMA path
     fire_usart();
-    let mut out = [0u8; 4];
-    assert_eq!(s.read(&mut out), Ok(0));
-    assert_eq!(s.line_errors(), 1, "the disabling overrun counted once");
+
+    let mut out = [0u8; 8];
+    assert_eq!(
+        s.read(&mut out),
+        Ok(0),
+        "line error absorbed; the 3 disturbed bytes dropped by the resync"
+    );
+    assert_eq!(s.line_errors(), 1, "the recovered line error counted once");
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
-        0,
-        "channel disabled (fail-loud), not restarted"
+        CHEN,
+        "channel stays LIVE (self-heal), not disabled"
     );
-    set_stat(0);
-    assert_eq!(s.read(&mut out), Ok(0), "quiescent afterwards");
-    assert_eq!(s.line_errors(), 1, "no further counting");
+
+    // The channel stayed live: a fresh byte past the resync point (index 3) still arrives.
+    dma_write(ptr, 3, 0xEE);
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 4);
+    assert_eq!(s.read(&mut out), Ok(1));
+    assert_eq!(out[0], 0xEE);
+    assert_eq!(
+        s.line_errors(),
+        1,
+        "no further counting once the line is clean"
+    );
 }
 
 #[test]

@@ -781,68 +781,78 @@ fn b11_self_check_failure_arms_nothing() {
     );
 }
 
-// --- B12: line error stops reception; a fresh new re-arms (no auto-restart) -------------------
+// --- B12: a line error self-heals in place (channel stays LIVE, no re-`new`) -------------------
+//
+// The always-on-framed-link fix (silicon 2026-07-17): a transient line disturbance (a peer
+// rebooting / a cable connecting / the peer re-initialising its USART) must NOT strand the DMA RX.
+// A staged FERR fires the shared ISR (which clears the hardware flag); the next `read` resyncs the
+// cursor to the live write position, leaves the channel LIVE, and surfaces the recoverable
+// `RingOverrun` (mirroring the b9 lap-overrun path). A subsequent read then drains fresh bytes with
+// no re-`new`. Previously this DISABLED the channel and required a fresh `new`, which stranded the
+// inter-board link on the first peer-reboot glitch until a full reset.
 
 #[test]
-fn b12_line_error_stops_reception_and_re_new_rearms() {
+fn b12_line_error_self_heals_channel_stays_live() {
     let fam = f10x();
     let _g = setup();
-    let (mut rx, ch, _ptr) = install_ring(&fam, 32);
+    let (mut rx, ch, ptr) = install_ring(&fam, 32);
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
         CHEN,
         "armed at start"
     );
 
-    // A USART line error (ERRIE path) during background reception: stage FERR and fire the shared
-    // USART ISR, which records the sticky line error.
+    // Stage a FRAMING line error and fire the shared USART ISR (records the sticky, clears the flag).
     Reg32::new(USART_BASE, fam.stat).write(FERR);
     fire(&fam);
 
-    // read surfaces the error AND stops background reception (CHEN cleared) - fail-loud, no restart.
-    let mut out = [0u8; 8];
+    // The DMA had written 6 bytes into the buffer (write index 6) when the glitch hit.
+    for (i, &b) in [1u8, 2, 3, 4, 5, 6].iter().enumerate() {
+        dma_write(ptr, i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(32 - 6);
+
+    // read surfaces the recoverable RingOverrun, resyncs the cursor to the live write position
+    // (dropping the disturbed bytes), and leaves the channel LIVE (CHEN still set): NO disable.
+    let mut out = [0u8; 16];
     assert_eq!(
         rx.read(&mut out),
-        Err(UsartError::Framing),
-        "line error surfaced"
+        Err(UsartError::RingOverrun),
+        "a line error is the in-place-recoverable RingOverrun, not a disabling error"
     );
-    assert_eq!(
-        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
-        0,
-        "reception stopped (channel disabled), no silent auto-restart"
-    );
-
-    // A fresh `new` re-arms: CHEN set again, and DENR/IDLEIE/ERRIE re-enabled.
-    let chip = chip_for(&fam);
-    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
-    let buf2: &'static mut [u8] = vec![0u8; 32].leak();
-    let _rx2 = RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart1, buf2).unwrap();
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
         CHEN,
-        "re-armed: CHEN set"
+        "the channel stays LIVE (self-heal, no disable, no re-`new`)"
+    );
+
+    // The cursor resynced to the live write position (6): fresh bytes past it drain on the next read,
+    // and the disturbed bytes are NOT replayed.
+    for (i, &b) in [7u8, 8].iter().enumerate() {
+        dma_write(ptr, 6 + i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(32 - 8);
+    let n = rx.read(&mut out).unwrap();
+    assert_eq!(
+        n, 2,
+        "cursor resynced to the live position; only the fresh bytes drain"
     );
     assert_eq!(
-        Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_DENR,
-        CTL2_DENR,
-        "DENR re-enabled"
-    );
-    assert_eq!(
-        Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_ERRIE,
-        CTL2_ERRIE,
-        "ERRIE re-enabled"
-    );
-    assert_eq!(
-        Reg32::new(USART_BASE, fam.ctl0).read() & CTL0_IDLEIE,
-        CTL0_IDLEIE,
-        "IDLEIE re-enabled"
+        &out[..2],
+        &[7, 8],
+        "the disturbed bytes were dropped, not replayed"
     );
 }
 
-// --- B12b: an ERRIE *overrun* line error returns the DISABLING `Overrun`, distinct from a lap ----
+// --- B12b: an ERRIE *overrun* line error also self-heals (no longer channel-disabling) ----------
+//
+// Previously an ERRIE overrun DISABLED the channel while a lap was recoverable-in-place; that split
+// stranded an always-on link on the first overrun. Now BOTH map to the in-place `RingOverrun` with
+// the channel left LIVE (the disabling behaviour is gone; a persistent bad line is the protocol
+// layer's `comms_loss`, not a dead peripheral).
 
 #[test]
-fn b12b_errie_overrun_disables_channel_and_is_overrun_not_ring_overrun() {
+fn b12b_errie_overrun_self_heals_channel_stays_live() {
     let fam = f10x();
     let _g = setup();
     let (mut rx, ch, _ptr) = install_ring(&fam, 32);
@@ -852,23 +862,21 @@ fn b12b_errie_overrun_disables_channel_and_is_overrun_not_ring_overrun() {
         "armed at start"
     );
 
-    // A USART ORERR (overrun) line error on the ERRIE path: the shared ISR records it sticky. Unlike
-    // the b9 lap-overrun, this is a HARDWARE overrun that the read path treats as channel-disabling.
+    // A USART ORERR (overrun) line error on the ERRIE path: the shared ISR records it sticky.
     Reg32::new(USART_BASE, fam.stat).write(ORERR);
     fire(&fam);
 
     let mut out = [0u8; 8];
-    // It surfaces as the channel-disabling `Overrun` (NOT `RingOverrun`): the two overrun conditions
-    // map to distinct values so the caller re-arms here but recovers in place after a lap.
+    // It surfaces as the in-place-recoverable `RingOverrun`, exactly like a framing glitch and a lap.
     assert_eq!(
         rx.read(&mut out),
-        Err(UsartError::Overrun),
-        "an ERRIE overrun is the disabling `Overrun`, not the in-place `RingOverrun`"
+        Err(UsartError::RingOverrun),
+        "an ERRIE overrun now self-heals as the in-place RingOverrun, not the disabling Overrun"
     );
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
-        0,
-        "the ERRIE overrun disabled the channel (caller must re-arm)"
+        CHEN,
+        "the channel stays LIVE (no disable)"
     );
 }
 

@@ -798,25 +798,34 @@ impl RingBufferedRx {
     /// Drain bytes that have arrived since the last read (between the cursor and the live DMA write
     /// position `len - CHxCNT`), into `buf`; returns the count, 0 if none (non-blocking).
     ///
-    /// Fail-loud surfaces, each clearing its condition. The two are DISTINCT error values so the
-    /// caller can tell the channel-dead case from the keep-going case (a conflated single value is a
-    /// trap: it makes an in-place-recoverable lap indistinguishable from a disabled channel):
-    /// - A USART line error (the `ERRIE` path, recorded by the shared ISR: overrun / framing / parity)
-    ///   returns its mapped [`UsartError`] (`Overrun` / `Framing` / `Parity`) and **stops background
-    ///   reception** (disables the channel); the caller must `new` again to resume (section 5.4, no
-    ///   silent auto-restart).
-    /// - A lapped cursor (the DMA wrote more than `len` bytes ahead of the cursor: bytes were
-    ///   overwritten before being read) returns [`UsartError::RingOverrun`] and resyncs the cursor to
-    ///   the freshest position, **leaving the channel live** so subsequent reads continue (section
-    ///   5.2). Recoverable in place: the caller drops the lost bytes and keeps reading, it does NOT
-    ///   re-arm.
+    /// Both loss conditions are **recoverable in place** and surfaced as [`UsartError::RingOverrun`]:
+    /// `read` resyncs the cursor to the freshest data and the DMA channel stays LIVE, so the caller
+    /// drops the lost bytes and keeps reading (it does NOT re-arm). This is the self-heal default an
+    /// always-on framed link needs (section 5.4): a transient line disturbance must not strand the
+    /// receiver.
+    /// - A **USART line error** (the `ERRIE` path, recorded by the shared ISR: overrun / framing /
+    ///   noise) is a transient glitch on an always-on link (a peer rebooting, a cable connecting, the
+    ///   peer re-initialising its USART, all of which momentarily disturb the line). The shared ISR
+    ///   already cleared the hardware flag; `read` drops the disturbed bytes by resyncing the cursor
+    ///   to the live write position and leaves the channel running, so the
+    ///   [`crate::serial::SplitSerial`]/`StreamFramer` above resyncs on the next frame boundary and
+    ///   the link self-heals with no reset. A PERSISTENT bad line is a protocol-layer concern (it
+    ///   shows up upstream as the link's `comms_loss`), NOT a disabled peripheral.
+    /// - A **lapped cursor** (the DMA wrote more than `len` bytes ahead of the cursor: bytes were
+    ///   overwritten before being read) likewise resyncs to the freshest position and leaves the
+    ///   channel live (section 5.2).
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
-        // Line error first (fail-loud): stop reception and surface; caller re-`new`s. Reads THIS
-        // instance's shared RX slot (the module's IDLE/error path is independent of USART1's).
-        let code = self.slot.line_error.swap(ERR_NONE, Ordering::AcqRel);
-        if code != ERR_NONE {
-            self.map.disable();
-            return Err(decode_error(code));
+        // Line error (the ERRIE path): SELF-HEAL in place, do NOT disable the channel. The shared ISR
+        // already cleared the hardware flag; drop the disturbed bytes by resyncing the cursor to the
+        // live DMA write position and keep the channel running, exactly as the lap-overrun path below.
+        // A transient line glitch (a peer rebooting / a cable connecting) must not strand an always-on
+        // link; a persistent bad line surfaces upstream as `comms_loss`, never a dead peripheral.
+        // Reads THIS instance's shared RX slot (the module's IDLE/error path is independent of USART1's).
+        if self.slot.line_error.swap(ERR_NONE, Ordering::AcqRel) != ERR_NONE {
+            let (wraps, rem) = self.snapshot();
+            let write_total = wraps as u64 * self.len as u64 + (self.len as u64 - rem as u64);
+            self.cursor = write_total; // drop the disturbed bytes; resume from the live position
+            return Err(UsartError::RingOverrun);
         }
 
         let (wraps, rem) = self.snapshot();

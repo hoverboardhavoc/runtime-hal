@@ -67,20 +67,20 @@ pub enum DetectError {
 pub enum UsartError {
     /// Receive overrun (a byte arrived before the previous one was read).
     ///
-    /// On the DMA-ring path ([`crate::usart_rx::RingBufferedRx::read`]) this is the
-    /// **channel-disabling** overrun: a USART/ERRIE overrun the shared ISR recorded, which the read
-    /// path surfaces AFTER disabling the DMA channel (no silent auto-restart). The caller must re-arm
-    /// (`new` again) to resume reception. This is DISTINCT from [`RingOverrun`](Self::RingOverrun),
-    /// the in-place-recoverable lap-overrun. (On the interrupt path
-    /// [`crate::usart_rx::BufferedRx::read`] it is the recoverable ring-full overflow.)
+    /// On the interrupt path ([`crate::usart_rx::BufferedRx::read`]) this is the recoverable
+    /// ring-full overflow (a byte was dropped; the next read resumes). The DMA-ring path
+    /// ([`crate::usart_rx::RingBufferedRx::read`]) no longer raises `Overrun`: an `ERRIE` line error
+    /// there self-heals in place and surfaces as [`RingOverrun`](Self::RingOverrun) with the channel
+    /// left LIVE (see that variant), so a transient line disturbance never disables the peripheral.
     Overrun,
-    /// DMA-ring lap-overrun: the circular DMA write head passed the read cursor by more than a full
-    /// buffer, so some unread bytes were overwritten before [`crate::usart_rx::RingBufferedRx::read`]
-    /// drained them. **Recoverable in place**: `read` has already resynced the cursor to the freshest
-    /// data and the DMA channel stays live, so the caller may keep reading (the lost bytes are gone,
-    /// but reception continues). This is the non-silent signal that data was dropped; it is reported
-    /// separately from [`Overrun`](Self::Overrun) so a caller can tell "keep going, you lost some" from
-    /// "the channel is dead, re-arm". Only the DMA-ring `read` raises it.
+    /// DMA-ring recoverable loss ([`crate::usart_rx::RingBufferedRx::read`]): EITHER the circular DMA
+    /// write head passed the read cursor by more than a full buffer (a lap: unread bytes were
+    /// overwritten) OR a USART line error (`ERRIE`: overrun / framing / noise) disturbed the stream.
+    /// **Recoverable in place**: `read` has already resynced the cursor to the freshest data and the
+    /// DMA channel stays LIVE, so the caller drops the lost bytes and keeps reading (reception
+    /// continues, no re-arm). This is the non-silent signal that data was dropped; a persistent bad
+    /// line is left for the protocol layer to notice (its `comms_loss`), the receiver is never
+    /// disabled. Only the DMA-ring `read` raises it.
     RingOverrun,
     /// Framing error (stop bit not seen / line noise broke the frame).
     Framing,
