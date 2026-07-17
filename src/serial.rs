@@ -250,10 +250,11 @@ impl<R: RxBackend> SplitSerial<R> {
     }
 
     /// Diagnostic: conditions absorbed by `read` so far (ring lap, ring overflow, line errors),
-    /// saturating. A channel-DISABLING hardware overrun (the ERRIE fail-loud path) also lands here
-    /// once, after which reads return 0 until the owner re-arms via [`Self::into_parts`]
-    /// (`specs/serial-adapters.md` D3: no silent auto-restart). Outside the `embedded-io` traits by
-    /// design.
+    /// saturating. An ERRIE hardware line error (overrun / framing / noise) under DMA also lands here
+    /// once, surfaced as an absorbed [`RingOverrun`](crate::error::UsartError::RingOverrun) with the
+    /// channel left LIVE: reads resume with no re-arm (the backend self-heals in place by resyncing
+    /// its cursor). A persistent bad line is left for the protocol layer to notice as `comms_loss`,
+    /// not a disabled peripheral. Outside the `embedded-io` traits by design.
     #[inline]
     pub fn line_errors(&self) -> u16 {
         self.line_errors
