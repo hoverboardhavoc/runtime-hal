@@ -275,6 +275,7 @@ fn usart_error_kind_is_other() {
     // Infallible: the receivers' fail-loud reads still carry UsartError for non-adapter callers.
     assert_eq!(UsartError::Overrun.kind(), ErrorKind::Other);
     assert_eq!(UsartError::RingOverrun.kind(), ErrorKind::Other);
+    assert_eq!(UsartError::LineError.kind(), ErrorKind::Other);
     assert_eq!(UsartError::Framing.kind(), ErrorKind::Other);
     assert_eq!(UsartError::Parity.kind(), ErrorKind::Other);
 }

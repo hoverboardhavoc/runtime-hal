@@ -848,9 +848,10 @@ fn b12_line_error_self_heals_channel_stays_live() {
 // --- B12b: an ERRIE *overrun* line error also self-heals (no longer channel-disabling) ----------
 //
 // Previously an ERRIE overrun DISABLED the channel while a lap was recoverable-in-place; that split
-// stranded an always-on link on the first overrun. Now BOTH map to the in-place `RingOverrun` with
-// the channel left LIVE (the disabling behaviour is gone; a persistent bad line is the protocol
-// layer's `comms_loss`, not a dead peripheral).
+// stranded an always-on link on the first overrun. Now an ERRIE overrun self-heals in place with the
+// channel left LIVE, surfaced as the `LineError` variant (a wire disturbance), DISTINCT from a lap's
+// `RingOverrun` (a slow-consumer loss) per the OQ1 split. The disabling behaviour is gone; a
+// persistent bad line is the protocol layer's `comms_loss`, not a dead peripheral.
 
 #[test]
 fn b12b_errie_overrun_self_heals_channel_stays_live() {
