@@ -99,7 +99,9 @@ impl PolledSerial {
 
     /// Diagnostic: line errors (framing / parity) absorbed by `read` so far, saturating. Overrun
     /// recovery happens inside [`Usart::try_read_byte`] and never surfaces at all (it is not
-    /// separately countable here). Outside the `embedded-io` traits by design
+    /// separately countable here). Unlike [`SplitSerial`] this needs no line-error / lap split (the
+    /// OQ1 split): the polled path has no DMA ring, so there is no lap/buffer-overrun cause to conflate;
+    /// this counter is already purely line errors. Outside the `embedded-io` traits by design
     /// (`specs/serial-adapters.md` D3).
     #[inline]
     pub fn line_errors(&self) -> u16 {
@@ -227,6 +229,7 @@ pub struct SplitSerial<R: RxBackend> {
     tx: UsartTx,
     rx: R,
     line_errors: u16,
+    lap_overruns: u16,
 }
 
 impl<R: RxBackend> SplitSerial<R> {
@@ -239,6 +242,7 @@ impl<R: RxBackend> SplitSerial<R> {
             tx,
             rx,
             line_errors: 0,
+            lap_overruns: 0,
         }
     }
 
@@ -249,15 +253,29 @@ impl<R: RxBackend> SplitSerial<R> {
         (self.tx, self.rx)
     }
 
-    /// Diagnostic: conditions absorbed by `read` so far (ring lap, ring overflow, line errors),
-    /// saturating. An ERRIE hardware line error (overrun / framing / noise) under DMA also lands here
-    /// once, surfaced as an absorbed [`RingOverrun`](crate::error::UsartError::RingOverrun) with the
-    /// channel left LIVE: reads resume with no re-arm (the backend self-heals in place by resyncing
-    /// its cursor). A persistent bad line is left for the protocol layer to notice as `comms_loss`,
-    /// not a disabled peripheral. Outside the `embedded-io` traits by design.
+    /// Diagnostic: **line-level disturbances** absorbed by `read` so far, saturating: a DMA-ring
+    /// [`LineError`](crate::error::UsartError::LineError) (a USART `ERRIE` overrun / framing / noise
+    /// glitch, i.e. a wire disturbance) or a `BufferedRx` framing / parity error. Each is absorbed once
+    /// with the channel left LIVE and reads resume with no re-arm (the backend self-heals in place). A
+    /// persistent bad line is left for the protocol layer to notice as `comms_loss`, not a disabled
+    /// peripheral. Counted SEPARATELY from [`lap_overruns`](Self::lap_overruns) so a consumer can tell
+    /// a wire glitch from a slow-consumer loss (they were conflated before). Outside the `embedded-io`
+    /// traits by design.
     #[inline]
     pub fn line_errors(&self) -> u16 {
         self.line_errors
+    }
+
+    /// Diagnostic: **buffer-overrun losses** absorbed by `read` so far, saturating: a DMA-ring
+    /// [`RingOverrun`](crate::error::UsartError::RingOverrun) (the circular DMA lapped the read cursor)
+    /// or a `BufferedRx` ring-full [`Overrun`](crate::error::UsartError::Overrun). Both mean the
+    /// consumer fell behind and bytes were dropped; each is absorbed with reception continuing (no
+    /// re-arm). Counted SEPARATELY from [`line_errors`](Self::line_errors) (a wire disturbance) so
+    /// "the consumer is too slow" is distinguishable from "the line glitched". Outside the
+    /// `embedded-io` traits by design.
+    #[inline]
+    pub fn lap_overruns(&self) -> u16 {
+        self.lap_overruns
     }
 }
 
@@ -267,8 +285,9 @@ impl<R: RxBackend> ErrorType for SplitSerial<R> {
 
 impl<R: RxBackend> Read for SplitSerial<R> {
     /// Non-blocking: drain what the backend has; `Ok(0)` when nothing is available. The IDLE latch
-    /// is consumed (dropped) here so it can never leak to a consumer; an absorbed condition (lap /
-    /// overflow / line error) ticks the counter and the drain is retried, so a single `read` still
+    /// is consumed (dropped) here so it can never leak to a consumer; an absorbed condition ticks the
+    /// matching counter (a wire disturbance -> [`line_errors`](Self::line_errors), a buffer-overrun
+    /// loss -> [`lap_overruns`](Self::lap_overruns)) and the drain is retried, so a single `read` still
     /// returns post-recovery bytes where the backend has them.
     fn read(&mut self, out: &mut [u8]) -> Result<usize, Self::Error> {
         // The adapter owns the IDLE latch: consume it unconditionally (framing belongs to the
@@ -276,10 +295,17 @@ impl<R: RxBackend> Read for SplitSerial<R> {
         let _ = self.rx.rx_take_idle();
 
         // Each surfaced condition is consume-on-read (the backend clears it as it returns Err), so
-        // this loop is finite in practice; bound it anyway so a misbehaving state cannot spin.
+        // this loop is finite in practice; bound it anyway so a misbehaving state cannot spin. Classify
+        // by the returned variant so the two recoverable causes are counted apart (the OQ1 split): a
+        // slow-consumer buffer-overrun loss vs a wire/line disturbance.
         for _ in 0..4 {
             match self.rx.rx_read(out) {
                 Ok(n) => return Ok(n),
+                // Buffer-overrun losses (the consumer fell behind): a DMA lap or a BufferedRx ring-full.
+                Err(UsartError::RingOverrun) | Err(UsartError::Overrun) => {
+                    self.lap_overruns = self.lap_overruns.saturating_add(1);
+                }
+                // Wire/line disturbances: a DMA LineError or a BufferedRx framing/parity error.
                 Err(_) => {
                     self.line_errors = self.line_errors.saturating_add(1);
                 }

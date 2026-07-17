@@ -663,9 +663,9 @@ fn b9_lap_past_cursor_is_ring_overrun() {
     Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 1);
 
     let mut out = [0u8; 16];
-    // The lap is a non-silent loss signal, but RECOVERABLE in place: it is `RingOverrun`, NOT the
-    // channel-disabling `Overrun` the ERRIE path raises (b12b). The channel must stay live so the very
-    // next read keeps draining.
+    // The lap is a non-silent loss signal, RECOVERABLE in place: it is `RingOverrun`, DISTINCT from the
+    // ERRIE path's `LineError` (b12/b12b) so the two recoverable causes classify apart (OQ1). The
+    // channel must stay live so the very next read keeps draining.
     assert_eq!(
         rx.read(&mut out),
         Err(UsartError::RingOverrun),
@@ -812,13 +812,14 @@ fn b12_line_error_self_heals_channel_stays_live() {
     }
     Reg32::new(DMA0_BASE, ch_cnt(ch)).write(32 - 6);
 
-    // read surfaces the recoverable RingOverrun, resyncs the cursor to the live write position
-    // (dropping the disturbed bytes), and leaves the channel LIVE (CHEN still set): NO disable.
+    // read surfaces the recoverable LineError (the ERRIE cause, DISTINCT from a lap's RingOverrun),
+    // resyncs the cursor to the live write position (dropping the disturbed bytes), and leaves the
+    // channel LIVE (CHEN still set): NO disable.
     let mut out = [0u8; 16];
     assert_eq!(
         rx.read(&mut out),
-        Err(UsartError::RingOverrun),
-        "a line error is the in-place-recoverable RingOverrun, not a disabling error"
+        Err(UsartError::LineError),
+        "a line error is the in-place-recoverable LineError (its own variant), not a disabling error"
     );
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
@@ -867,11 +868,12 @@ fn b12b_errie_overrun_self_heals_channel_stays_live() {
     fire(&fam);
 
     let mut out = [0u8; 8];
-    // It surfaces as the in-place-recoverable `RingOverrun`, exactly like a framing glitch and a lap.
+    // It surfaces as the in-place-recoverable `LineError` (a wire disturbance), exactly like a framing
+    // glitch: the ERRIE cause is DISTINCT from a lap's `RingOverrun`, and it never disables the channel.
     assert_eq!(
         rx.read(&mut out),
-        Err(UsartError::RingOverrun),
-        "an ERRIE overrun now self-heals as the in-place RingOverrun, not the disabling Overrun"
+        Err(UsartError::LineError),
+        "an ERRIE overrun now self-heals as the in-place LineError, not the disabling Overrun"
     );
     assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,

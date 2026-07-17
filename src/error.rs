@@ -69,19 +69,28 @@ pub enum UsartError {
     ///
     /// On the interrupt path ([`crate::usart_rx::BufferedRx::read`]) this is the recoverable
     /// ring-full overflow (a byte was dropped; the next read resumes). The DMA-ring path
-    /// ([`crate::usart_rx::RingBufferedRx::read`]) no longer raises `Overrun`: an `ERRIE` line error
-    /// there self-heals in place and surfaces as [`RingOverrun`](Self::RingOverrun) with the channel
-    /// left LIVE (see that variant), so a transient line disturbance never disables the peripheral.
+    /// ([`crate::usart_rx::RingBufferedRx::read`]) never raises `Overrun`: a line disturbance there is
+    /// [`LineError`](Self::LineError) and a lapped cursor is [`RingOverrun`](Self::RingOverrun), both
+    /// recoverable in place with the channel left LIVE, so a transient disturbance never disables the
+    /// peripheral.
     Overrun,
-    /// DMA-ring recoverable loss ([`crate::usart_rx::RingBufferedRx::read`]): EITHER the circular DMA
-    /// write head passed the read cursor by more than a full buffer (a lap: unread bytes were
-    /// overwritten) OR a USART line error (`ERRIE`: overrun / framing / noise) disturbed the stream.
-    /// **Recoverable in place**: `read` has already resynced the cursor to the freshest data and the
-    /// DMA channel stays LIVE, so the caller drops the lost bytes and keeps reading (reception
-    /// continues, no re-arm). This is the non-silent signal that data was dropped; a persistent bad
-    /// line is left for the protocol layer to notice (its `comms_loss`), the receiver is never
-    /// disabled. Only the DMA-ring `read` raises it.
+    /// DMA-ring **lap-overrun** ([`crate::usart_rx::RingBufferedRx::read`]): the circular DMA write
+    /// head passed the read cursor by more than a full buffer, so unread bytes were overwritten (the
+    /// consumer fell behind). **Recoverable in place**: `read` has already resynced the cursor to the
+    /// freshest data and the DMA channel stays LIVE, so the caller drops the lost bytes and keeps
+    /// reading (no re-arm). DISTINCT from [`LineError`](Self::LineError) (a wire/line disturbance) so a
+    /// diagnostic can tell a slow-consumer loss from a line glitch; both are non-silent and
+    /// channel-live. Only the DMA-ring `read` raises it.
     RingOverrun,
+    /// DMA-ring **line error** ([`crate::usart_rx::RingBufferedRx::read`]): a USART `ERRIE` disturbance
+    /// (overrun / framing / noise) the shared ISR recorded, i.e. a transient glitch on the wire (a peer
+    /// rebooting, a cable connecting, the peer re-initialising its USART). **Recoverable in place**:
+    /// the ISR already cleared the hardware flag and `read` resyncs the cursor to the live write
+    /// position with the DMA channel left LIVE, so the link self-heals with no reset (the `StreamFramer`
+    /// above resyncs on the next frame boundary). A PERSISTENT bad line is a protocol-layer concern
+    /// (its `comms_loss`), never a disabled peripheral. DISTINCT from [`RingOverrun`](Self::RingOverrun)
+    /// (a lap: the consumer fell behind) purely for classification; only the DMA-ring `read` raises it.
+    LineError,
     /// Framing error (stop bit not seen / line noise broke the frame).
     Framing,
     /// Parity error.
@@ -97,6 +106,7 @@ impl embedded_io::Error for UsartError {
         match self {
             UsartError::Overrun
             | UsartError::RingOverrun
+            | UsartError::LineError
             | UsartError::Framing
             | UsartError::Parity
             | UsartError::Other => embedded_io::ErrorKind::Other,

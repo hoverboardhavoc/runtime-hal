@@ -310,6 +310,7 @@ fn split_dma_reads_staged_bytes_across_the_wrap() {
     assert_eq!(s.read(&mut out), Ok(4));
     assert_eq!(&out[..4], &[16, 17, 20, 21]);
     assert_eq!(s.line_errors(), 0);
+    assert_eq!(s.lap_overruns(), 0);
 }
 
 #[test]
@@ -348,12 +349,14 @@ fn split_dma_ready_is_nonconsuming_and_sees_the_pending_wrap() {
     );
     assert_eq!(&out[..7], &[50, 51, 52, 53, 54, 55, 56]);
     assert_eq!(s.line_errors(), 0, "B13 must not count as a condition");
+    assert_eq!(s.lap_overruns(), 0, "B13 is not a lap either");
 }
 
 #[test]
 fn split_dma_absorbs_a_lap_and_keeps_reading() {
     // B9 THROUGH the adapter: a genuine lap (data overwritten) is absorbed - the counter ticks,
-    // Err never escapes, and the same read call returns post-resync state; later bytes flow.
+    // Err never escapes, and the same read call returns post-resync state; later bytes flow. The OQ1
+    // split: a lap counts `lap_overruns` (a slow-consumer loss), NOT `line_errors` (a wire glitch).
     let _g = setup();
     let (mut s, ch, ptr) = split_ring(8);
 
@@ -366,7 +369,12 @@ fn split_dma_absorbs_a_lap_and_keeps_reading() {
 
     let mut out = [0u8; 16];
     assert_eq!(s.read(&mut out), Ok(0), "lap absorbed; cursor resynced");
-    assert_eq!(s.line_errors(), 1, "the lap counted once");
+    assert_eq!(s.lap_overruns(), 1, "the lap counted once as a lap-overrun");
+    assert_eq!(
+        s.line_errors(),
+        0,
+        "a lap is NOT a line error (the OQ1 split)"
+    );
 
     // The channel stayed live: new bytes past the resync point still arrive.
     dma_write(ptr, 1, 0xEE);
@@ -395,8 +403,9 @@ fn split_dma_consumes_the_idle_latch_invisibly() {
 fn split_dma_absorbs_a_line_error_and_keeps_reading() {
     // The always-on-link self-heal (silicon 2026-07-17) THROUGH the adapter: a hardware line error
     // under DMA (the ERRIE path) no longer disables the channel. The adapter absorbs the one surfaced
-    // RingOverrun (counter ticks - the recovered-line-error observable), the channel stays LIVE, and
-    // later bytes still flow, with no re-arm.
+    // LineError (counter ticks - the recovered-line-error observable), the channel stays LIVE, and
+    // later bytes still flow, with no re-arm. The OQ1 split: a line error counts `line_errors` (a wire
+    // glitch), NOT `lap_overruns` (a slow-consumer loss).
     let _g = setup();
     let (mut s, ch, ptr) = split_ring(8);
 
@@ -416,6 +425,11 @@ fn split_dma_absorbs_a_line_error_and_keeps_reading() {
     );
     assert_eq!(s.line_errors(), 1, "the recovered line error counted once");
     assert_eq!(
+        s.lap_overruns(),
+        0,
+        "a line error is NOT a lap-overrun (the OQ1 split)"
+    );
+    assert_eq!(
         Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
         CHEN,
         "channel stays LIVE (self-heal), not disabled"
@@ -431,6 +445,7 @@ fn split_dma_absorbs_a_line_error_and_keeps_reading() {
         1,
         "no further counting once the line is clean"
     );
+    assert_eq!(s.lap_overruns(), 0, "still no lap");
 }
 
 #[test]
@@ -502,7 +517,8 @@ fn split_buffered_reads_isr_staged_bytes() {
 fn split_buffered_absorbs_ring_overflow_and_continues() {
     // Ring capacity word 4 = 3 usable slots; a 4th ISR byte overflows -> sticky Overrun. The
     // adapter absorbs it (counter), the buffered bytes still arrive, and ReadReady saw the pending
-    // condition as progress.
+    // condition as progress. The OQ1 split: a ring-full overflow is a buffer-overrun loss (the
+    // consumer fell behind), so it counts `lap_overruns`, NOT `line_errors`.
     let _g = setup();
     let mut s = split_buffered::<4>();
 
@@ -515,7 +531,16 @@ fn split_buffered_absorbs_ring_overflow_and_continues() {
     // First read surfaces-and-absorbs the overflow, then (same call, retried drain) the 3 bytes.
     assert_eq!(s.read(&mut out), Ok(3));
     assert_eq!(&out[..3], &[1, 2, 3]);
-    assert_eq!(s.line_errors(), 1, "the overflow counted once");
+    assert_eq!(
+        s.lap_overruns(),
+        1,
+        "the ring-full overflow counted once as a lap-overrun"
+    );
+    assert_eq!(
+        s.line_errors(),
+        0,
+        "a buffer overflow is NOT a line error (the OQ1 split)"
+    );
 }
 
 #[test]

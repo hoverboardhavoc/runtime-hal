@@ -798,34 +798,34 @@ impl RingBufferedRx {
     /// Drain bytes that have arrived since the last read (between the cursor and the live DMA write
     /// position `len - CHxCNT`), into `buf`; returns the count, 0 if none (non-blocking).
     ///
-    /// Both loss conditions are **recoverable in place** and surfaced as [`UsartError::RingOverrun`]:
-    /// `read` resyncs the cursor to the freshest data and the DMA channel stays LIVE, so the caller
-    /// drops the lost bytes and keeps reading (it does NOT re-arm). This is the self-heal default an
-    /// always-on framed link needs (section 5.4): a transient line disturbance must not strand the
-    /// receiver.
-    /// - A **USART line error** (the `ERRIE` path, recorded by the shared ISR: overrun / framing /
-    ///   noise) is a transient glitch on an always-on link (a peer rebooting, a cable connecting, the
-    ///   peer re-initialising its USART, all of which momentarily disturb the line). The shared ISR
-    ///   already cleared the hardware flag; `read` drops the disturbed bytes by resyncing the cursor
-    ///   to the live write position and leaves the channel running, so the
-    ///   [`crate::serial::SplitSerial`]/`StreamFramer` above resyncs on the next frame boundary and
-    ///   the link self-heals with no reset. A PERSISTENT bad line is a protocol-layer concern (it
-    ///   shows up upstream as the link's `comms_loss`), NOT a disabled peripheral.
-    /// - A **lapped cursor** (the DMA wrote more than `len` bytes ahead of the cursor: bytes were
-    ///   overwritten before being read) likewise resyncs to the freshest position and leaves the
-    ///   channel live (section 5.2).
+    /// Both loss conditions are **recoverable in place** with the DMA channel left LIVE (the caller
+    /// drops the lost bytes and keeps reading, it does NOT re-arm), but they are DISTINCT error values
+    /// so a diagnostic can classify them (section 5.4, the self-heal default an always-on framed link
+    /// needs: a transient line disturbance must not strand the receiver):
+    /// - A **USART line error** ([`UsartError::LineError`], the `ERRIE` path recorded by the shared
+    ///   ISR: overrun / framing / noise) is a transient wire glitch on an always-on link (a peer
+    ///   rebooting, a cable connecting, the peer re-initialising its USART, all of which momentarily
+    ///   disturb the line). The shared ISR already cleared the hardware flag; `read` drops the
+    ///   disturbed bytes by resyncing the cursor to the live write position and leaves the channel
+    ///   running, so the [`crate::serial::SplitSerial`]/`StreamFramer` above resyncs on the next frame
+    ///   boundary and the link self-heals with no reset. A PERSISTENT bad line is a protocol-layer
+    ///   concern (it shows up upstream as the link's `comms_loss`), NOT a disabled peripheral.
+    /// - A **lapped cursor** ([`UsartError::RingOverrun`], the DMA wrote more than `len` bytes ahead of
+    ///   the cursor: the consumer fell behind and unread bytes were overwritten) likewise resyncs to
+    ///   the freshest position and leaves the channel live (section 5.2).
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
         // Line error (the ERRIE path): SELF-HEAL in place, do NOT disable the channel. The shared ISR
         // already cleared the hardware flag; drop the disturbed bytes by resyncing the cursor to the
         // live DMA write position and keep the channel running, exactly as the lap-overrun path below.
-        // A transient line glitch (a peer rebooting / a cable connecting) must not strand an always-on
-        // link; a persistent bad line surfaces upstream as `comms_loss`, never a dead peripheral.
-        // Reads THIS instance's shared RX slot (the module's IDLE/error path is independent of USART1's).
+        // Returns the DISTINCT `LineError` (not `RingOverrun`) so a diagnostic can tell a wire glitch
+        // from a slow-consumer lap. A transient line glitch (a peer rebooting / a cable connecting)
+        // must not strand an always-on link; a persistent bad line surfaces upstream as `comms_loss`,
+        // never a dead peripheral. Reads THIS instance's shared RX slot (independent of the module's).
         if self.slot.line_error.swap(ERR_NONE, Ordering::AcqRel) != ERR_NONE {
             let (wraps, rem) = self.snapshot();
             let write_total = wraps as u64 * self.len as u64 + (self.len as u64 - rem as u64);
             self.cursor = write_total; // drop the disturbed bytes; resume from the live position
-            return Err(UsartError::RingOverrun);
+            return Err(UsartError::LineError);
         }
 
         let (wraps, rem) = self.snapshot();
