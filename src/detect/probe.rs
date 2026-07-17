@@ -32,14 +32,16 @@
 //!   learns the access faulted).
 //! - **The PC fixup (the risk).** On a faulted access the handler MUST advance the stacked return PC
 //!   past the faulting load so execution resumes AFTER the probe access instead of re-executing it
-//!   (which would re-fault forever). The probe emits the candidate access as a FIXED-WIDTH 32-bit
-//!   volatile read (`probe_read32`, `#[inline(never)]`), which lowers to a 32-bit Thumb-2 `LDR`
-//!   (4 bytes), so the handler adds [`FAULT_SKIP_WIDTH`] = 4 to the stacked PC. DF-5: this is the
-//!   pinned-fixed-width approach (the alternative is a trampolined re-execute). Getting this `+4`
-//!   wrong is the one piece that needs careful testing on BOTH real parts; it is the explicit
-//!   acceptance criterion of the DF-T6 bench test. The access is placed outside any IT block (a plain
-//!   call) so the xPSR IT-state complication does not arise. **This fixup is validated ONLY on
-//!   hardware**; no host/emulator raises the fault it fixes up (spec section 8.2).
+//!   (which would re-fault forever). The advance is the faulting instruction's ACTUAL byte-width,
+//!   DECODED from the instruction stream (`thumb_instr_bytes` on the halfword at the stacked PC: 4 for
+//!   a 32-bit Thumb-2 encoding, 2 for a 16-bit one), NOT a hardcoded constant. A hardcoded skip is
+//!   silicon-fragile: it desynced when the probe read lowered to a 16-bit `LDR` while the handler
+//!   still skipped 4, resuming one halfword past the load into adjacent code (DECISIONS.md #15). The
+//!   probe still emits the load as a single 32-bit `LDR.W` (`probe_read32`, `#[inline(never)]`) for a
+//!   clean single access, but the handler no longer DEPENDS on that width. The access is placed
+//!   outside any IT block (a plain call) so the xPSR IT-state complication does not arise. **The
+//!   fixup's resume-on-silicon is validated ONLY on hardware**; no host/emulator raises the fault it
+//!   fixes up (spec section 8.2), though the decode + advance arithmetic is now host-tested.
 //!
 //! # Who owns the BusFault handler (the HAL, via a probe-scoped vector table)
 //!
@@ -275,11 +277,6 @@ pub const F1X0_GPIOA_BASE: u32 = 0x4800_0000;
 /// F10x GPIO-A base; a clean control-register read here => F10x family.
 pub const F10X_GPIOA_BASE: u32 = 0x4001_0800;
 
-/// The width (bytes) of the pinned probe-read instruction; the handler advances the stacked PC by
-/// this on a fault. A 32-bit Thumb-2 `LDR` is 4 bytes. DF-5: this MUST match `probe_read32`'s
-/// emitted instruction width or the PC-fixup resumes at the wrong place.
-pub const FAULT_SKIP_WIDTH: u32 = 4;
-
 // --- the probe <-> handler shared state -------------------------------------------------------
 
 /// Armed by [`run`] before each candidate access, disarmed after a clean read. The handler treats a
@@ -315,22 +312,21 @@ pub struct Detected {
     pub adc_count: u8,
 }
 
-// --- the fixed-width pinned probe read (DF-5) -------------------------------------------------
+// --- the single-access probe read -------------------------------------------------------------
 
-/// Read a 32-bit control word at `addr` as a SINGLE fixed-width volatile load.
+/// Read a 32-bit control word at `addr` as a SINGLE volatile load.
 ///
-/// `#[inline(never)]` so the access is a standalone 32-bit `LDR` the handler's `+4` PC-fixup matches;
-/// not inlined into a context where the compiler might fuse or re-widen it. On thumbv7m a
-/// `read_volatile::<u32>` of an aligned address lowers to a 32-bit Thumb-2 `LDR` (4 bytes), which is
-/// why [`FAULT_SKIP_WIDTH`] is 4. If the access faults, the handler advances the stacked PC past this
-/// `LDR` and returns; the returned value is then meaningless (the caller checks `FAULTED` first).
+/// `#[inline(never)]` so the access is a standalone `LDR`, not inlined into a context where the
+/// compiler might fuse or re-widen it. If the access faults, the handler advances the stacked PC past
+/// this `LDR` and returns; the returned value is then meaningless (the caller checks `FAULTED` first).
 ///
-/// **The instruction width is PINNED by inline asm** (debt-paydown slice 9): the load is an explicit
-/// `ldr.w` (the `.w` qualifier FORCES the 32-bit Thumb-2 encoding; the assembler rejects it if the
-/// wide form were unavailable), so [`FAULT_SKIP_WIDTH`] `= 4` is an encoding fact, not codegen luck.
-/// The previous `read_volatile::<u32>` relied on the compiler never choosing a 16-bit `LDR` lowering
-/// (legal for low registers + small offsets), which would silently break the stacked-PC fixup on a
-/// toolchain bump. The asm block keeps volatile semantics (no `pure`), reads only, no stack.
+/// The load is emitted as an explicit `ldr.w` (the `.w` qualifier FORCES the 32-bit Thumb-2 encoding)
+/// so the fault is a single clean 4-byte access rather than whatever `read_volatile::<u32>` happens to
+/// lower to (a 16-bit `LDR` is legal for low registers + small offsets, and the compiler DID choose it
+/// at commit 3309e39). The handler no longer DEPENDS on this width, though: it decodes the faulting
+/// instruction's actual width from the stacked PC ([`resume_pc_after_probe_load`]), so a 16- or 32-bit
+/// lowering both resume correctly (DECISIONS.md #15). The asm block keeps volatile semantics (no
+/// `pure`), reads only, no stack.
 ///
 /// # Safety
 /// `addr` is a candidate peripheral base; the read is wrapped by the armed BusFault handler so a
@@ -510,8 +506,8 @@ fn probe_candidate(base: u32) -> Option<u32> {
 // These GENERALIZE the family probe's machinery for the peripheral-presence MEASUREMENT: instead of
 // resolving F1x0-vs-F10x, MEASURE which advanced timers / ADCs a given instance actually has, per
 // chip, rather than inferring counts from a family constant. They reuse the SAME shared atomics
-// (EXPECTING_FAULT / PROBED_ADDR / FAULTED) and the SAME fixed-width `probe_read32` + `+4` PC-fixup
-// `on_bus_fault` as the family probe; no new private duplicate state. The whole sweep runs under ONE
+// (EXPECTING_FAULT / PROBED_ADDR / FAULTED) and the SAME `probe_read32` + width-decoding `on_bus_fault`
+// PC-fixup as the family probe; no new private duplicate state. The whole sweep runs under ONE
 // BusFault enable (rather than per-candidate like the family probe), so the SCB enable/disable is
 // split out into [`arm_busfault`] / [`disarm_busfault`] and the per-access armed read is exposed as
 // [`probe_present`]. `run` calls [`measure_counts`] once a family is known so its `Detected` carries
@@ -554,13 +550,13 @@ pub fn disarm_busfault(prev: bool) {
 
 /// Fault-safe read of an ARBITRARY 32-bit address inside the armed BusFault window. Generalizes
 /// `probe_candidate` (which is GPIOA-specific) for the peripheral-presence sweep: arm the shared
-/// window, do the fixed-width `probe_read32`, disarm, and report `None` if the access faulted (the
+/// window, do the single-access `probe_read32`, disarm, and report `None` if the access faulted (the
 /// address is absent / reserved) or `Some(value)` on a clean read.
 ///
 /// The caller MUST have already enabled `SHCSR.BUSFAULTENA` (via [`arm_busfault`]) and be running
 /// inside [`with_probe_vector_table`]; this function does NOT touch the SCB enable or the vector table,
 /// so a whole candidate sweep can run under one enable/restore. It reuses the SAME `EXPECTING_FAULT` /
-/// `PROBED_ADDR` / `FAULTED` atomics and the SAME `+4` `on_bus_fault` PC-fixup as `run`.
+/// `PROBED_ADDR` / `FAULTED` atomics and the SAME width-decoding `on_bus_fault` PC-fixup as `run`.
 ///
 /// # Safety
 /// `addr` is a candidate peripheral register address; the read is bounded by the armed fault harness
@@ -789,6 +785,37 @@ fn scratch_present(base: u32) -> bool {
 /// passes it down; the HAL does not depend on cortex-m-rt's `ExceptionFrame`.
 const STACKED_PC_INDEX: usize = 6;
 
+/// The byte-width of the Thumb instruction whose first halfword is `first_halfword`: 4 for a 32-bit
+/// Thumb-2 encoding, 2 for a 16-bit one.
+///
+/// Per ARMv7-M ARM A5.1, a halfword is the FIRST halfword of a 32-bit instruction iff its top five
+/// bits (`[15:11]`) are `0b11101`, `0b11110`, or `0b11111`, i.e. `(first_halfword & 0xF800) >=
+/// 0xE800`; every other top-five-bit pattern is a complete 16-bit instruction. This is what lets the
+/// BusFault handler resume EXACTLY on the instruction after the faulting probe load without assuming
+/// how that load lowered (a `probe_read32` that compiles to a 16-bit `LDR` and one that compiles to a
+/// 32-bit `LDR.W` are both handled).
+// Called by `on_bus_fault` (arm) and the host tests; on a non-arm non-test build its only caller is
+// the dead-code-allowed `on_bus_fault`, so allow it there too.
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+#[inline]
+fn thumb_instr_bytes(first_halfword: u16) -> u32 {
+    if first_halfword & 0xF800 >= 0xE800 {
+        4
+    } else {
+        2
+    }
+}
+
+/// The resume PC for a faulting probe load: `stacked_pc` advanced past the faulting instruction by its
+/// decoded Thumb width ([`thumb_instr_bytes`]). Pure (no memory access), so the handler's PC-advance
+/// arithmetic is host-testable; the BusFault handler reads `first_halfword` from the instruction
+/// stream and calls this.
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+#[inline]
+fn resume_pc_after_probe_load(stacked_pc: u32, first_halfword: u16) -> u32 {
+    stacked_pc.wrapping_add(thumb_instr_bytes(first_halfword))
+}
+
 /// The HAL-internal naked BusFault entry the probe-scoped vector table points at.
 ///
 /// The hardware calls this DIRECTLY from the relocated table on a BusFault: on entry the core has
@@ -876,19 +903,23 @@ unsafe extern "C" fn bus_fault_trampoline(frame: *mut u32) -> u32 {
 /// The BusFault handler body the HAL's probe-scoped vector entry ([`bus_fault_entry`]) delegates to.
 ///
 /// `frame` is the stacked exception frame pointer (8 `u32` words: r0..r3, r12, lr, pc, xpsr). On a
-/// PROBE fault (the access we armed) this advances the stacked PC by [`FAULT_SKIP_WIDTH`] so the
-/// faulting `LDR` is skipped on return, clears the BusFault status, records `FAULTED`, and returns
-/// (resuming after the probe access). On a NON-probe fault (`EXPECTING_FAULT` is `false`) it does
-/// NOT fix up; it returns `false` so the entry can spin (a real bus fault outside the probe is a
-/// genuine error, and detection has no production handler to escalate to).
+/// PROBE fault (the access we armed) this advances the stacked PC past the faulting load by that
+/// load's DECODED Thumb width (2 or 4 bytes; see [`resume_pc_after_probe_load`]) so the `LDR` is
+/// skipped on return, clears the BusFault status, records `FAULTED`, and returns (resuming after the
+/// probe access). Only the stacked PC (word 6) is touched; the stacked xPSR (word 7, carrying the
+/// Thumb bit) is left intact, so the exception return restores Thumb state unchanged. On a NON-probe
+/// fault (`EXPECTING_FAULT` is `false`) it does NOT fix up; it returns `false` so the entry can spin
+/// (a real bus fault outside the probe is a genuine error, and detection has no production handler to
+/// escalate to).
 ///
 /// Returns `true` if it handled (fixed up) a probe fault, `false` if the fault was not an armed probe
 /// access.
 ///
 /// # Safety
 /// `frame` must be the valid stacked exception frame pointer the BusFault entry produced. The PC
-/// fix-up writes the stacked PC word; an incorrect [`FAULT_SKIP_WIDTH`] resumes at the wrong address.
-/// This is the DF-5 risk and is validated only on hardware (DF-T6).
+/// fix-up reads the faulting instruction at the stacked PC and writes the stacked PC word; it assumes
+/// a precise (synchronous) BusFault so the stacked PC is the faulting instruction's own address. The
+/// resume-on-silicon is validated only on hardware (DF-T6); the advance arithmetic is host-tested.
 // Used by `bus_fault_trampoline` (the `arm` naked entry's bridge); unreferenced in a host build.
 #[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
 pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
@@ -907,12 +938,21 @@ pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
     // Clear the BusFault status bits (write-1-to-clear over the whole CFSR is the cortex-m idiom).
     scb.cfsr.write(cfsr);
 
-    // Advance the stacked PC past the fixed-width probe load so we resume AFTER it. The stacked PC is
-    // word 6 of the exception frame.
+    // Advance the stacked PC past the faulting probe load so we resume AFTER it. The stacked PC is
+    // word 6 of the exception frame. The advance is the ACTUAL byte-width of the faulting instruction,
+    // DECODED from the instruction stream, not a hardcoded constant: on a synchronous (precise)
+    // BusFault the stacked PC is the faulting instruction's own (even) address, so its first halfword
+    // tells us whether the probe load lowered to a 16- or 32-bit Thumb encoding. A hardcoded skip
+    // desynced when the load lowered to a 16-bit `LDR` (proven at commit 3309e39: `6800 ldr` = 2
+    // bytes, skipped by 4), resuming one halfword PAST the load's function into adjacent code -> a
+    // stale-register branch (IACCVIOL) or a non-Thumb target (INVSTATE). See DECISIONS.md #15.
     let pc = core::ptr::read_volatile(frame.add(STACKED_PC_INDEX));
+    // SAFETY: `pc` is the faulting instruction address in flash (readable, 2-byte aligned); masking
+    // bit 0 is defensive (a precise-fault stacked PC is already even).
+    let first_halfword = core::ptr::read_volatile((pc & !1) as *const u16);
     core::ptr::write_volatile(
         frame.add(STACKED_PC_INDEX),
-        pc.wrapping_add(FAULT_SKIP_WIDTH),
+        resume_pc_after_probe_load(pc, first_halfword),
     );
 
     FAULTED.store(true, Ordering::SeqCst);
@@ -984,10 +1024,103 @@ mod table_tests {
     }
 
     #[test]
-    fn fault_skip_width_matches_a_32bit_thumb_ldr() {
-        // The PC fix-up adds the width of the pinned 32-bit Thumb-2 LDR (4 bytes).
-        assert_eq!(FAULT_SKIP_WIDTH, 4);
-        // The stacked PC is word 6 of the 8-word exception frame.
+    fn stacked_pc_is_word_six_of_the_frame() {
+        // The stacked PC is word 6 of the 8-word exception frame (r0..r3, r12, lr, pc, xpsr); the
+        // stacked xPSR (the Thumb bit) is word 7 and the fixup must never touch it.
         assert_eq!(STACKED_PC_INDEX, 6);
+    }
+
+    #[test]
+    fn thumb_instr_bytes_decodes_16_vs_32_bit_encodings() {
+        // 16-bit encodings: top five bits < 0b11101. The `6800 LDR r0,[r0]` the probe read lowered to
+        // at commit 3309e39 is 16-bit; the `E7FE b.n` self-branch is 16-bit; a MOV/ADD low reg too.
+        assert_eq!(
+            thumb_instr_bytes(0x6800),
+            2,
+            "narrow LDR (the 3309e39 lowering)"
+        );
+        assert_eq!(thumb_instr_bytes(0xE7FE), 2, "b.n (top five bits 0b11100)");
+        assert_eq!(thumb_instr_bytes(0x4608), 2, "mov r0, r1");
+        assert_eq!(thumb_instr_bytes(0x0000), 2);
+        assert_eq!(
+            thumb_instr_bytes(0xE7FF),
+            2,
+            "0xE7FF is the last 16-bit halfword"
+        );
+
+        // 32-bit Thumb-2 encodings: top five bits are 0b11101 / 0b11110 / 0b11111, i.e.
+        // (hw & 0xF800) >= 0xE800. The `F8D0 xxxx LDR.W` the probe read now emits is 32-bit.
+        assert_eq!(
+            thumb_instr_bytes(0xF8D0),
+            4,
+            "LDR.W (the pinned probe load)"
+        );
+        assert_eq!(
+            thumb_instr_bytes(0xE800),
+            4,
+            "first 32-bit halfword (0b11101)"
+        );
+        assert_eq!(
+            thumb_instr_bytes(0xF000),
+            4,
+            "0b11110 (BL / data-processing)"
+        );
+        assert_eq!(thumb_instr_bytes(0xF800), 4, "0b11111");
+        assert_eq!(thumb_instr_bytes(0xFFFF), 4);
+
+        // The exact 16/32 boundary: 0xE7FF is 16-bit, 0xE800 is the first 32-bit halfword.
+        assert_eq!(thumb_instr_bytes(0xE7FF), 2);
+        assert_eq!(thumb_instr_bytes(0xE800), 4);
+    }
+
+    #[test]
+    fn resume_pc_advances_by_the_decoded_width_thumb_bit_preserved() {
+        // A 32-bit LDR.W at an even PC resumes exactly 4 bytes on (the probe's current lowering); a
+        // 16-bit LDR resumes 2 bytes on (the 3309e39 lowering that a fixed +4 skip mishandled). The
+        // resume PC stays even in both cases (bit 0 clear), so the exception-return PC is a valid
+        // instruction address and Thumb state (carried in the stacked xPSR, untouched here) is intact.
+        for &pc in &[0x0800_07e2u32, 0x0800_0d02, 0x0800_0000, 0x2000_0100] {
+            assert_eq!(resume_pc_after_probe_load(pc, 0xF8D0), pc + 4);
+            assert_eq!(resume_pc_after_probe_load(pc, 0x6800), pc + 2);
+            assert_eq!(resume_pc_after_probe_load(pc, 0xF8D0) & 1, 0);
+            assert_eq!(resume_pc_after_probe_load(pc, 0x6800) & 1, 0);
+        }
+    }
+
+    #[test]
+    fn frame_model_only_pc_word_changes() {
+        // Model the 8-word stacked exception frame and apply the fixup arithmetic the handler does:
+        // only word 6 (PC) moves, by the decoded width; every other word (including word 7, xPSR /
+        // the Thumb bit) is untouched. This is the property the desynced fixed-width skip violated by
+        // overshooting the PC (and the reason the Thumb bit / return state stayed valid here).
+        let faulting_pc = 0x0800_0d02u32; // a 32-bit LDR.W probe load
+        let xpsr = 0x0100_0000u32; // xPSR with the Thumb bit (bit 24) set
+        let mut frame: [u32; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, faulting_pc, xpsr];
+        let before = frame;
+
+        // The handler's arithmetic: read word 6, decode width from the instruction (0xF8D0 = LDR.W),
+        // write the advanced PC back to word 6.
+        frame[STACKED_PC_INDEX] = resume_pc_after_probe_load(frame[STACKED_PC_INDEX], 0xF8D0);
+
+        assert_eq!(
+            frame[STACKED_PC_INDEX],
+            faulting_pc + 4,
+            "PC advanced past the 4-byte LDR.W"
+        );
+        for i in 0..8 {
+            if i != STACKED_PC_INDEX {
+                assert_eq!(
+                    frame[i], before[i],
+                    "word {i} must be untouched (xPSR is word 7)"
+                );
+            }
+        }
+        assert_eq!(frame[7], xpsr, "the stacked xPSR (Thumb bit) is preserved");
+
+        // The same frame with the 16-bit lowering resumes 2 bytes on (a fixed +4 skip would have
+        // overshot to faulting_pc + 4, landing past the load's `pop {r7,pc}` into adjacent code).
+        let mut narrow = before;
+        narrow[STACKED_PC_INDEX] = resume_pc_after_probe_load(narrow[STACKED_PC_INDEX], 0x6800);
+        assert_eq!(narrow[STACKED_PC_INDEX], faulting_pc + 2);
     }
 }
