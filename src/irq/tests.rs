@@ -25,13 +25,14 @@
 
 use super::grouped_inner;
 use super::{
-    build_table, call_control_handler, clear_control_handler, default_isr, handler_addr,
-    install_mock, mock_vtor, register_control_handler, set_grouped_demux_timer_base,
-    ControlHandler, F10X_ADC0_1_IRQ, F10X_DMA0_CH2_IRQ, F10X_EXTI10_15_IRQ, F10X_EXTI5_9_IRQ,
-    F10X_TIMER0_BRK_IRQ, F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ, F10X_TIMER0_UP_IRQ,
-    F1X0_ADC_CMP_IRQ, F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ,
-    F1X0_TIMER0_BRK_UP_TRG_COM_IRQ, F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF,
-    INTF_UPIF, MAX_VECTORS, SYSTEM_VECTORS, TIMER_INTF,
+    build_table, call_control_handler, clear_control_handler, clear_tick_count, clear_tick_handler,
+    default_isr, handler_addr, install_mock, mock_vtor, on_systick, register_control_handler,
+    register_tick_handler, set_grouped_demux_timer_base, tick_count, ControlHandler, TickHandler,
+    F10X_ADC0_1_IRQ, F10X_DMA0_CH2_IRQ, F10X_EXTI10_15_IRQ, F10X_EXTI5_9_IRQ, F10X_TIMER0_BRK_IRQ,
+    F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ, F10X_TIMER0_UP_IRQ, F1X0_ADC_CMP_IRQ,
+    F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ,
+    F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF, INTF_UPIF, MAX_VECTORS,
+    SYSTEM_VECTORS, TIMER_INTF,
 };
 use crate::descriptor::IrqLayout;
 use crate::reg::{mock, Reg32};
@@ -170,6 +171,52 @@ fn registration_swaps_the_noop_default_for_the_registered_handler() {
     );
 
     clear_control_handler();
+}
+
+/// The tick-seam test handler's call counter (mirrors `TEST_HANDLER_CALLS`).
+static TEST_TICK_CALLS: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn test_tick_handler() {
+    TEST_TICK_CALLS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[test]
+fn tick_seam_registration_and_dispatch_through_on_systick() {
+    // The G7 tick seam end to end (the integration firmware's SysTick wiring: it registers its
+    // scheduler tick through this seam because `install()` flips VTOR to the RAM table, whose
+    // slot-15 `systick_handler` reaches `on_systick`; a firmware-side `#[exception] SysTick`
+    // on the flash table would be dead code after the flip).
+    let _serial = mock::lock();
+    clear_tick_handler();
+    clear_tick_count();
+    TEST_TICK_CALLS.store(0, Ordering::SeqCst);
+
+    // Before registration: `on_systick` (the single body every SysTick route reaches) bumps the
+    // free-running count and calls the no-op default; the pre-registration window is safe.
+    on_systick();
+    on_systick();
+    assert_eq!(tick_count(), 2, "the free-running count always advances");
+    assert_eq!(
+        TEST_TICK_CALLS.load(Ordering::SeqCst),
+        0,
+        "before registration the no-op default runs, not the firmware tick"
+    );
+
+    // After registration (the firmware's boot-time act): every tick reaches the handler AND the
+    // count keeps advancing (the handler is additive, not a replacement).
+    register_tick_handler(test_tick_handler as TickHandler);
+    on_systick();
+    on_systick();
+    on_systick();
+    assert_eq!(
+        TEST_TICK_CALLS.load(Ordering::SeqCst),
+        3,
+        "after registration the firmware tick handler runs once per tick"
+    );
+    assert_eq!(tick_count(), 5);
+
+    clear_tick_handler();
+    clear_tick_count();
 }
 
 // --- The exception-after-flip sequencing test (DECISIONS.md #6) -------------------------------
