@@ -9,6 +9,10 @@
 //! - **transfer + `embedded-hal`** ([`embedded_hal::i2c::I2c`]): write / read / write_read over the
 //!   mock register space with STAT0 seeded so the polls pass, and error-injection (BERR / LOSTARB /
 //!   AERR in STAT0) asserting the mapped [`embedded_hal::i2c::ErrorKind`].
+//! - **recovery + the busy gate** (the 2026-07-18 silicon finding): a failed transfer clears the
+//!   sticky STAT0 error flags and SRESET-reinits a wedged block (pending START/STOP cleared, the
+//!   timing reprogrammed); a fresh transfer on a stuck-busy bus fails fast with `Bus` instead of
+//!   corrupting the wire; the non-fresh (repeated-START) read skips the busy gate.
 //!
 //! The mock backend is a flat array (a static register snapshot, not a sequencer), so the polled
 //! loops are made to terminate by seeding STAT0 with every flag the transfer waits on set at once;
@@ -340,6 +344,102 @@ fn zero_length_write_is_a_presence_check() {
     // An empty write still does START + address (an embedded-hal bus presence check) and STOPs.
     dev.write(IMU, &[]).expect("empty write should succeed");
     assert_eq!(r(CTL0) & CTL0_STOP, CTL0_STOP);
+}
+
+// --- Solution B receive shapes (flat mock: flow + end state; the sequencing is silicon's) ------
+
+#[test]
+fn read_burst_14_solution_b_completes_and_stops() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    seed_stat0_all_ready();
+    let mut buf = [0u8; 14];
+    dev.read(IMU, &mut buf)
+        .expect("14-byte burst should succeed");
+    let ctl0 = r(CTL0);
+    assert_eq!(ctl0 & CTL0_STOP, CTL0_STOP, "burst read issues STOP");
+    assert_eq!(
+        ctl0 & CTL0_ACKEN,
+        CTL0_ACKEN,
+        "ACK re-enabled for next transfer"
+    );
+    assert_eq!(ctl0 & CTL0_POAP, 0, "POAP not used for N>2");
+}
+
+#[test]
+fn read_two_bytes_restores_poap_and_stops() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    seed_stat0_all_ready();
+    let mut buf = [0u8; 2];
+    dev.read(IMU, &mut buf).expect("2-byte read should succeed");
+    let ctl0 = r(CTL0);
+    assert_eq!(ctl0 & CTL0_STOP, CTL0_STOP, "N=2 read issues STOP");
+    assert_eq!(
+        ctl0 & CTL0_POAP,
+        0,
+        "POAP restored (cleared) after the transfer"
+    );
+    assert_eq!(ctl0 & CTL0_ACKEN, CTL0_ACKEN, "ACK re-enabled");
+}
+
+// --- recovery + the busy gate ------------------------------------------------------------------
+
+#[test]
+fn failed_transfer_clears_sticky_errors_and_reinits() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    // Zero CKCFG after bring-up so the reinit's reprogramming is observable.
+    w(CKCFG, 0);
+    // BERR set, no ready flags: the SBSEND wait fails with Bus; recovery must then (1) clear the
+    // sticky BERR, (2) SRESET-reinit (the failed attempt left a START request pending).
+    w(STAT0, STAT0_BERR);
+    let e = dev.write(IMU, &[0x00]).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Bus);
+    assert_eq!(r(STAT0) & STAT0_BERR, 0, "sticky BERR cleared by recovery");
+    let ctl0 = r(CTL0);
+    assert_eq!(
+        ctl0 & (CTL0_START | CTL0_STOP),
+        0,
+        "pending START/STOP request cleared by the SRESET reinit"
+    );
+    assert_eq!(ctl0 & CTL0_I2CEN, CTL0_I2CEN, "block re-enabled");
+    assert_eq!(ctl0 & CTL0_ACKEN, CTL0_ACKEN, "ACK posture restored");
+    assert_eq!(r(CKCFG), 0xB4, "timing reprogrammed by the reinit");
+}
+
+#[test]
+fn stuck_busy_fresh_transfer_fails_bus_after_sreset() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    w(CKCFG, 0); // observable reinit, as above
+                 // I2CBSY stuck with MASTER clear (the silicon-observed wedge shape); STAT0 stays 0. The fresh
+                 // transfer's busy gate exhausts, recovery SRESET-reinits, the (mock-static) bus is still busy,
+                 // and the call fails fast with Bus.
+    w(STAT1, STAT1_I2CBSY);
+    let e = dev.write(IMU, &[0x00]).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Bus);
+    assert_eq!(
+        r(CKCFG),
+        0xB4,
+        "wedge recovery SRESET-reinit reprogrammed the timing"
+    );
+    assert_eq!(r(CTL0) & CTL0_I2CEN, CTL0_I2CEN, "block re-enabled");
+}
+
+#[test]
+fn non_fresh_read_skips_the_busy_gate() {
+    let _g = seed_reset();
+    let dev = brought_up();
+    // Busy is EXPECTED mid-transaction (this side holds the bus after a register-pointer write):
+    // the repeated-START read must not busy-gate. Seed busy + all-ready and drive the raw
+    // non-fresh read; it must complete.
+    w(STAT1, STAT1_I2CBSY | STAT1_MASTER);
+    seed_stat0_all_ready();
+    let mut buf = [0u8; 1];
+    dev.read_bytes(IMU, &mut buf, false)
+        .expect("non-fresh read must not busy-gate");
+    assert_eq!(r(CTL0) & CTL0_STOP, CTL0_STOP, "read still STOPs");
 }
 
 // --- error injection: STAT0 error bits map to the right ErrorKind -----------------------------

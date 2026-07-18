@@ -44,14 +44,43 @@
 //! I2CCLK = 8, RT = 9, CKCFG = 40; runtime-hal reproduces whatever the supplied [`ClockConfig`]
 //! implies, so the same code matches the probe at 8 MHz and the 72 MHz bring-up.
 //!
-//! # Transfer sequence (T7, the classic event-based STAT0/STAT1 handshake)
+//! # Transfer sequence (T7): master receive is the manual's **Solution B**, plus error recovery
 //!
-//! The polled master read/write sequence mirrors the bench-proven `i2c_probe.c` (a polled probe on
-//! the same peripheral that read the IMU): START -> SBSEND -> write address to DATA -> ADDSEND ->
-//! clear ADDSEND by reading STAT0 then STAT1 -> data via TBE/BTC (transmit) or RBNE (receive) ->
-//! STOP, with the single-byte-receive ACK-disable-before-clearing-ADDSEND + STOP-before-RBNE
-//! sequence the block requires, and the repeated-START for a register read. Every poll is bounded
-//! ([`I2C_TIMEOUT`]) so a missing/stuck device cannot hang (the F130 hang-if-done-wrong class).
+//! Master transmit is the classic event-based STAT0/STAT1 handshake: START -> SBSEND -> address ->
+//! ADDSEND (cleared by reading STAT0 then STAT1) -> bytes via TBE with a final BTC. Transmit is
+//! inherently delay-tolerant (the master stretches SCL when TBE/BTC go unserviced).
+//!
+//! Master **receive** uses the user manual's **Solution B** (GD32F1x0 UM Rev 3.6 / GD32F10x UM
+//! Rev 2.6, "Programming model in master receiving mode"), NOT Solution A. The manual is explicit
+//! that "Solution A requires the software's quick response to I2C events, while Solution B
+//! doesn't": Solution A's ACKEN-clear + STOP must land inside the last byte's reception, so any
+//! interrupt delaying the polled loop at that point lets the last byte be ACKed and the STOP fall
+//! mid-byte, which can corrupt the transfer and wedge the bus. **Observed on silicon
+//! (2026-07-18, the integrated firmware's 250 Hz IMU burst on the bench F130 under SysTick + DMA
+//! ISR load): the peripheral deadlocked with CTL0 = I2CEN|START|STOP|ACKEN pending, STAT1 =
+//! I2CBSY-with-MASTER-clear, STAT0 = 0, permanently, while the same 14-byte burst runs error-free
+//! in an interrupt-free image.** Solution B parks every software decision under an SCL stretch
+//! (RBNE+BTC both set holds SCL low), so ISR latency can never break the NACK/STOP placement:
+//!
+//! - N = 1: ACKEN clear before clearing ADDSEND; STOP after clearing ADDSEND; read on RBNE.
+//! - N = 2: POAP set before START (ACKEN then governs the *next* byte); ACKEN clear before
+//!   clearing ADDSEND; wait BTC (both bytes held, SCL stretched); STOP; read twice.
+//! - N > 2: read via RBNE until N-3 bytes are in hand; wait BTC (byte N-2 in DR, N-1 in shift,
+//!   SCL stretched); clear ACKEN; read N-2 (the last byte then arrives NACKed); wait BTC again
+//!   (stretched); STOP; read N-1; read N.
+//!
+//! Every poll is bounded ([`I2C_TIMEOUT`]) so a missing/stuck device cannot hang (the F130
+//! hang-if-done-wrong class), and a fresh transfer first waits (bounded) for I2CBSY to clear.
+//!
+//! **Error recovery (the persistence half of the same silicon finding):** the sticky STAT0 error
+//! flags (BERR/LOSTARB/AERR/OUERR, all rc_w0) are cleared only by software, and a transfer
+//! abandoned mid-flight leaves the slave mid-transaction and the peripheral with START/STOP
+//! pending, so without recovery ONE failed transfer latches every later transfer dead (the same
+//! failure class as the UART ORE latch). Every failed transfer now runs [`I2c::recover`]: clear
+//! the sticky error flags, STOP if still master, and if the peripheral stays wedged (I2CBSY
+//! without MASTER, or START/STOP request stuck) pulse SRESET (CTL0 bit 15) and reprogram
+//! timing/mode/enable. The error still surfaces to the caller (one lost sample); the peripheral
+//! is usable again on the next call.
 //!
 //! The GD/ST register naming stays on this side of the trait boundary (SPEC.md): what crosses into
 //! `embedded-hal` `i2c::I2c` is bytes, a 7-bit address, and an [`I2cError`].
@@ -82,6 +111,11 @@ const CTL0_SMBEN: u32 = 1 << 1;
 const CTL0_START: u32 = 1 << 8;
 const CTL0_STOP: u32 = 1 << 9;
 const CTL0_ACKEN: u32 = 1 << 10;
+/// POAP: with it set, ACKEN governs the **next** byte to be received, not the current one (the
+/// manual's Solution B N=2 case; set before START, cleared after the transfer).
+const CTL0_POAP: u32 = 1 << 11;
+/// SRESET: software reset of the I2C block (the recovery path's escape for a wedged peripheral).
+const CTL0_SRESET: u32 = 1 << 15;
 
 // CTL1 / CKCFG / RT fields.
 const CTL1_I2CCLK: u32 = 0x7F; // BITS(0,6)
@@ -104,6 +138,14 @@ const STAT0_BERR: u32 = 1 << 8;
 const STAT0_LOSTARB: u32 = 1 << 9;
 const STAT0_AERR: u32 = 1 << 10;
 const STAT0_OUERR: u32 = 1 << 11;
+/// The sticky (rc_w0, software-cleared) STAT0 error flags the recovery path clears.
+const STAT0_ERRORS: u32 = STAT0_BERR | STAT0_LOSTARB | STAT0_AERR | STAT0_OUERR;
+
+// STAT1 bits.
+/// MASTER: the block is in master mode.
+const STAT1_MASTER: u32 = 1 << 0;
+/// I2CBSY: the bus is busy (a transfer in progress, or a line held low).
+const STAT1_I2CBSY: u32 = 1 << 1;
 
 /// SPL `I2CCLK_MAX` / `I2CCLK_MIN` clamp bounds for the peripheral-clock MHz field.
 const I2CCLK_MAX: u32 = 0x48;
@@ -114,6 +156,12 @@ const I2CCLK_MIN: u32 = 0x02;
 /// timing, but always escaping a dead bus. It counts loop iterations, not cycles, so it is
 /// clock-independent.
 pub const I2C_TIMEOUT: u32 = 100_000;
+
+/// Bounded poll budget for the fresh-transfer bus-idle wait (I2CBSY clear). Much shorter than
+/// [`I2C_TIMEOUT`]: a healthy bus goes idle within a couple of byte times of the previous STOP
+/// (~200 us at 100 kHz), and a stuck bus should fail fast (~200 us of polling at 72 MHz) rather
+/// than eat a control tick's budget on every call while stuck.
+const BUSY_TIMEOUT: u32 = I2C_TIMEOUT / 10;
 
 /// Fast-mode duty cycle (open item I2C-1). `Two` (Tlow/Thigh = 2, DTCY = 0) is the default the IMU
 /// reference and the bench probe use; `SixteenNine` (16/9, DTCY = 1) is expressible for callers
@@ -227,12 +275,16 @@ pub fn i2c_input_clock(clock: &ClockConfig) -> u32 {
 
 // --- the handle -------------------------------------------------------------------------------
 
-/// A configured I2C master, resolved once at bring-up: just the base (the register model is shared,
-/// so there is no per-family field). The polled transfer primitives and the `embedded-hal`
-/// `i2c::I2c` impl hang off this (DECISIONS.md #4: resolve once into a concrete handle).
+/// A configured I2C master, resolved once at bring-up: the base (the register model is shared,
+/// so there is no per-family field) plus the computed timing, kept so the recovery path's SRESET
+/// can reprogram the block without re-deriving the clock tree. The polled transfer primitives and
+/// the `embedded-hal` `i2c::I2c` impl hang off this (DECISIONS.md #4: resolve once into a
+/// concrete handle).
 #[derive(Debug, Clone, Copy)]
 pub struct I2c {
     base: u32,
+    /// The bring-up timing (CTL1 I2CCLK / CKCFG / RT), reused by [`I2c::recover`]'s SRESET reinit.
+    timing: I2cTiming,
 }
 
 /// The master own-address value programmed into `SADDR0` (the bench probe's `0x24`). As a
@@ -293,9 +345,10 @@ impl I2c {
         );
 
         // 4. Timing + mode + enable + ACK.
-        let dev = I2c { base };
         let pclk1 = i2c_input_clock(clock);
-        dev.configure_timing(timing_for(pclk1, mode.speed_hz, mode.duty));
+        let timing = timing_for(pclk1, mode.speed_hz, mode.duty);
+        let dev = I2c { base, timing };
+        dev.configure_timing(timing);
         dev.configure_mode_addr(MASTER_OWN_ADDR);
         // i2c_enable: set I2CEN.
         dev.ctl0().modify(CTL0_I2CEN, CTL0_I2CEN);
@@ -394,6 +447,13 @@ impl I2c {
             .modify(CTL0_ACKEN, if enable { CTL0_ACKEN } else { 0 });
     }
 
+    /// `i2c_ackpos_config`: set or clear CTL0 POAP (Solution B's N=2 ACK repositioning).
+    #[inline]
+    fn set_poap(&self, next: bool) {
+        self.ctl0()
+            .modify(CTL0_POAP, if next { CTL0_POAP } else { 0 });
+    }
+
     /// `i2c_master_addressing`: write the address byte to DATA. `read` selects the R/W bit:
     /// transmitter clears bit 0, receiver sets it (matching the SPL's `& I2C_TRANSMITTER` /
     /// `| I2C_RECEIVER`). `addr7` is the 7-bit address; the byte sent is `(addr7 << 1) | rw`.
@@ -457,15 +517,110 @@ impl I2c {
         }
     }
 
-    // --- polled master transfers (the classic event-based sequence) ---------------------------
+    // --- error recovery (the persistence half of the 2026-07-18 silicon finding) --------------
+
+    /// Bounded wait for the bus to go idle (I2CBSY clear) before a FRESH transfer's START. On
+    /// exhaustion, run [`I2c::recover`] once (an SRESET un-wedges the observed
+    /// START/STOP-pending deadlock) and re-check; a bus still busy after that is a genuinely
+    /// held line, surfaced as [`I2cError::Bus`].
+    fn wait_bus_idle(&self) -> Result<(), I2cError> {
+        let mut budget = BUSY_TIMEOUT;
+        loop {
+            if self.stat1().read() & STAT1_I2CBSY == 0 {
+                return Ok(());
+            }
+            budget -= 1;
+            if budget == 0 {
+                self.recover();
+                if self.stat1().read() & STAT1_I2CBSY == 0 {
+                    return Ok(());
+                }
+                return Err(I2cError::Bus);
+            }
+        }
+    }
+
+    /// Put the peripheral back into a usable state after a failed transfer. Without this, ONE
+    /// failure latches the block dead (the silicon-observed wedge: sticky error flags, a
+    /// never-sent STOP pending, I2CBSY stuck with MASTER dropped). Steps:
+    ///
+    /// 1. Clear the sticky rc_w0 error flags (the SPL `i2c_flag_clear` shape: RMW writing the
+    ///    flag bits low, leaving the read-only bits untouched).
+    /// 2. If still master, release the bus with a STOP (bounded wait for the request to clear).
+    /// 3. If the peripheral stays wedged (I2CBSY without MASTER, or a START/STOP request stuck
+    ///    pending), pulse SRESET and reprogram timing/mode/enable from the stored bring-up state.
+    /// 4. Restore the next-transfer posture (POAP clear, ACKEN set).
+    fn recover(&self) {
+        // 1. Sticky error flags (rc_w0: cleared by writing 0 to the flag bit).
+        let s = self.stat0().read();
+        self.stat0().write(s & !STAT0_ERRORS);
+
+        // 2. Release the bus if this side still drives it.
+        if self.stat1().read() & STAT1_MASTER != 0 {
+            self.stop_on_bus();
+            let mut budget = BUSY_TIMEOUT;
+            while self.ctl0().read() & CTL0_STOP != 0 {
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
+            }
+        }
+
+        // 3. A wedged block: busy without mastering the bus (the observed MASTER-dropped
+        //    deadlock), or a START/STOP request that never completed.
+        let busy_not_master = self.stat1().read() & (STAT1_I2CBSY | STAT1_MASTER) == STAT1_I2CBSY;
+        let request_stuck = self.ctl0().read() & (CTL0_START | CTL0_STOP) != 0;
+        if busy_not_master || request_stuck {
+            self.soft_reset_reinit();
+        }
+
+        // 4. Next-transfer posture.
+        self.set_poap(false);
+        self.set_ack(true);
+    }
+
+    /// Pulse CTL0 SRESET (hold, release) and reprogram the block from the stored bring-up state
+    /// (SRESET clears the configuration registers). The recovery path's escape for a wedged
+    /// peripheral; mirrors the bring-up order timing -> mode/address -> I2CEN -> ACKEN.
+    fn soft_reset_reinit(&self) {
+        self.ctl0().write(CTL0_SRESET);
+        self.ctl0().write(0);
+        self.configure_timing(self.timing);
+        self.configure_mode_addr(MASTER_OWN_ADDR);
+        self.ctl0().modify(CTL0_I2CEN, CTL0_I2CEN);
+        self.set_ack(true);
+    }
+
+    // --- polled master transfers (transmit event-based; receive per the manual's Solution B) --
 
     /// Polled master write: START -> address+W -> ADDSEND (clear) -> each byte via TBE then a final
     /// BTC -> optional STOP. If `stop` is false the transfer is left without a STOP so a repeated
-    /// START can follow (the register-pointer phase of a read). Mirrors `i2c_probe.c`'s phase-1.
+    /// START can follow (the register-pointer phase of a read). `fresh` marks a transfer that
+    /// starts on a bus this side does not already hold: it first waits (bounded) for I2CBSY to
+    /// clear, so a wedged or still-finishing bus is detected up front instead of corrupting the
+    /// new transfer. A failed transfer runs [`I2c::recover`] before the error is returned.
     ///
     /// An empty `bytes` still does the START + address handshake (an `embedded-hal` zero-length
     /// write is a bus presence check); the trailing BTC wait is skipped when no byte was sent.
-    pub fn write_bytes(&self, addr7: u8, bytes: &[u8], stop: bool) -> Result<(), I2cError> {
+    pub fn write_bytes(
+        &self,
+        addr7: u8,
+        bytes: &[u8],
+        fresh: bool,
+        stop: bool,
+    ) -> Result<(), I2cError> {
+        if fresh {
+            self.wait_bus_idle()?; // recovers internally on exhaustion
+        }
+        let r = self.write_inner(addr7, bytes, stop);
+        if r.is_err() {
+            self.recover();
+        }
+        r
+    }
+
+    fn write_inner(&self, addr7: u8, bytes: &[u8], stop: bool) -> Result<(), I2cError> {
         self.set_ack(true);
         self.start_on_bus();
         self.wait_flag(STAT0_SBSEND, NackKind::Address)?;
@@ -479,7 +634,7 @@ impl I2c {
             self.wait_flag(STAT0_TBE, NackKind::Data)?;
             self.transmit(b);
             // After the LAST byte, wait for BTC (byte transfer complete) so the shift register has
-            // drained before a STOP or repeated START, exactly as the probe does.
+            // drained before a STOP or repeated START.
             if i == bytes.len() - 1 {
                 self.wait_flag(STAT0_BTC, NackKind::Data)?;
             }
@@ -491,49 +646,83 @@ impl I2c {
         Ok(())
     }
 
-    /// Polled master read: START -> address+R -> ADDSEND -> data via RBNE -> STOP, with the
-    /// single-vs-multi-byte ACK/STOP sequencing the block requires (mirrors `i2c_probe.c`'s
-    /// phase-2). `repeated` selects whether this is a repeated START after a write (the START is
-    /// issued either way; the flag documents intent and keeps the call sites readable).
-    ///
-    /// Single byte: disable ACK, clear ADDSEND, program STOP, then wait RBNE and read. Multi byte:
-    /// clear ADDSEND, then for each byte (NACK + STOP before the last) wait RBNE and read.
-    pub fn read_bytes(&self, addr7: u8, buf: &mut [u8], repeated: bool) -> Result<(), I2cError> {
-        let _ = repeated;
+    /// Polled master read per the manual's **Solution B** (see the module docs: delay-tolerant,
+    /// every NACK/STOP decision under an SCL stretch, immune to ISR latency; Solution A's
+    /// quick-response requirement is what wedged the integrated image on silicon). `fresh` marks
+    /// a transfer that starts on a bus this side does not already hold (false for the repeated
+    /// START after a register-pointer write); it first waits (bounded) for I2CBSY to clear. A
+    /// failed transfer runs [`I2c::recover`] before the error is returned.
+    pub fn read_bytes(&self, addr7: u8, buf: &mut [u8], fresh: bool) -> Result<(), I2cError> {
         if buf.is_empty() {
             return Ok(());
         }
+        if fresh {
+            self.wait_bus_idle()?; // recovers internally on exhaustion
+        }
+        let r = self.read_inner(addr7, buf);
+        if r.is_err() {
+            self.recover();
+        }
+        r
+    }
+
+    fn read_inner(&self, addr7: u8, buf: &mut [u8]) -> Result<(), I2cError> {
+        let n = buf.len();
         self.set_ack(true);
+        // Solution B, N=2: POAP before START, so the ACKEN cleared below applies to the SECOND
+        // byte (the one to NACK), not the first.
+        if n == 2 {
+            self.set_poap(true);
+        }
         self.start_on_bus();
         self.wait_flag(STAT0_SBSEND, NackKind::Address)?;
         self.send_address(addr7, true);
 
-        if buf.len() == 1 {
-            // Single byte: NACK must be set BEFORE clearing ADDSEND, then STOP, then read.
-            self.set_ack(false);
-            self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
-            self.clear_addsend();
-            self.stop_on_bus();
-            self.wait_flag(STAT0_RBNE, NackKind::Data)?;
-            buf[0] = self.receive();
-        } else {
-            self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
-            self.clear_addsend();
-            let n = buf.len();
-            // Index loop (not iter): the last-byte branch needs the position, and `buf[i]` is the
-            // receive target, so a plain range loop is the clear form here.
-            #[allow(clippy::needless_range_loop)]
-            for i in 0..n {
-                if i == n - 1 {
-                    // Last byte: NACK then STOP, then read it.
-                    self.set_ack(false);
-                    self.stop_on_bus();
-                }
+        match n {
+            1 => {
+                // N=1: ACKEN clear BEFORE clearing ADDSEND; STOP after; read on RBNE.
+                self.set_ack(false);
+                self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
+                self.clear_addsend();
+                self.stop_on_bus();
                 self.wait_flag(STAT0_RBNE, NackKind::Data)?;
-                buf[i] = self.receive();
+                buf[0] = self.receive();
+            }
+            2 => {
+                // N=2 (POAP set above): ACKEN clear before clearing ADDSEND (NACKs byte 2); then
+                // both bytes arrive into DR + shift and SCL stretches (BTC); STOP; read twice.
+                self.set_ack(false);
+                self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
+                self.clear_addsend();
+                self.wait_flag(STAT0_BTC, NackKind::Data)?;
+                self.stop_on_bus();
+                buf[0] = self.receive();
+                self.wait_flag(STAT0_RBNE, NackKind::Data)?;
+                buf[1] = self.receive();
+                self.set_poap(false);
+            }
+            _ => {
+                // N>2: RBNE-read the first N-3 bytes; byte N-2 stays in DR until BTC signals
+                // N-1 in the shift register with SCL stretched; ACKEN clear (the LAST byte will
+                // be NACKed); read N-2 (releases the bus for the last byte); BTC again (N-1 in
+                // DR, last in shift, stretched); STOP; read N-1; read the last.
+                self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
+                self.clear_addsend();
+                for b in buf[..n - 3].iter_mut() {
+                    self.wait_flag(STAT0_RBNE, NackKind::Data)?;
+                    *b = self.receive();
+                }
+                self.wait_flag(STAT0_BTC, NackKind::Data)?;
+                self.set_ack(false);
+                buf[n - 3] = self.receive();
+                self.wait_flag(STAT0_BTC, NackKind::Data)?;
+                self.stop_on_bus();
+                buf[n - 2] = self.receive();
+                self.wait_flag(STAT0_RBNE, NackKind::Data)?;
+                buf[n - 1] = self.receive();
             }
         }
-        // Re-enable ACK for the next transfer (the probe restores it after the STOP).
+        // Re-enable ACK for the next transfer.
         self.set_ack(true);
         Ok(())
     }
@@ -555,49 +744,57 @@ impl i2c::ErrorType for I2c {
 }
 
 impl i2c::I2c<SevenBitAddress> for I2c {
-    /// Read `read.len()` bytes from `address` (a plain master read with its own START/STOP).
+    /// Read `read.len()` bytes from `address` (a fresh master read with its own START/STOP).
     fn read(&mut self, address: SevenBitAddress, read: &mut [u8]) -> Result<(), Self::Error> {
-        self.read_bytes(address, read, false)
+        self.read_bytes(address, read, true)
     }
 
     /// Write `write` to `address` with a terminating STOP.
     fn write(&mut self, address: SevenBitAddress, write: &[u8]) -> Result<(), Self::Error> {
-        self.write_bytes(address, write, true)
+        self.write_bytes(address, write, true, true)
     }
 
     /// Write `write` then, with a repeated START, read `read` (the register-pointer-then-read
     /// pattern; the IMU WHO_AM_I sequence). The write phase does NOT issue a STOP so the read's
-    /// START is a repeated START.
+    /// START is a repeated START, and the read is NOT `fresh` (this side already holds the bus,
+    /// so I2CBSY is expectedly set).
     fn write_read(
         &mut self,
         address: SevenBitAddress,
         write: &[u8],
         read: &mut [u8],
     ) -> Result<(), Self::Error> {
-        self.write_bytes(address, write, false)?;
-        self.read_bytes(address, read, true)
+        self.write_bytes(address, write, true, false)?;
+        self.read_bytes(address, read, false)
     }
 
     /// Execute an `embedded-hal` operation list against `address` as one logical transaction.
     ///
     /// Each `Write`/`Read` runs as its own START; a write's STOP is issued only when it is the
     /// final operation, so a `[Write, Read]` list is the repeated-start register read (the IMU
-    /// WHO_AM_I sequence). The classic event-based block must program STOP before the last received
-    /// byte's RBNE, so a `Read` always terminates with a STOP, which means a `Read` that is not the
-    /// final operation is not supported as a non-terminating phase; M2's transactions
-    /// (write-then-read) always place the read last. Consecutive same-direction operations are not
-    /// coalesced (the trait permits either; this is the simple form).
+    /// WHO_AM_I sequence). A `Read` always terminates with a STOP (the receive sequence programs
+    /// it), which means a `Read` that is not the final operation is not supported as a
+    /// non-terminating phase; M2's transactions (write-then-read) always place the read last.
+    /// `fresh` tracks bus ownership across the list: the first operation and any operation after
+    /// a STOP wait for bus idle; an operation after a non-stopped write is a repeated START.
     fn transaction(
         &mut self,
         address: SevenBitAddress,
         operations: &mut [Operation<'_>],
     ) -> Result<(), Self::Error> {
         let last = operations.len();
+        let mut fresh = true;
         for (i, op) in operations.iter_mut().enumerate() {
             let is_last = i + 1 == last;
             match op {
-                Operation::Write(w) => self.write_bytes(address, w, is_last)?,
-                Operation::Read(r) => self.read_bytes(address, r, i != 0)?,
+                Operation::Write(w) => {
+                    self.write_bytes(address, w, fresh, is_last)?;
+                    fresh = is_last; // a non-stopped write keeps the bus for the next op
+                }
+                Operation::Read(r) => {
+                    self.read_bytes(address, r, fresh)?;
+                    fresh = true; // a read always STOPs
+                }
             }
         }
         Ok(())
