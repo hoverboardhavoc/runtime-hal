@@ -593,6 +593,11 @@ mod per_cycle_path {
     /// `BringUpError::Descriptor(MissingBase(..))`.
     #[test]
     fn from_descriptor_resolves_and_range_checks() {
+        // `configure()` writes TIMER0 registers into the shared mock SPACE, so this test must
+        // hold the mock lock like every other register-writing test here (without it the writes
+        // spray into concurrently running tests: 7/150 full-suite flakes, audit 2026-07-18).
+        let _serial = mock::lock();
+        mock::reset();
         let mut addrs = AddrTable::new();
         addrs.set(PeriphLabel::Timer0, TIMER0_BASE);
         let chip = chip_with(addrs);
