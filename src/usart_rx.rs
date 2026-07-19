@@ -844,11 +844,20 @@ impl RingBufferedRx {
         let n = core::cmp::min(available as usize, buf.len());
         // Section 6: the buffer reads must not be hoisted before the CHxCNT snapshot above.
         core::sync::atomic::compiler_fence(Ordering::Acquire);
-        for (i, slot) in buf.iter_mut().enumerate().take(n) {
-            let pos = ((self.cursor + i as u64) % self.len as u64) as usize;
+        // ONE u64 modulo per CALL, then a conditional-reset wrap per byte. The previous per-byte
+        // `(cursor + i) % len` was a software `__aeabi_uldivmod` on every byte, and on the M3 that
+        // per-byte division was the dominant term of the flood-drain cost (round-4 slice-1 PC
+        // profile: 35% of CPU in u64 division; the per-call hoist removes all but one).
+        let mut pos = (self.cursor % self.len as u64) as usize;
+        let len = self.len;
+        for slot in buf.iter_mut().take(n) {
             // SAFETY: `pos < len`, within the `'static` buffer; the byte is strictly behind the live
             // DMA write index, so it is fully written and not being overwritten now (section 6).
             *slot = unsafe { core::ptr::read_volatile(self.buf.add(pos)) };
+            pos += 1;
+            if pos == len {
+                pos = 0;
+            }
         }
         self.cursor += n as u64;
         Ok(n)
