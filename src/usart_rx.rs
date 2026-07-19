@@ -813,6 +813,7 @@ impl RingBufferedRx {
     /// - A **lapped cursor** ([`UsartError::RingOverrun`], the DMA wrote more than `len` bytes ahead of
     ///   the cursor: the consumer fell behind and unread bytes were overwritten) likewise resyncs to
     ///   the freshest position and leaves the channel live (section 5.2).
+    #[inline]
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
         // Line error (the ERRIE path): SELF-HEAL in place, do NOT disable the channel. The shared ISR
         // already cleared the hardware flag; drop the disturbed bytes by resyncing the cursor to the
@@ -866,6 +867,7 @@ impl RingBufferedRx {
     /// Atomically read-and-clear the IDLE latch (the frame-complete hint), exactly as
     /// [`BufferedRx::take_idle`]: the IDLE boundary is delivered by the shared USART IRQ (section 5.3),
     /// so the DMA-ring reader uses the same latch to know a variable-length frame just ended.
+    #[inline]
     pub fn take_idle(&self) -> bool {
         self.slot.idle_seen.swap(false, Ordering::AcqRel)
     }
@@ -876,6 +878,7 @@ impl RingBufferedRx {
     /// condition (a recorded line error, or a lap) that `read` would surface-and-clear. Consumes
     /// nothing (the cursor does not advance). The `embedded-io` `ReadReady` shape
     /// (`specs/serial-adapters.md` D4).
+    #[inline]
     pub fn ready(&self) -> bool {
         if self.slot.line_error.load(Ordering::Acquire) != ERR_NONE {
             return true;

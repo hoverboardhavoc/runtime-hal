@@ -199,12 +199,15 @@ pub trait RxBackend: private::Sealed {
 }
 
 impl RxBackend for RingBufferedRx {
+    #[inline]
     fn rx_read(&mut self, buf: &mut [u8]) -> Result<usize, UsartError> {
         self.read(buf)
     }
+    #[inline]
     fn rx_ready(&self) -> bool {
         self.ready()
     }
+    #[inline]
     fn rx_take_idle(&self) -> bool {
         self.take_idle()
     }
@@ -289,6 +292,7 @@ impl<R: RxBackend> Read for SplitSerial<R> {
     /// matching counter (a wire disturbance -> [`line_errors`](Self::line_errors), a buffer-overrun
     /// loss -> [`lap_overruns`](Self::lap_overruns)) and the drain is retried, so a single `read` still
     /// returns post-recovery bytes where the backend has them.
+    #[inline]
     fn read(&mut self, out: &mut [u8]) -> Result<usize, Self::Error> {
         // The adapter owns the IDLE latch: consume it unconditionally (framing belongs to the
         // framer above; the latch must never sit as un-modeled state a consumer misreads).
@@ -318,6 +322,7 @@ impl<R: RxBackend> Read for SplitSerial<R> {
 impl<R: RxBackend> ReadReady for SplitSerial<R> {
     /// The backend's own progress state (buffered bytes / bytes behind the live DMA write position,
     /// or a pending condition a read would clear). Consumes nothing.
+    #[inline]
     fn read_ready(&mut self) -> Result<bool, Self::Error> {
         Ok(self.rx.rx_ready())
     }
