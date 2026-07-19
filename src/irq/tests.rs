@@ -34,6 +34,10 @@ use super::{
     F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF, INTF_UPIF, MAX_VECTORS,
     SYSTEM_VECTORS, TIMER_INTF,
 };
+use super::{
+    DMA_RX_ISR_METRIC, F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ, SYSTICK_ISR_METRIC,
+    USART1_RX_ISR_METRIC,
+};
 use crate::descriptor::IrqLayout;
 use crate::reg::{mock, Reg32};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -393,4 +397,54 @@ fn misplaced_vector_slot_is_flagged() {
             "the flagged slot must be the misplaced one"
         );
     }
+}
+
+// --- Per-vector ISR entry counting (permanent observability) ----------------------------------
+
+#[test]
+fn isr_metrics_count_entries_per_vector() {
+    // The permanent CTRL_OBS instrumentation seam: each instrumented vector body bumps its own
+    // entry counter exactly once per invocation, and the three counters are independent. Entry
+    // counts alone are what discriminates a per-byte storm from the expected IDLE/wrap rate on
+    // silicon (only entries are published; below-pass cycle attribution is not a trusted
+    // observable). Deltas (not absolutes) under the serial lock, since the metrics are process-wide.
+    let _serial = mock::lock();
+
+    // SysTick: on_systick is the single body every SysTick route reaches; it must record one entry.
+    let s0 = SYSTICK_ISR_METRIC.entries();
+    on_systick();
+    on_systick();
+    assert_eq!(
+        SYSTICK_ISR_METRIC.entries().wrapping_sub(s0),
+        2,
+        "SysTick metric bumps once per tick body"
+    );
+
+    // USART1 RX + DMA RX: dispatch their vectors through the installed F1x0 RAM table the way
+    // hardware would after the VTOR flip, and assert only the dispatched vector's counter moved.
+    install_mock(IrqLayout::F1x0Grouped, 0x2000_4000);
+    let u0 = USART1_RX_ISR_METRIC.entries();
+    let d0 = DMA_RX_ISR_METRIC.entries();
+
+    unsafe { mock_vtor::dispatch(F1X0_USART1_IRQ) };
+    assert_eq!(
+        USART1_RX_ISR_METRIC.entries().wrapping_sub(u0),
+        1,
+        "the USART1 RX vector records one entry"
+    );
+    assert_eq!(
+        DMA_RX_ISR_METRIC.entries().wrapping_sub(d0),
+        0,
+        "dispatching USART1 RX must not touch the DMA metric"
+    );
+
+    let d1 = DMA_RX_ISR_METRIC.entries();
+    unsafe { mock_vtor::dispatch(F1X0_DMA_CH3_4_IRQ) };
+    assert_eq!(
+        DMA_RX_ISR_METRIC.entries().wrapping_sub(d1),
+        1,
+        "the DMA RX vector records one entry"
+    );
+
+    mock_vtor::reset();
 }

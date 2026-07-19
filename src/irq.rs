@@ -267,6 +267,7 @@ pub fn clear_tick_count() {
 pub fn on_systick() {
     TICK_COUNT.fetch_add(1, Ordering::Release);
     call_tick_handler();
+    SYSTICK_ISR_METRIC.record();
 }
 
 // --- Static USART RX handler registration (G-DMA-UART Gate A) ---------------------------------
@@ -426,6 +427,96 @@ pub fn call_dma_rx_handler2() {
     f();
 }
 
+// --- Per-vector ISR entry counting (permanent observability) ----------------------------------
+//
+// A small, always-on facility that counts entries into the interrupt vectors the inter-board-link
+// CPU budget rides on (the SysTick tick, the USART1 RX IDLE/error vector, and the DMA-RX wrap
+// vector). Each instrumented vector bumps a per-vector entry counter; the application publishes
+// these (e.g. the firmware's `CTRL_OBS`) so a bench read over SWD, taking a delta over a timed
+// window, sees each vector's entry RATE WITHOUT a throwaway probe build. The overhead is one
+// relaxed atomic add per instrumented ISR; the hot control-loop ADC vector is deliberately NOT
+// instrumented so the PWM-rate path is untouched.
+//
+// Only entries are counted, not in-ISR cycles: the round-7a bench characterisation found the
+// NVIC-handler-mode DWT `CYCCNT` delta carries a ~19x per-entry inflation artifact, so below-pass
+// cycle attribution is not a trustworthy observable. Entry counts alone discriminate a per-byte
+// storm (thousands/s) from the expected IDLE/wrap rate (hundreds/s). [`enable_cycle_counter`] /
+// [`cycle_count`] remain for wall-anchored, pass-scale timing windows taken by an attached bench.
+
+/// A per-vector ISR metric: a free-running entry count (wrapping `u32`). The application reads it
+/// and takes a delta over a timed window to get a per-vector entry rate. Written only from the
+/// instrumented ISR body (a single writer per vector); read lock-free from the main thread.
+pub struct IsrMetric {
+    entries: AtomicU32,
+}
+
+impl IsrMetric {
+    const fn new() -> Self {
+        Self {
+            entries: AtomicU32::new(0),
+        }
+    }
+
+    /// Count one ISR invocation: bump the entry count.
+    #[inline]
+    fn record(&self) {
+        self.entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The free-running entry count (wraps on overflow). Take a delta over a timed window for a rate.
+    #[inline]
+    pub fn entries(&self) -> u32 {
+        self.entries.load(Ordering::Relaxed)
+    }
+}
+
+/// SysTick ISR metric (the tick body [`on_systick`]).
+pub static SYSTICK_ISR_METRIC: IsrMetric = IsrMetric::new();
+/// USART1 RX ISR metric (the [`usart1_rx_isr`] vector: IDLE boundary + line errors under DMA RX).
+pub static USART1_RX_ISR_METRIC: IsrMetric = IsrMetric::new();
+/// DMA-RX ISR metric (the [`dma_rx_isr`] vector: the circular-DMA half/full wrap servicing).
+pub static DMA_RX_ISR_METRIC: IsrMetric = IsrMetric::new();
+
+/// Enable the DWT cycle counter (`CYCCNT`) so [`cycle_count`] is live for wall-anchored, pass-scale
+/// timing windows taken by an attached bench. Call once at boot, after the clock tree is up. Sets
+/// `DEMCR.TRCENA` then
+/// `DWT_CTRL.CYCCNTENA` and zeroes `CYCCNT`. Idempotent. A no-op under the host `mock` build.
+#[cfg(not(feature = "mock"))]
+#[inline]
+pub fn enable_cycle_counter() {
+    const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32; // Debug Exception and Monitor Control Register
+    const DWT_CTRL: *mut u32 = 0xE000_1000 as *mut u32;
+    const DWT_CYCCNT: *mut u32 = 0xE000_1004 as *mut u32;
+    // SAFETY: three word-aligned core debug/DWT registers; single-writer boot-time init.
+    unsafe {
+        DEMCR.write_volatile(DEMCR.read_volatile() | (1 << 24)); // TRCENA
+        DWT_CYCCNT.write_volatile(0);
+        DWT_CTRL.write_volatile(DWT_CTRL.read_volatile() | 1); // CYCCNTENA
+    }
+}
+
+/// Host stand-in: no DWT under `cargo test`.
+#[cfg(feature = "mock")]
+#[inline]
+pub fn enable_cycle_counter() {}
+
+/// Read the DWT cycle counter (`CYCCNT`, `0xE000_1004`). A free-running CPU-cycle counter once
+/// [`enable_cycle_counter`] ran; deltas of two reads bound the CPU cycles between them (including
+/// any ISR that preempted the window, since the CPU runs it). Reads 0 under the host `mock` build.
+#[cfg(not(feature = "mock"))]
+#[inline]
+pub fn cycle_count() -> u32 {
+    // SAFETY: a single volatile read of the word-aligned DWT CYCCNT register.
+    unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
+}
+
+/// Host stand-in: no DWT under `cargo test`.
+#[cfg(feature = "mock")]
+#[inline]
+pub fn cycle_count() -> u32 {
+    0
+}
+
 // --- The owned RAM vector table (DECISIONS.md #6) ---------------------------------------------
 
 /// The owned RAM vector table (DECISIONS.md #6): an alignment-correct `static` in a dedicated
@@ -575,6 +666,7 @@ extern "C" fn adc_isr() {
 /// a safe no-op.
 extern "C" fn usart1_rx_isr() {
     call_usart_rx_handler();
+    USART1_RX_ISR_METRIC.record();
 }
 
 /// The module-USART RX vector body (F10x `USART2_IRQn` = 39): route to the registered second-instance
@@ -591,6 +683,7 @@ extern "C" fn module_usart_rx_isr() {
 /// handler is registered this is a safe no-op.
 extern "C" fn dma_rx_isr() {
     call_dma_rx_handler();
+    DMA_RX_ISR_METRIC.record();
 }
 
 /// The module DMA-RX vector body (F10x `DMA0_Channel2_IRQn` = 13): route to the registered second
