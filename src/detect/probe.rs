@@ -77,25 +77,35 @@ use super::{Family, FLASH_DENSITY_ADDR};
 // BusFault slot points at the HAL-internal naked entry below, runs the probe, then restores VTOR. The
 // application therefore defines NO `#[exception] BusFault`. See the module docs for the full rationale.
 
-/// The number of `u32` entries the probe-scoped RAM vector table holds: the initial-SP word + 15
-/// system-exception vectors + a generous IRQ margin. ARMv7-M has at most 240 external IRQs; copying a
-/// generous prefix is cheap and keeps every handler the active table already had. 256 entries (1 KiB)
-/// covers the system vectors and the IRQ lines these parts use with margin to spare.
-const VECTOR_TABLE_LEN: usize = 256;
+/// The number of `u32` entries the probe-scoped RAM vector table holds: the initial-SP word + the 15
+/// ARMv7-M system-exception vectors (indices 1..=15, up to SysTick). The probe runs in an IRQ-LESS
+/// window (no NVIC line is enabled, and the probe enables none), so ONLY the system exceptions can
+/// fire; external IRQ vectors (index 16+) are unreachable and are NOT copied. 16 entries is exactly
+/// the reachable set. The only slot the HAL overrides is BusFault (index 5); every other system slot
+/// is copied from the active table so an unrelated system fault still reaches the application's
+/// handler. Shrinking this from the former 256-word (1 KiB) table reclaims ~900 B of RAM with no
+/// overlay hazard (the dropped words were never-reachable IRQ vectors), lowering the firmware stack
+/// floor by that much (round-11 stack slice).
+const VECTOR_TABLE_LEN: usize = 16;
 
 /// The exception number (and table index) of BusFault on ARMv7-M: vector offset `0x14` => word index
 /// 5. This is the only slot the HAL overrides; every other entry is copied from the active table so
 /// existing handlers (Reset, NMI, HardFault, ...) keep working.
 const BUSFAULT_VECTOR_INDEX: usize = 5;
 
+/// The ARMv7-M `VTOR` alignment requirement for this table: the base must be aligned to a power of two
+/// that is BOTH >= the table's byte size AND >= 128 bytes (the architectural floor: `VTOR[6:0]` are
+/// reserved / RAZ). The table is 16 words = 64 bytes, so the 128-byte floor dominates and 128 is the
+/// alignment. (128 >= 64, is a power of two, and meets the floor.)
+const VTOR_ALIGN: u32 = 128;
+
 /// A HAL-owned RAM vector table for the probe window.
 ///
-/// `#[repr(align(1024))]` satisfies the ARMv7-M `VTOR` alignment requirement: the table base must be
-/// aligned to a power of two that is >= its byte size and >= 128 bytes. The table is 256 words = 1 KiB
-/// (`VECTOR_TABLE_LEN`), so aligning the static to a full 1 KiB makes its own address a valid `VTOR`
-/// base directly; [`vector_table_base`] rounds up to the same boundary as a defensive no-op (so a
-/// misaligned base could never be programmed, and the indexed slots always land inside this static).
-#[repr(align(1024))]
+/// `#[repr(align(128))]` satisfies [`VTOR_ALIGN`]: the table is 16 words = 64 bytes and the ARMv7-M
+/// `VTOR` floor is 128 bytes, so aligning the static to 128 makes its own address a valid `VTOR` base
+/// directly; [`vector_table_base`] rounds up to the same boundary as a defensive no-op (so a misaligned
+/// base could never be programmed, and the indexed slots always land inside this static).
+#[repr(align(128))]
 struct AlignedVectorTable {
     entries: [u32; VECTOR_TABLE_LEN],
 }
@@ -107,26 +117,24 @@ static mut PROBE_VECTOR_TABLE: AlignedVectorTable = AlignedVectorTable {
     entries: [0; VECTOR_TABLE_LEN],
 };
 
-/// The byte-size of the RAM vector table (used as the `VTOR` alignment requirement).
-const VECTOR_TABLE_BYTES: u32 = (VECTOR_TABLE_LEN * core::mem::size_of::<u32>()) as u32;
-
-/// Compute the `VTOR` base to program for the RAM table: the table's own address rounded UP to a
-/// multiple of its byte size, which is the ARMv7-M requirement (base aligned to a power of two >= the
-/// table byte size). Because `AlignedVectorTable` is `#[repr(align(1024))]` and the table is exactly
-/// 1 KiB, the static's address is ALREADY a multiple of `VECTOR_TABLE_BYTES`, so this round-up is a
-/// no-op for the real base; it is kept as a defensive guarantee that the programmed `VTOR` is always
-/// table-size-aligned (the indexed slots then always land inside the static).
+/// Compute the `VTOR` base to program for the RAM table: the table's own address rounded UP to
+/// [`VTOR_ALIGN`] (128 bytes), the ARMv7-M requirement (base aligned to a power of two that is >= the
+/// table byte size AND >= the 128-byte floor). Because `AlignedVectorTable` is `#[repr(align(128))]`,
+/// the static's address is ALREADY a multiple of `VTOR_ALIGN`, so this round-up is a no-op for the
+/// real base; it is kept as a defensive guarantee that the programmed `VTOR` is always aligned (the
+/// indexed slots then always land inside the static).
 #[inline]
 fn vector_table_base(addr: u32) -> u32 {
-    let align = VECTOR_TABLE_BYTES;
+    let align = VTOR_ALIGN;
     addr.wrapping_add(align - 1) & !(align - 1)
 }
 
 /// Build the probe-scoped table by copying the active table then overriding the BusFault slot.
 ///
 /// `active_vtor` is the current `SCB.VTOR` base (the flash table cortex-m-rt linked, or whatever table
-/// is active). We copy `VECTOR_TABLE_LEN` words from it so every existing handler (HardFault, NMI, the
-/// IRQ lines, ...) is preserved, then write [`bus_fault_entry`]'s address into the BusFault slot. A
+/// is active). We copy `VECTOR_TABLE_LEN` (= 16) words from it, the system-exception slots only
+/// (HardFault, NMI, ...; the probe window runs with no NVIC line enabled, so IRQ slots are
+/// unreachable and not carried), then write [`bus_fault_entry`]'s address into the BusFault slot. A
 /// Rust fn pointer on thumbv7m already has the Thumb bit (bit 0) set, which the hardware requires for
 /// an exception vector, so `bus_fault_entry as usize as u32` is the correct value to store.
 ///
@@ -136,8 +144,9 @@ fn vector_table_base(addr: u32) -> u32 {
 unsafe fn build_probe_vector_table(active_vtor: u32) {
     let dst = core::ptr::addr_of_mut!(PROBE_VECTOR_TABLE.entries) as *mut u32;
     let src = active_vtor as *const u32;
-    // Copy the active table (system exceptions + a generous IRQ prefix). The source is the real
-    // (flash) table base, so reading VECTOR_TABLE_LEN words from it is in-bounds on these parts.
+    // Copy the active table's 16 system-exception slots (the only vectors reachable in the
+    // IRQ-less probe window). The source is the real (flash) table base, so reading
+    // VECTOR_TABLE_LEN words from it is in-bounds on these parts.
     let mut i = 0usize;
     while i < VECTOR_TABLE_LEN {
         core::ptr::write_volatile(dst.add(i), core::ptr::read_volatile(src.add(i)));
@@ -969,6 +978,10 @@ pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
 mod table_tests {
     use super::*;
 
+    /// The table byte-size (16 words = 64 B), a test-only invariant helper: the VTOR base alignment
+    /// ([`VTOR_ALIGN`], the 128-byte floor) exceeds it, so it is not used in the lib build.
+    const VECTOR_TABLE_BYTES: u32 = (VECTOR_TABLE_LEN * core::mem::size_of::<u32>()) as u32;
+
     #[test]
     fn busfault_vector_index_matches_offset_0x14() {
         // BusFault is exception number 5; its vector offset is 0x14 = index 5 * 4 bytes.
@@ -981,25 +994,40 @@ mod table_tests {
     }
 
     #[test]
-    fn vector_table_is_large_enough_to_cover_the_busfault_slot() {
-        // The table must hold at least the system exceptions; the BusFault slot must be in range.
+    fn vector_table_covers_the_system_vectors_and_the_busfault_slot() {
+        // The table holds exactly the reachable set in the IRQ-less probe window: the SP word + the 15
+        // system exceptions (indices 0..=15). The BusFault slot (index 5) must be in range.
+        assert_eq!(
+            VECTOR_TABLE_LEN, 16,
+            "SP word + 15 system exception vectors"
+        );
         assert!(VECTOR_TABLE_LEN > BUSFAULT_VECTOR_INDEX);
-        // 256 words = 1 KiB; covers the 16 system vectors plus a generous IRQ margin.
         assert_eq!(VECTOR_TABLE_BYTES, (VECTOR_TABLE_LEN * 4) as u32);
+        // VTOR's base alignment (not the table's own byte size) must meet the 128-byte floor and be a
+        // power of two >= the table size. The table is 64 B; the 128-byte floor dominates.
         assert!(
-            VECTOR_TABLE_BYTES >= 128,
-            "ARMv7-M VTOR needs >= 128-byte tables"
+            VTOR_ALIGN >= 128,
+            "ARMv7-M VTOR base needs >= 128-byte alignment"
+        );
+        assert!(
+            VTOR_ALIGN >= VECTOR_TABLE_BYTES,
+            "alignment must be >= the table size"
+        );
+        assert_eq!(
+            VTOR_ALIGN & (VTOR_ALIGN - 1),
+            0,
+            "VTOR alignment is a power of two"
         );
     }
 
     #[test]
-    fn vector_table_base_rounds_up_to_table_size() {
-        let align = VECTOR_TABLE_BYTES;
+    fn vector_table_base_rounds_up_to_vtor_align() {
+        let align = VTOR_ALIGN;
         // An already-aligned address is unchanged.
         assert_eq!(vector_table_base(align), align);
         assert_eq!(vector_table_base(2 * align), 2 * align);
         assert_eq!(vector_table_base(0), 0);
-        // A misaligned address rounds UP to the next multiple of the table size.
+        // A misaligned address rounds UP to the next multiple of the VTOR alignment.
         assert_eq!(vector_table_base(1), align);
         assert_eq!(vector_table_base(align - 1), align);
         assert_eq!(vector_table_base(align + 1), 2 * align);
@@ -1007,14 +1035,14 @@ mod table_tests {
 
     #[test]
     fn vector_table_base_is_a_valid_vtor_value() {
-        // VTOR requires the base aligned to a power of two >= the table byte size. The round-up
-        // result is always a multiple of VECTOR_TABLE_BYTES, hence aligned to it.
+        // VTOR requires the base aligned to a power of two >= the table byte size AND >= 128 (the
+        // architectural floor). The round-up result is always a multiple of VTOR_ALIGN, hence aligned.
         for addr in [0u32, 1, 7, 0x2000_0001, 0x2000_03FF, 0x2000_0400] {
             let base = vector_table_base(addr);
             assert_eq!(
-                base % VECTOR_TABLE_BYTES,
+                base % VTOR_ALIGN,
                 0,
-                "the programmed VTOR base must be a multiple of the table size"
+                "the programmed VTOR base must be a multiple of the VTOR alignment"
             );
             assert!(
                 base >= addr,

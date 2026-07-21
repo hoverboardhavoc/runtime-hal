@@ -531,8 +531,9 @@ pub fn cycle_count() -> u32 {
 /// needs (a too-small stack overflows into `.bss` and corrupts the ISR state). It is one half of a
 /// **two-part** stack-overflow fix that together keep the peak under the region; neither is sufficient
 /// alone: this `align(512)` (region 3004 -> 4028 B) AND the firmware's `store::MAX_RECORD = 272`
-/// (peak 4820 -> 3044 B). (The detect-probe table is a SEPARATE `align(1024)` `AlignedVectorTable` in
-/// [`crate::detect`], unaffected by this.) `#[no_mangle]` + the section let the linker place it in RAM;
+/// (peak 4820 -> 3044 B). (The detect-probe table is a SEPARATE `align(128)` `AlignedVectorTable` in
+/// [`crate::detect`] holding only the 16 reachable system vectors, unaffected by this.) `#[no_mangle]` +
+/// the section let the linker place it in RAM;
 /// the flash table still covers reset + the first exceptions until [`install`] flips `VTOR`.
 #[repr(C, align(512))]
 pub struct RamVectorTable {
