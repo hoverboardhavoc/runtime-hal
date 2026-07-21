@@ -8,7 +8,7 @@
  * and the stack within the shrunk region (top = _stack_start = 0x2000_1F00), so it never touches the
  * tail. The firmware writes its result struct to a FIXED address at the start of that tail
  * (RESULT_ADDR = 0x2000_1F00) and the SWD reader reads that constant directly, no `arm-none-eabi-nm`
- * symbol resolution needed (the size-optimised release ELF drops the .symtab nm reads). An earlier
+ * symbol resolution needed (a convenience for the SWD runbook; the ELF does carry a symtab). An earlier
  * attempt to pin a fixed RAM-ORIGIN section collided with cortex-m-rt; reserving the TAIL avoids that.
  */
 MEMORY

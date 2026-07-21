@@ -3,7 +3,8 @@
 //! # Why this image exists
 //!
 //! The detect probe's BusFault fixup (the HAL naked entry `probe::bus_fault_entry` + `on_bus_fault`'s
-//! symbol-anchored resume) is the load-bearing, host-untestable piece of runtime detection: no host or
+//! relative width-decode advance of the stacked PC) is the load-bearing, host-untestable piece of
+//! runtime detection: no host or
 //! emulator raises the real bus fault it recovers from. In PRODUCTION it is only ever exercised on an
 //! F10x part, because the family probe faults there (reading the reserved F1x0 GPIO base). On an F1x0
 //! part detect NEVER faults: the wrong-family base `0x4800_0000` is that part's own real GPIOA, and the
@@ -12,8 +13,10 @@
 //!
 //! This image closes that gap. It deliberately reads a KNOWN-reserved, bus-faulting address
 //! (`0x6000_0000`, the unpopulated FSMC / external-memory region on these parts) through runtime-hal's
-//! public armed-probe harness, so the HAL's naked BusFault entry and the symbol-anchored resume run on
-//! REAL silicon of BOTH the F103 and the F130. It records:
+//! public armed-probe harness, so the HAL's naked BusFault entry and the width-decode PC fixup run on
+//! REAL silicon of BOTH the F103 and the F130. (The round-14 pinning showed the F1x0's late external
+//! fault stacks the CALLER's frame, which is exactly why an absolute symbol-anchored resume was
+//! rejected: only a relative advance is SP-consistent in every observed frame.) It records:
 //!   - `faulted`  = 1 if the read bus-faulted and was caught (`probe_present` returned `None`),
 //!   - `readback` = the value the read returned (garbage on a fault; meaningful only if `faulted == 0`),
 //!   - `magic`    = written LAST, so a reader seeing it knows the fault was caught AND execution
@@ -58,7 +61,8 @@ struct FaultPinResult {
 
 /// Fixed RAM address of the result struct: the top of the (shrunk) RAM region reserved by `memory.x`
 /// (cortex-m-rt ends RAM 256 B early so it never allocates here). The SWD reader reads this CONSTANT
-/// directly; the size-optimised release ELF drops the `.symtab` an nm read would need.
+/// directly so the bench runbook needs no symbol lookup step (the ELF does carry a symtab; the
+/// fixed address is a convenience, not a necessity).
 const RESULT_ADDR: u32 = 0x2000_1F00;
 
 /// Initial contents (the region is outside `.bss`, so the C runtime does not zero it): `magic = 0`
@@ -86,8 +90,8 @@ fn main() -> ! {
     // Force the fault on a known-reserved address through the HAL's armed-probe harness. This drives
     // the exact machinery detect uses: the probe-scoped vector table (BusFault slot -> the naked
     // `bus_fault_entry`), `SHCSR.BUSFAULTENA`, then the single armed `probe_read32`. A bus fault at
-    // `0x6000_0000` traps to `bus_fault_entry`, `on_bus_fault` fixes up the stacked PC via the
-    // symbol-anchored resume, and `probe_present` returns `None`. If any of that is wrong on this
+    // `0x6000_0000` traps to `bus_fault_entry`, `on_bus_fault` advances the stacked PC by the
+    // decoded instruction width, and `probe_present` returns `None`. If any of that is wrong on this
     // silicon (bad resume PC / clobbered callee-saved state) the core hangs or HardFaults here and
     // `magic` is never written.
     let result = probe::with_probe_vector_table(|| {
