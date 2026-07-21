@@ -841,14 +841,18 @@ fn resume_pc_after_probe_load(stacked_pc: u32, first_halfword: u16) -> u32 {
 /// on silicon under the OLD mechanism), relocated into the HAL and adapted to a naked direct vector
 /// target:
 ///
-/// 1. Capture `LR` (the EXC_RETURN), `MSP`, and `PSP` up front.
-/// 2. Select the frame pointer from EXC_RETURN bit 2 (0 => the frame is on MSP, 1 => on PSP). At boot
-///    the probe runs on MSP.
+/// 1. Read `MSP`/`PSP` and select the frame pointer from EXC_RETURN (`LR`) bit 2 (0 => the frame is on
+///    MSP, 1 => on PSP; at boot the probe runs on MSP) into r0, using only caller-saved r0-r2.
+/// 2. Stash EXC_RETURN on the STACK (`push {r3, lr}`, r3 as 8-byte-alignment padding) across the call,
+///    NOT in a callee-saved register: `on_bus_fault`'s caller-context r4-r11 must survive untouched, so
+///    the entry never writes any callee-saved register (the round-13 F103 brick was `mov r4, lr`
+///    leaking EXC_RETURN into the interrupted context's r4).
 /// 3. Call [`bus_fault_trampoline`] (a normal Rust fn) with the frame pointer; it invokes
 ///    `on_bus_fault` for the PC fix-up and returns whether the fault was an armed probe access.
-/// 4. If handled, return from the exception with `BX LR` (the EXC_RETURN), resuming AFTER the skipped
-///    probe load. If NOT handled (a real fault outside the probe window), spin: we are mid-detection
-///    with no production handlers installed, so there is nothing safe to resume to.
+/// 4. Restore EXC_RETURN (`pop {r3, lr}`). If handled, return from the exception with `BX LR`, resuming
+///    AFTER the skipped probe load with all callee-saved state intact. If NOT handled (a real fault
+///    outside the probe window), spin: we are mid-detection with no production handlers installed, so
+///    there is nothing safe to resume to.
 ///
 /// # Safety
 /// Installed only as the BusFault vector of the probe-scoped table (its address carries the Thumb bit,
@@ -867,17 +871,27 @@ pub unsafe extern "C" fn bus_fault_entry() {
         "ite  eq",
         "moveq r0, r1",
         "movne r0, r2",
-        // Preserve EXC_RETURN across the call (callee may clobber LR); r4 is callee-saved.
-        "mov  r4, lr",
+        // Preserve EXC_RETURN across the call WITHOUT touching any callee-saved register: stash LR on
+        // the stack. `push {{r3, lr}}` stores EXC_RETURN (LR) and pushes r3 purely as padding to keep
+        // SP 8-byte aligned for the AAPCS call (r3 is caller-saved, so clobbering it is free). The
+        // former `mov r4, lr` used r4 to hold EXC_RETURN across the `bl`, but r4 is callee-SAVED and is
+        // NOT part of the hardware exception frame, so the interrupted context resumed with r4 =
+        // EXC_RETURN (0xFFFFFFF9); code that relied on its r4 then dereferenced that value (the
+        // round-13 F103 hard fault: BFAR 0xFFFFFFF9 in the VTOR-restore code). Keeping EXC_RETURN off
+        // the integer registers entirely makes this entry insensitive to how the probe/caller allocate
+        // r4-r11 (the #[inline(never)] on the probe fns is now hardening, not the fix).
+        "push {{r3, lr}}",
         "bl   {trampoline}",
+        "pop  {{r3, lr}}",
         // r0 = handled?. If zero (a real fault, not an armed probe access), spin: nothing safe to
         // resume to mid-detection.
         "cbnz r0, 1f",
         "2:",
         "b    2b",
-        // Handled: return from the exception with the preserved EXC_RETURN.
+        // Handled: return from the exception with the restored EXC_RETURN in LR (untouched callee-saved
+        // state, so the interrupted context resumes exactly as stacked).
         "1:",
-        "bx   r4",
+        "bx   lr",
         trampoline = sym bus_fault_trampoline,
     )
 }
