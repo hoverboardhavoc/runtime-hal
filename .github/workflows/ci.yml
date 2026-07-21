@@ -34,8 +34,10 @@ jobs:
       # firmware/ is ONE source (the chip is detected at runtime); the f103 / f130 feature selects only
       # the linker memory.x (RAM size), so both link variants are built (f130 needs --no-default-features
       # to turn the default f103 off). bench-fw/: coldpath (cold-path peripheral bring-up), detect
-      # (family detection acceptance), probe (peripheral-presence measurement), motor-verify (hot-path
-      # configure-then-read-back, MOE never armed). All are no_std thumbv7m-none-eabi images.
+      # (family detection acceptance), probe (peripheral-presence measurement), faultpin (forced
+      # reserved-address fault -> BusFault resume validator, the F1x0 forced-fault regression guard),
+      # motor-verify (hot-path configure-then-read-back, MOE never armed). All are no_std
+      # thumbv7m-none-eabi images.
       - name: build embedded firmware + bench-fw (verified non-empty)
         run: |
           set -euo pipefail
@@ -52,7 +54,7 @@ jobs:
           check firmware/target/thumbv7m-none-eabi/release/bench
           ( cd firmware && cargo build --release --no-default-features --features f130 )
           check firmware/target/thumbv7m-none-eabi/release/bench
-          for c in detect probe coldpath motor-verify usart-rx serial; do
+          for c in detect probe faultpin coldpath motor-verify usart-rx serial; do
             ( cd "bench-fw/$c" && cargo build --release )
             check "bench-fw/$c/target/thumbv7m-none-eabi/release/bench-fw-$c"
           done

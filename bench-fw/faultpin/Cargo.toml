@@ -1,0 +1,26 @@
+[package]
+name = "bench-fw-faultpin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Forced-fault resume validator for the detect BusFault fixup. Detect never bus-faults on an F1x0 part (the wrong-family GPIO base is that part's REAL GPIOA, and absent peripherals read-as-zero), so the family that never exercises the fixup in production has no on-silicon coverage of the PC resume. This image deliberately reads a known-reserved, bus-faulting address (0x6000_0000, the unpopulated FSMC/external region) through runtime-hal's armed probe harness (with_probe_vector_table + arm_busfault + probe_present) so the HAL's naked BusFault entry + symbol-anchored resume run on REAL silicon of BOTH families. It records whether the read faulted and whether execution resumed (the run reaching the magic write proves the resume returned correctly), in a fixed-layout RAM struct read over SWD. Strictly read-only: one reserved-address read, caught and resumed; no peripheral state touched."
+
+[dependencies]
+# runtime-hal in its normal real-MMIO no_std build (it carries the bus-fault-safe probe machinery and
+# the naked BusFault entry under test). NOT the `mock` feature (a real bus fault is silicon-only).
+runtime-hal = { path = "../..", default-features = false }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+
+[[bin]]
+name = "bench-fw-faultpin"
+path = "src/main.rs"
+
+# Size-optimised, debuggable release image for flashing.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+overflow-checks = false

@@ -31,12 +31,15 @@
 //!   handler can confirm `BFAR == PROBED_ADDR`), and `FAULTED` (the handler sets it so the probe
 //!   learns the access faulted).
 //! - **The PC fixup (the risk).** On a faulted access the handler MUST advance the stacked return PC
-//!   past the faulting load so execution resumes AFTER the probe access instead of re-executing it
-//!   (which would re-fault forever). The advance is the faulting instruction's ACTUAL byte-width,
-//!   DECODED from the instruction stream (`thumb_instr_bytes` on the halfword at the stacked PC: 4 for
-//!   a 32-bit Thumb-2 encoding, 2 for a 16-bit one), NOT a hardcoded constant. A hardcoded skip is
-//!   silicon-fragile: it desynced when the probe read lowered to a 16-bit `LDR` while the handler
-//!   still skipped 4, resuming one halfword past the load into adjacent code (DECISIONS.md #15). The
+//!   to the NEXT instruction boundary so execution resumes past the probe access instead of
+//!   re-executing it (which would re-fault forever). The advance is a RELATIVE one-instruction step:
+//!   the decoded Thumb width of the instruction AT the stacked PC (`thumb_instr_bytes`: 4 for 32-bit
+//!   Thumb-2, 2 for 16-bit), NOT a hardcoded constant and NOT an absolute resume address. Pinned on
+//!   silicon (DECISIONS.md #15), the stacked PC is not reliably the faulting load -- it may be
+//!   load+width (F103) or the caller's return address (F130 late external-region fault) -- so only a
+//!   relative advance stays SP-consistent; an absolute resume would fault against the wrong SP. A
+//!   hardcoded skip is silicon-fragile: it desynced when the probe read lowered to a 16-bit `LDR` while
+//!   the handler still skipped 4, resuming one halfword past the load into adjacent code (DECISIONS.md #15). The
 //!   probe still emits the load as a single 32-bit `LDR.W` (`probe_read32`, `#[inline(never)]`) for a
 //!   clean single access, but the handler no longer DEPENDS on that width. The access is placed
 //!   outside any IT block (a plain call) so the xPSR IT-state complication does not arise. **The
@@ -946,9 +949,12 @@ unsafe extern "C" fn bus_fault_trampoline(frame: *mut u32) -> u32 {
 ///
 /// # Safety
 /// `frame` must be the valid stacked exception frame pointer the BusFault entry produced. The PC
-/// fix-up reads the faulting instruction at the stacked PC and writes the stacked PC word; it assumes
-/// a precise (synchronous) BusFault so the stacked PC is the faulting instruction's own address. The
-/// resume-on-silicon is validated only on hardware (DF-T6); the advance arithmetic is host-tested.
+/// fix-up reads the instruction halfword at the stacked PC and advances the stacked PC word by that
+/// instruction's decoded width (a RELATIVE one-instruction step, SP-consistent). It does NOT assume the
+/// stacked PC is the faulting instruction: pinned on silicon (DECISIONS.md #15) the stacked PC may be
+/// load+width or even the caller's return address (a late external-region fault). The resume-on-silicon
+/// is validated only on hardware (the F103 real fault on every F10x boot + `bench-fw-faultpin` on the
+/// F1x0); the advance arithmetic is host-tested.
 // Used by `bus_fault_trampoline` (the `arm` naked entry's bridge); unreferenced in a host build.
 #[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
 pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
@@ -967,14 +973,18 @@ pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
     // Clear the BusFault status bits (write-1-to-clear over the whole CFSR is the cortex-m idiom).
     scb.cfsr.write(cfsr);
 
-    // Advance the stacked PC past the faulting probe load so we resume AFTER it. The stacked PC is
-    // word 6 of the exception frame. The advance is the ACTUAL byte-width of the faulting instruction,
-    // DECODED from the instruction stream, not a hardcoded constant: on a synchronous (precise)
-    // BusFault the stacked PC is the faulting instruction's own (even) address, so its first halfword
-    // tells us whether the probe load lowered to a 16- or 32-bit Thumb encoding. A hardcoded skip
-    // desynced when the load lowered to a 16-bit `LDR` (proven at commit 3309e39: `6800 ldr` = 2
-    // bytes, skipped by 4), resuming one halfword PAST the load's function into adjacent code -> a
-    // stale-register branch (IACCVIOL) or a non-Thumb target (INVSTATE). See DECISIONS.md #15.
+    // Advance the stacked PC (word 6) by ONE instruction so we resume past the probe access instead of
+    // re-faulting. The advance is the decoded Thumb width of the instruction AT the stacked PC (not a
+    // hardcoded constant), and it is RELATIVE to the stacked PC, never an absolute code address. This
+    // matters because the stacked PC is NOT reliably the faulting load: pinned on silicon (DECISIONS.md
+    // #15) it is the load+4 (F103 @0x48000000, still in probe_read32) OR the caller's return address
+    // (F130 @0x60000000, probe_read32 already unwound, SP = caller's) -- both instruction boundaries at
+    // a coherent captured SP. A relative one-instruction advance is SP-consistent in every case (the
+    // hardware snapshots PC+SP together); an ABSOLUTE resume would resume against the wrong SP in the
+    // caller-return case -> HardFault. The instruction stepped over is discarded harmlessly (the read's
+    // result is ignored once FAULTED is set). A hardcoded skip desynced when the load lowered to a
+    // 16-bit `LDR` (commit 3309e39: `6800 ldr`=2, skipped by 4), landing one halfword into adjacent
+    // code (IACCVIOL / INVSTATE); the decode removes that assumption. See DECISIONS.md #15.
     let pc = core::ptr::read_volatile(frame.add(STACKED_PC_INDEX));
     // SAFETY: `pc` is the faulting instruction address in flash (readable, 2-byte aligned); masking
     // bit 0 is defensive (a precise-fault stacked PC is already even).
