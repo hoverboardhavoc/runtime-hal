@@ -428,6 +428,7 @@ fn shcsr_set_busfaultena(enable: bool) -> bool {
 /// duration of the family probe, sets `SHCSR.BUSFAULTENA` on entry, and restores both on every exit,
 /// so a precise data-bus error traps to the HAL-internal BusFault handler rather than escalating to
 /// HardFault, and the application defines no fault handler. It does NOT retry or loop.
+#[inline(never)] // O3 fault-path isolation: keep the armed-BusFault window out of the caller (main) so opt-level 3 cannot interleave its register state with the fault-skip; see round-13 F103 regression.
 pub fn run() -> Option<Detected> {
     // The family-probe vector-table swap is strictly probe-scoped: install -> probe -> restore, all
     // inside this call. The HAL's BusFault entry handles a faulted candidate read; every other vector
@@ -468,6 +469,7 @@ pub fn run() -> Option<Detected> {
 /// matched [`Family`] or `None` if neither candidate read cleanly (fail safe). The remaining
 /// observations (flash density, measured counts) are gathered by the caller [`run`] once a family is
 /// known, so this returns only the family decision.
+#[inline(never)] // O3 fault-path isolation: keep the armed-BusFault window out of the caller (main) so opt-level 3 cannot interleave its register state with the fault-skip; see round-13 F103 regression.
 fn probe_family() -> Option<Family> {
     // Step 1: F1x0. Enable GPIOA's clock in the F1x0-correct RCU register, then read GPIOA control.
     rcu_set_bit(RCU_AHBEN, F1X0_PAEN_BIT);
@@ -491,6 +493,7 @@ fn probe_family() -> Option<Family> {
 
 /// Read one candidate GPIOA control register inside the armed fault window. Returns `Some(value)` on
 /// a clean read, `None` if the access bus-faulted (the family-negative signal).
+#[inline(never)] // O3 fault-path isolation: keep the armed-BusFault window out of the caller (main) so opt-level 3 cannot interleave its register state with the fault-skip; see round-13 F103 regression.
 fn probe_candidate(base: u32) -> Option<u32> {
     PROBED_ADDR.store(base, Ordering::SeqCst);
     FAULTED.store(false, Ordering::SeqCst);
@@ -571,6 +574,7 @@ pub fn disarm_busfault(prev: bool) {
 /// `addr` is a candidate peripheral register address; the read is bounded by the armed fault harness
 /// (the caller's [`arm_busfault`] + the HAL's probe-scoped [`bus_fault_entry`] -> `on_bus_fault`), so
 /// a fault on an absent/reserved address is caught and reported as `None` instead of escalating.
+#[inline(never)] // O3 fault-path isolation: keep the armed-BusFault window out of the caller (main) so opt-level 3 cannot interleave its register state with the fault-skip; see round-13 F103 regression.
 pub fn probe_present(addr: u32) -> Option<u32> {
     PROBED_ADDR.store(addr, Ordering::SeqCst);
     FAULTED.store(false, Ordering::SeqCst);
@@ -703,6 +707,7 @@ const ADC_CLOCK_BITS: [u32; 3] = [9, 10, 15];
 ///
 /// NOT host-testable (the same reason as [`run`]: the write-back to an absent slot relies on real
 /// silicon behavior no host/emulator reproduces); validated on the bench.
+#[inline(never)] // O3 fault-path isolation: keep the armed-BusFault window out of the caller (main) so opt-level 3 cannot interleave its register state with the fault-skip; see round-13 F103 regression.
 pub fn measure_counts() -> MeasuredCounts {
     // Probe-scoped vector-table swap around the whole sweep (install -> sweep -> restore).
     with_probe_vector_table(|| {
@@ -755,6 +760,7 @@ pub fn measure_counts() -> MeasuredCounts {
 ///
 /// Side-effect-free: the scratch register (`TIMERx_PSC` / `ADC_WDLT`) only loads a prescaler /
 /// watchdog-threshold shadow and is restored to its reset value (see [`SCRATCH_OFFSET`]).
+#[inline(never)] // O3 fault-path isolation: keep the armed-BusFault window out of the caller (main) so opt-level 3 cannot interleave its register state with the fault-skip; see round-13 F103 regression.
 fn scratch_present(base: u32) -> bool {
     let scratch = base + SCRATCH_OFFSET;
 
