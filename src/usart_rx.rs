@@ -872,6 +872,21 @@ impl RingBufferedRx {
         self.slot.idle_seen.swap(false, Ordering::AcqRel)
     }
 
+    /// **Validation hook**: inject one line error into this receiver's RX slot EXACTLY as the shared
+    /// ERRIE ISR records a real one ([`record_line_error`], into `slot.line_error`), so the next
+    /// [`read`](RingBufferedRx::read) surfaces [`UsartError::LineError`] and self-heals in place (the
+    /// cursor resync in `read`, channel left LIVE) -- the identical recovery path a real wire glitch
+    /// takes. It fabricates NO DMA state: only the sticky slot byte the ISR itself sets; `read`'s own
+    /// snapshot handles the cursor. One call injects one error (a real error already pending is kept,
+    /// per `record_line_error`'s first-wins). This is the controlled-injection stimulus the firmware's
+    /// Gate-1 UART-RX-self-heal sign-off drives over SWD (poke a flag, observe `line_errors` increment
+    /// while the framed link stays live); it is spec'd, permanent, and drives the shipping self-heal
+    /// path rather than a stand-in.
+    #[inline]
+    pub fn inject_line_error(&self) {
+        record_line_error(self.slot, UsartError::Overrun);
+    }
+
     /// True if the next [`read`](RingBufferedRx::read) will make progress: bytes are available
     /// behind the live DMA write position (the same wrap-consistent [`snapshot`](Self::snapshot)
     /// `read` uses, so the B13 pending-wrap case never reads false-negative), or a pending

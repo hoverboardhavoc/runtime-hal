@@ -845,6 +845,52 @@ fn b12_line_error_self_heals_channel_stays_live() {
     );
 }
 
+// --- inject_line_error: the Gate-1 controlled-injection validation hook ------------------------
+//
+// `inject_line_error` records a line error into the RX slot EXACTLY as the ERRIE ISR would (no
+// hardware error staged, no DMA state fabricated), so the next `read` surfaces the same recoverable
+// `LineError` and self-heals in place -- identical to the real b12 path, just triggered by the hook.
+#[test]
+fn inject_line_error_surfaces_a_line_error_and_self_heals() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut rx, ch, ptr) = install_ring(&fam, 32);
+
+    // No hardware error, no ISR: the hook alone records the sticky line error into the slot.
+    rx.inject_line_error();
+
+    // The DMA had written 4 bytes when the (injected) glitch surfaces.
+    for (i, &b) in [10u8, 11, 12, 13].iter().enumerate() {
+        dma_write(ptr, i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(32 - 4);
+
+    // read surfaces the recoverable LineError, resyncs the cursor, leaves the channel LIVE.
+    let mut out = [0u8; 16];
+    assert_eq!(
+        rx.read(&mut out),
+        Err(UsartError::LineError),
+        "the injected error surfaces as the in-place-recoverable LineError"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        CHEN,
+        "channel stays LIVE after an injected line error (self-heal, no disable)"
+    );
+
+    // Cursor resynced to the live write position (4): only fresh bytes drain next.
+    for (i, &b) in [14u8, 15].iter().enumerate() {
+        dma_write(ptr, 4 + i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(32 - 6);
+    let n = rx.read(&mut out).unwrap();
+    assert_eq!(
+        n, 2,
+        "cursor resynced; disturbed bytes dropped, not replayed"
+    );
+    assert_eq!(&out[..2], &[14, 15]);
+}
+
 // --- B12b: an ERRIE *overrun* line error also self-heals (no longer channel-disabling) ----------
 //
 // Previously an ERRIE overrun DISABLED the channel while a lap was recoverable-in-place; that split

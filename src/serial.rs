@@ -282,6 +282,19 @@ impl<R: RxBackend> SplitSerial<R> {
     }
 }
 
+impl SplitSerial<RingBufferedRx> {
+    /// **Validation hook** (DMA-ring backend only): inject one line error into the RX path exactly as
+    /// the ERRIE ISR would record it, so the next [`read`](Read::read) surfaces it (counted into
+    /// [`line_errors`](Self::line_errors)) and self-heals in place. Passthrough to
+    /// [`RingBufferedRx::inject_line_error`]; see its docs. Concrete to the DMA-ring backend because
+    /// that is the always-on framed inter-board UART link the firmware's Gate-1 self-heal sign-off
+    /// drives over SWD (`BufferedRx` has no such exercised hook).
+    #[inline]
+    pub fn inject_line_error(&self) {
+        self.rx.inject_line_error();
+    }
+}
+
 impl<R: RxBackend> ErrorType for SplitSerial<R> {
     type Error = Infallible;
 }
