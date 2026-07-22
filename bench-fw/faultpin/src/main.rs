@@ -13,10 +13,15 @@
 //!
 //! This image closes that gap. It deliberately reads a KNOWN-reserved, bus-faulting address
 //! (`0x6000_0000`, the unpopulated FSMC / external-memory region on these parts) through runtime-hal's
-//! public armed-probe harness, so the HAL's naked BusFault entry and the width-decode PC fixup run on
+//! public armed-probe harness, so the HAL's naked BusFault entry and the range-gated PC fixup run on
 //! REAL silicon of BOTH the F103 and the F130. (The round-14 pinning showed the F1x0's late external
 //! fault stacks the CALLER's frame, which is exactly why an absolute symbol-anchored resume was
-//! rejected: only a relative advance is SP-consistent in every observed frame.) It records:
+//! rejected: only a relative advance is SP-consistent in every observed frame.) Round 18 range-gated
+//! the fixup on `probe_read32`'s code extent, so this F1x0 caller-frame case is now the on-silicon
+//! coverage of the OUT-of-function branch: the handler leaves the stacked PC UNCHANGED and the caller
+//! RE-EXECUTES its not-yet-run instruction (rather than the old skip). The recorded observables are
+//! unchanged by the gate -- both resume cleanly -- so a clean run (magic written) still validates it.
+//! It records:
 //!   - `faulted`  = 1 if the read bus-faulted and was caught (`probe_present` returned `None`),
 //!   - `readback` = the value the read returned (garbage on a fault; meaningful only if `faulted == 0`),
 //!   - `magic`    = written LAST, so a reader seeing it knows the fault was caught AND execution

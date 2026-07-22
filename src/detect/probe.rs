@@ -30,21 +30,29 @@
 //!   candidate access, disarmed after a clean read), `PROBED_ADDR` (the candidate base, so the
 //!   handler can confirm `BFAR == PROBED_ADDR`), and `FAULTED` (the handler sets it so the probe
 //!   learns the access faulted).
-//! - **The PC fixup (the risk).** On a faulted access the handler MUST advance the stacked return PC
-//!   to the NEXT instruction boundary so execution resumes past the probe access instead of
-//!   re-executing it (which would re-fault forever). The advance is a RELATIVE one-instruction step:
-//!   the decoded Thumb width of the instruction AT the stacked PC (`thumb_instr_bytes`: 4 for 32-bit
-//!   Thumb-2, 2 for 16-bit), NOT a hardcoded constant and NOT an absolute resume address. Pinned on
-//!   silicon (DECISIONS.md #15), the stacked PC is not reliably the faulting load -- it may be
-//!   load+width (F103) or the caller's return address (F130 late external-region fault) -- so only a
-//!   relative advance stays SP-consistent; an absolute resume would fault against the wrong SP. A
-//!   hardcoded skip is silicon-fragile: it desynced when the probe read lowered to a 16-bit `LDR` while
-//!   the handler still skipped 4, resuming one halfword past the load into adjacent code (DECISIONS.md #15). The
-//!   probe still emits the load as a single 32-bit `LDR.W` (`probe_read32`, `#[inline(never)]`) for a
-//!   clean single access, but the handler no longer DEPENDS on that width. The access is placed
-//!   outside any IT block (a plain call) so the xPSR IT-state complication does not arise. **The
-//!   fixup's resume-on-silicon is validated ONLY on hardware**; no host/emulator raises the fault it
-//!   fixes up (spec section 8.2), though the decode + advance arithmetic is now host-tested.
+//! - **The PC fixup (the risk).** On a faulted access the handler fixes up the stacked return PC so
+//!   execution resumes correctly instead of re-faulting forever. The fixup is RANGE-GATED against
+//!   `probe_read32`'s code extent (DECISIONS.md #15), because pinned on silicon the stacked PC is NOT
+//!   reliably the faulting load and VARIES by fault region:
+//!   - **In-function** (F103: stacked PC = `ldr.w + 4`, still inside `probe_read32`): the load began,
+//!     so ADVANCE the stacked PC by the decoded Thumb width of the instruction AT the stacked PC
+//!     (`thumb_instr_bytes`: 4 for 32-bit Thumb-2, 2 for 16-bit), a RELATIVE one-instruction step, NOT
+//!     a hardcoded constant and NOT an absolute resume address. A hardcoded skip is silicon-fragile: it
+//!     desynced when the probe read lowered to a 16-bit `LDR` while the handler still skipped 4,
+//!     resuming one halfword past the load into adjacent code (DECISIONS.md #15).
+//!   - **Out of function** (F130 late external-region fault: stacked PC = the caller's return address,
+//!     `probe_read32` already unwound): the consumer instruction there has NOT executed, so
+//!     re-execution is EXACT -- leave the stacked PC UNCHANGED. The extent comes from the linker
+//!     encapsulation symbols bracketing `probe_read32`'s own section (`probe_read32_extent`), so the
+//!     gate is correct by construction, not by codegen luck.
+//!
+//! A relative advance stays SP-consistent (the hardware snapshots PC+SP together); an absolute resume
+//! would fault against the wrong SP. The probe still emits the load as a single 32-bit `LDR.W`
+//! (`probe_read32`, `#[inline(never)]`, its own `#[link_section]`) for a clean single access, but the
+//! handler no longer DEPENDS on that width. The access is placed outside any IT block (a plain call)
+//! so the xPSR IT-state complication does not arise. **The fixup's resume-on-silicon is validated
+//! ONLY on hardware**; no host/emulator raises the fault it fixes up (spec section 8.2), though the
+//! decode + advance + range-gate arithmetic is now host-tested.
 //!
 //! # Who owns the BusFault handler (the HAL, via a probe-scoped vector table)
 //!
@@ -345,6 +353,7 @@ pub struct Detected {
 /// fault on the wrong-family (reserved) base is caught instead of escalating.
 #[cfg(target_arch = "arm")]
 #[inline(never)]
+#[link_section = "probe_read32"]
 fn probe_read32(addr: u32) -> u32 {
     let value: u32;
     // SAFETY: the access is bounded by the armed fault harness (EXPECTING_FAULT + the BusFault
@@ -358,6 +367,42 @@ fn probe_read32(addr: u32) -> u32 {
         );
     }
     value
+}
+
+// `probe_read32` is placed in its OWN linker section (a valid C-identifier name), so the linker emits
+// the encapsulation boundary symbols `__start_probe_read32` / `__stop_probe_read32` bracketing its
+// code (both GNU ld and rust-lld generate these for such sections; the `linkme`/kernel pattern). The
+// range `[__start_probe_read32, __stop_probe_read32)` is `probe_read32`'s exact code extent, which
+// `on_bus_fault` range-gates the stacked-PC advance against (DECISIONS.md #15): the F103 in-function
+// fault stacks a PC INSIDE this range (advance one instruction), the F130 caller-frame late fault
+// stacks a PC OUTSIDE it, in `probe_present`/`probe_candidate` (leave unchanged, re-execute the
+// not-yet-run consumer). Owned entirely by the HAL (the attribute + the symbol decls), no firmware
+// linker-script edit.
+#[cfg(target_arch = "arm")]
+extern "C" {
+    static __start_probe_read32: u8;
+    static __stop_probe_read32: u8;
+}
+
+/// The `[lo, hi)` flash code extent of [`probe_read32`], from the linker encapsulation symbols.
+#[cfg(target_arch = "arm")]
+#[inline]
+fn probe_read32_extent() -> (u32, u32) {
+    // Linker-defined boundary symbols; only their ADDRESSES are taken (never dereferenced), and they
+    // bracket `probe_read32`'s section. `addr_of!` of a static needs no `unsafe`.
+    (
+        core::ptr::addr_of!(__start_probe_read32) as u32,
+        core::ptr::addr_of!(__stop_probe_read32) as u32,
+    )
+}
+
+/// Host stub for [`probe_read32_extent`]: no linker section / boundary symbols exist on the host, and
+/// the probe never runs there, so this is dead (the range-gate DECISION is host-tested directly via
+/// [`resume_pc_range_gated`] with explicit bounds). Returns an empty range.
+#[cfg(not(target_arch = "arm"))]
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+fn probe_read32_extent() -> (u32, u32) {
+    (0, 0)
 }
 
 /// Host stub for [`probe_read32`] (mock / non-`arm` builds): the probe never runs on the host, and
@@ -834,6 +879,30 @@ fn resume_pc_after_probe_load(stacked_pc: u32, first_halfword: u16) -> u32 {
     stacked_pc.wrapping_add(thumb_instr_bytes(first_halfword))
 }
 
+/// The range-gated stacked-PC fixup decision (DECISIONS.md #15, the round-14 correct-by-construction
+/// upgrade). `[lo, hi)` is [`probe_read32`]'s code extent:
+///
+/// - **In-function** (`lo <= stacked_pc < hi`): the F103 real fault stacks a PC INSIDE `probe_read32`
+///   (the pinned `ldr.w + 4`), so the faulting load DID begin; advance past it by the decoded Thumb
+///   width so the resume does not re-fault (the read result is discarded once `FAULTED` is set).
+/// - **Out of function** (`stacked_pc` outside `[lo, hi)`): the F130 late external-region fault stacks
+///   the CALLER's return address (`probe_read32` already unwound). Re-execution is EXACT there: the
+///   consumer instruction at the stacked PC has NOT executed, so leave the stacked PC UNCHANGED. The
+///   old unconditional advance skipped that not-yet-run caller instruction (benign only because the
+///   fault path guards the sole consumer); this makes it correct by construction.
+///
+/// Pure (no memory access), so the decision is host-testable; the handler reads `first_halfword` only
+/// when in-range (so it never reads a caller instruction it will not step over).
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+#[inline]
+fn resume_pc_range_gated(stacked_pc: u32, lo: u32, hi: u32, first_halfword: u16) -> u32 {
+    if stacked_pc >= lo && stacked_pc < hi {
+        resume_pc_after_probe_load(stacked_pc, first_halfword)
+    } else {
+        stacked_pc
+    }
+}
+
 /// The HAL-internal naked BusFault entry the probe-scoped vector table points at.
 ///
 /// The hardware calls this DIRECTLY from the relocated table on a BusFault: on entry the core has
@@ -935,26 +1004,31 @@ unsafe extern "C" fn bus_fault_trampoline(frame: *mut u32) -> u32 {
 /// The BusFault handler body the HAL's probe-scoped vector entry ([`bus_fault_entry`]) delegates to.
 ///
 /// `frame` is the stacked exception frame pointer (8 `u32` words: r0..r3, r12, lr, pc, xpsr). On a
-/// PROBE fault (the access we armed) this advances the stacked PC past the faulting load by that
-/// load's DECODED Thumb width (2 or 4 bytes; see [`resume_pc_after_probe_load`]) so the `LDR` is
-/// skipped on return, clears the BusFault status, records `FAULTED`, and returns (resuming after the
-/// probe access). Only the stacked PC (word 6) is touched; the stacked xPSR (word 7, carrying the
-/// Thumb bit) is left intact, so the exception return restores Thumb state unchanged. On a NON-probe
-/// fault (`EXPECTING_FAULT` is `false`) it does NOT fix up; it returns `false` so the entry can spin
-/// (a real bus fault outside the probe is a genuine error, and detection has no production handler to
-/// escalate to).
+/// PROBE fault (the access we armed) this fixes up the stacked PC, RANGE-GATED against `probe_read32`'s
+/// code extent (see [`resume_pc_range_gated`] and DECISIONS.md #15): if the stacked PC is INSIDE
+/// `probe_read32` (the F103 in-function case) it advances past the faulting load by that load's DECODED
+/// Thumb width (2 or 4 bytes) so the `LDR` is skipped on return; if the stacked PC is OUTSIDE it (the
+/// F130 caller-frame late fault, `probe_read32` already unwound) it leaves the stacked PC UNCHANGED so
+/// the not-yet-run caller instruction re-executes exactly. Either way it clears the BusFault status,
+/// records `FAULTED`, and returns. Only the stacked PC (word 6) is ever touched; the stacked xPSR
+/// (word 7, carrying the Thumb bit) is left intact, so the exception return restores Thumb state
+/// unchanged. On a NON-probe fault (`EXPECTING_FAULT` is `false`) it does NOT fix up; it returns
+/// `false` so the entry can spin (a real bus fault outside the probe is a genuine error, and detection
+/// has no production handler to escalate to).
 ///
 /// Returns `true` if it handled (fixed up) a probe fault, `false` if the fault was not an armed probe
 /// access.
 ///
 /// # Safety
 /// `frame` must be the valid stacked exception frame pointer the BusFault entry produced. The PC
-/// fix-up reads the instruction halfword at the stacked PC and advances the stacked PC word by that
-/// instruction's decoded width (a RELATIVE one-instruction step, SP-consistent). It does NOT assume the
+/// fix-up is RANGE-GATED against `probe_read32`'s code extent (`probe_read32_extent`, from the linker
+/// encapsulation symbols): only when the stacked PC lies INSIDE that extent does it read the
+/// instruction halfword at the stacked PC and advance by the decoded width (a RELATIVE step,
+/// SP-consistent); a stacked PC OUTSIDE it is left unchanged (re-execute). It does NOT assume the
 /// stacked PC is the faulting instruction: pinned on silicon (DECISIONS.md #15) the stacked PC may be
-/// load+width or even the caller's return address (a late external-region fault). The resume-on-silicon
-/// is validated only on hardware (the F103 real fault on every F10x boot + `bench-fw-faultpin` on the
-/// F1x0); the advance arithmetic is host-tested.
+/// load+width (F103, in-function) or the caller's return address (F130, a late external-region fault).
+/// The resume-on-silicon is validated only on hardware (the F103 real fault on every F10x boot +
+/// `bench-fw-faultpin` on the F1x0); the advance + range-gate arithmetic is host-tested.
 // Used by `bus_fault_trampoline` (the `arm` naked entry's bridge); unreferenced in a host build.
 #[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
 pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
@@ -973,26 +1047,33 @@ pub(crate) unsafe fn on_bus_fault(frame: *mut u32) -> bool {
     // Clear the BusFault status bits (write-1-to-clear over the whole CFSR is the cortex-m idiom).
     scb.cfsr.write(cfsr);
 
-    // Advance the stacked PC (word 6) by ONE instruction so we resume past the probe access instead of
-    // re-faulting. The advance is the decoded Thumb width of the instruction AT the stacked PC (not a
-    // hardcoded constant), and it is RELATIVE to the stacked PC, never an absolute code address. This
-    // matters because the stacked PC is NOT reliably the faulting load: pinned on silicon (DECISIONS.md
-    // #15) it is the load+4 (F103 @0x48000000, still in probe_read32) OR the caller's return address
-    // (F130 @0x60000000, probe_read32 already unwound, SP = caller's) -- both instruction boundaries at
-    // a coherent captured SP. A relative one-instruction advance is SP-consistent in every case (the
-    // hardware snapshots PC+SP together); an ABSOLUTE resume would resume against the wrong SP in the
-    // caller-return case -> HardFault. The instruction stepped over is discarded harmlessly (the read's
-    // result is ignored once FAULTED is set). A hardcoded skip desynced when the load lowered to a
-    // 16-bit `LDR` (commit 3309e39: `6800 ldr`=2, skipped by 4), landing one halfword into adjacent
-    // code (IACCVIOL / INVSTATE); the decode removes that assumption. See DECISIONS.md #15.
+    // Fix up the stacked PC (word 6), RANGE-GATED against probe_read32's code extent (DECISIONS.md
+    // #15, the round-14 correct-by-construction upgrade). The stacked PC is NOT reliably the faulting
+    // load, and its location VARIES by fault region (pinned on silicon):
+    //   - IN-function (F103 @0x48000000, stacked PC = load+4, still inside probe_read32): the load DID
+    //     begin, so ADVANCE past it by the decoded Thumb width of the instruction AT the stacked PC
+    //     (RELATIVE, never an absolute address; a fixed +4 desynced when the load lowered to a 16-bit
+    //     `LDR`, commit 3309e39 IACCVIOL/INVSTATE). SP-consistent because the hardware snapshots PC+SP
+    //     together, and the stepped-over instruction is discarded (the read result is ignored once
+    //     FAULTED is set).
+    //   - OUT of function (F130 @0x60000000, late external-region fault: stacked PC = the CALLER's
+    //     return address in probe_present/probe_candidate, probe_read32 already unwound): the consumer
+    //     instruction there has NOT executed, so re-execution is EXACT -- leave the stacked PC UNCHANGED.
+    //     The former unconditional advance skipped that not-yet-run caller instruction (benign only
+    //     because the fault path guards its sole consumer); the range gate makes it correct.
     let pc = core::ptr::read_volatile(frame.add(STACKED_PC_INDEX));
-    // SAFETY: `pc` is the faulting instruction address in flash (readable, 2-byte aligned); masking
-    // bit 0 is defensive (a precise-fault stacked PC is already even).
-    let first_halfword = core::ptr::read_volatile((pc & !1) as *const u16);
-    core::ptr::write_volatile(
-        frame.add(STACKED_PC_INDEX),
-        resume_pc_after_probe_load(pc, first_halfword),
-    );
+    let (lo, hi) = probe_read32_extent();
+    if pc >= lo && pc < hi {
+        // In-function: read the faulting instruction's first halfword and advance by its decoded width.
+        // SAFETY: `pc` is inside probe_read32's flash extent (readable, 2-byte aligned); masking bit 0
+        // is defensive (a precise-fault stacked PC is already even).
+        let first_halfword = core::ptr::read_volatile((pc & !1) as *const u16);
+        core::ptr::write_volatile(
+            frame.add(STACKED_PC_INDEX),
+            resume_pc_range_gated(pc, lo, hi, first_halfword),
+        );
+    }
+    // else: caller-frame late fault -- leave word 6 unchanged so the caller re-executes exactly.
 
     FAULTED.store(true, Ordering::SeqCst);
     true
@@ -1143,6 +1224,48 @@ mod table_tests {
             assert_eq!(resume_pc_after_probe_load(pc, 0xF8D0) & 1, 0);
             assert_eq!(resume_pc_after_probe_load(pc, 0x6800) & 1, 0);
         }
+    }
+
+    #[test]
+    fn range_gate_advances_in_function_pc_and_leaves_caller_frame_pc() {
+        // probe_read32's code extent (a stand-in range; the real bounds come from the linker symbols).
+        let lo = 0x0800_0d00u32;
+        let hi = 0x0800_0d20u32; // [lo, hi)
+                                 // IN-function (the F103 case: stacked PC = load+4, inside probe_read32): advance by the
+                                 // decoded width of the instruction at the stacked PC.
+        let in_pc = 0x0800_0d06u32; // load (0d02) + 4, still inside
+        assert_eq!(
+            resume_pc_range_gated(in_pc, lo, hi, 0xF8D0),
+            in_pc + 4,
+            "in-function 32-bit instruction advances by 4"
+        );
+        assert_eq!(
+            resume_pc_range_gated(in_pc, lo, hi, 0x6800),
+            in_pc + 2,
+            "in-function 16-bit instruction advances by 2"
+        );
+        // OUT of function (the F130 case: stacked PC = the caller's return address, past probe_read32):
+        // leave the stacked PC UNCHANGED so the not-yet-run consumer re-executes exactly.
+        let caller_pc = 0x0800_1a44u32; // in probe_present, outside [lo, hi)
+        assert_eq!(
+            resume_pc_range_gated(caller_pc, lo, hi, 0xF8D0),
+            caller_pc,
+            "caller-frame PC is unchanged (re-execute, do not skip)"
+        );
+        // A PC below the range is also out-of-function -> unchanged.
+        assert_eq!(resume_pc_range_gated(lo - 2, lo, hi, 0xF8D0), lo - 2);
+    }
+
+    #[test]
+    fn range_gate_boundaries_lo_inclusive_hi_exclusive() {
+        let lo = 0x0800_0d00u32;
+        let hi = 0x0800_0d20u32;
+        // lo is inside (>= lo): advance.
+        assert_eq!(resume_pc_range_gated(lo, lo, hi, 0x6800), lo + 2);
+        // hi is outside (< hi is false): unchanged.
+        assert_eq!(resume_pc_range_gated(hi, lo, hi, 0x6800), hi);
+        // hi - 2 (last in-range halfword) is inside: advance.
+        assert_eq!(resume_pc_range_gated(hi - 2, lo, hi, 0x6800), hi);
     }
 
     #[test]
