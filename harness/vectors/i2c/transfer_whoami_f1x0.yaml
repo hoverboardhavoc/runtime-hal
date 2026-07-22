@@ -18,12 +18,15 @@ description: |
   on coding style, not on whether the polls happen. The block layout is identical
   on both families, so transfer_whoami_f10x carries the same body.
 
-  runtime-hal: I2c::bring_up(...); I2c::write_read(0x68, &[0x75], &mut [0u8; 1]).
-  Sequence (the classic event-based handshake, mirroring i2c_probe.c):
-    phase 1 (write reg ptr, no STOP): START -> SBSEND -> addr+W -> ADDSEND ->
-      clear ADDSEND (read STAT0 then STAT1) -> TBE -> write 0x75 -> BTC;
-    phase 2 (repeated START, read 1): START -> SBSEND -> addr+R -> ACK off ->
-      ADDSEND -> clear ADDSEND -> STOP -> RBNE -> read byte -> ACK on.
+  runtime-hal: I2c::new(...); I2c::write_read(0x68, &[0x75], &mut [0u8; 1]).
+  Sequence (the classic event-based handshake, mirroring i2c_probe.c; the read
+  is the manual's Solution-B N=1 path per src/i2c.rs read_inner):
+    phase 1 (fresh write of the reg ptr, no STOP): bus-idle gate (read STAT1,
+      I2CBSY clear) -> START -> SBSEND -> addr+W -> ADDSEND -> clear ADDSEND
+      (read STAT0 then STAT1) -> TBE -> write 0x75 -> BTC;
+    phase 2 (repeated START, not fresh, read 1 -- Solution B N=1): START ->
+      SBSEND -> addr+R -> ACK off -> ADDSEND -> clear ADDSEND -> STOP -> RBNE ->
+      read byte -> ACK on.
 
   SEED PROVENANCE / re-seed flag (T7 caveat, the I2C analogue of CLOCK-1): the
   STAT0/STAT1 stub sequence below is SPL-DERIVED -- it is the exact set of flags
@@ -51,10 +54,19 @@ mode: with_polling
 #   0x02 ADDSEND  (phase-2 address ACK)
 #   0x02 clear-ADDSEND STAT0 read
 #   0x40 RBNE     (received byte available)
-# STAT1 (0x18) is read once per clear-ADDSEND (twice total); value irrelevant.
+# STAT1 (0x18) is read at the fresh write's bus-idle gate (I2CBSY clear) and once
+# per clear-ADDSEND (three reads total); all return 0 (bus idle; value else
+# irrelevant). The list is last-sticks, so 0x00,0x00 covers every STAT1 read.
 read_responses:
   "<I2C0_BASE>+0x14": [0x01, 0x02, 0x02, 0x80, 0x04, 0x01, 0x02, 0x02, 0x40]
   "<I2C0_BASE>+0x18": [0x00, 0x00]
+
+# The polled transfer handshake is what this vector proves; the RCU clock-enables and
+# the GPIOB SCL/SDA bring-up (plus the round-18 warm-reset I2C bus-clear, which pokes
+# GPIO before the peripheral claims the pins) are noise here. Scope the compare to the
+# I2C0 block so the golden pins the transfer choreography, not the routing.
+assert_only:
+  - "<I2C0_BASE>"
 
 implementations:
   runtime-hal/gd32f1x0:
@@ -86,9 +98,11 @@ implementations:
               (pins.pb6, pins.pb7), I2cMode::standard(100_000)).unwrap();
           let mut who = [0u8; 1];
           // IMU WHO_AM_I: write reg pointer 0x75 to 0x68 (no STOP), repeated START, read 1 byte.
-          // This is exactly what the embedded-hal i2c::I2c::write_read impl does (write_bytes(.., false)
-          // then read_bytes(.., true)); the inherent calls avoid pulling embedded-hal into the snippet
-          // crate while tracing the identical sequence. The trait surface is covered by host tests.
-          let _ = dev.write_bytes(0x68, &[0x75], false);
-          let _ = dev.read_bytes(0x68, &mut who, true);
+          // This is exactly what the embedded-hal i2c::I2c::write_read impl does: a fresh write with
+          // no STOP (write_bytes(.., fresh=true, stop=false)) then a not-fresh read that keeps the
+          // bus via the repeated START (read_bytes(.., fresh=false)). The inherent calls avoid
+          // pulling embedded-hal into the snippet crate while tracing the identical sequence; the
+          // trait surface is covered by host tests.
+          let _ = dev.write_bytes(0x68, &[0x75], true, false);
+          let _ = dev.read_bytes(0x68, &mut who, false);
       }

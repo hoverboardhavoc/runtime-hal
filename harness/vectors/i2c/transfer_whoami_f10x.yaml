@@ -17,6 +17,12 @@ read_responses:
   "<I2C0_BASE>+0x14": [0x01, 0x02, 0x02, 0x80, 0x04, 0x01, 0x02, 0x02, 0x40]
   "<I2C0_BASE>+0x18": [0x00, 0x00]
 
+# Scope the compare to the I2C0 block: the RCU clock-enables, the GPIOB SCL/SDA bring-up,
+# and the round-18 warm-reset bus-clear GPIO pokes are noise; the golden pins the polled
+# transfer choreography. See transfer_whoami_f1x0 for the full rationale.
+assert_only:
+  - "<I2C0_BASE>"
+
 implementations:
   runtime-hal/gd32f10x:
     body: |
@@ -45,7 +51,8 @@ implementations:
           let dev = I2c::new(&chip, &ClockConfig::REFERENCE_72M_IRC8M, PeriphLabel::I2c0,
               (pins.pb6, pins.pb7), I2cMode::standard(100_000)).unwrap();
           let mut who = [0u8; 1];
-          // The embedded-hal write_read sequence via the inherent calls (see transfer_whoami_f1x0).
-          let _ = dev.write_bytes(0x68, &[0x75], false);
-          let _ = dev.read_bytes(0x68, &mut who, true);
+          // The embedded-hal write_read sequence via the inherent calls (see transfer_whoami_f1x0):
+          // a fresh no-STOP write then a not-fresh read that keeps the bus via the repeated START.
+          let _ = dev.write_bytes(0x68, &[0x75], true, false);
+          let _ = dev.read_bytes(0x68, &mut who, false);
       }
