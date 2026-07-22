@@ -6,7 +6,9 @@
 #![cfg(feature = "mock")]
 
 use crate::descriptor::GpioPath;
-use crate::gpio::{configure_af, configure_output, set_pin, GpioOutput, PinRole};
+use crate::gpio::{
+    configure_af, configure_output, configure_output_od, set_pin, GpioOutput, PinRole,
+};
 use crate::reg::{mock, Reg32};
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
 use std::sync::MutexGuard;
@@ -426,6 +428,42 @@ fn f1x0_output_pb9_sets_ctl_omode_ospd() {
     // No AF mux written for a plain output.
     assert_eq!(read(AFSEL1), 0);
     assert_eq!(read(AFSEL0), 0);
+}
+
+// --- general-purpose OPEN-DRAIN output (configure_output_od; the warm-reset I2C bus-clear drive) --
+
+#[test]
+fn f10x_output_od_pb9_is_gp_open_drain_50mhz_nibble() {
+    let _g = seed();
+    // pull_up is ignored on F10x (no per-pin pull for outputs; external resistor).
+    configure_output_od(PORT_BASE, GpioPath::ApbCrlCrh, PB9, true);
+    // Pin 9 -> CTL1 nibble at [7:4]. GP open-drain 50MHz = CNF 0b01 | MODE 0b11 = 0x7.
+    assert_eq!(read(CTL1), 0x7 << 4);
+    assert_eq!(read(CTL0), 0);
+}
+
+#[test]
+fn f1x0_output_od_pb9_sets_ctl_omode_ospd_and_pullup() {
+    let _g = seed();
+    configure_output_od(PORT_BASE, GpioPath::AhbCtlAfsel, PB9, true);
+    // CTL: pin 9, 2 bits at [19:18], output mode = 1.
+    assert_eq!(read(CTL), 1 << 18);
+    // OMODE: pin 9 bit SET (open-drain = 1).
+    assert_eq!(read(OMODE) & (1 << 9), 1 << 9);
+    // OSPD: pin 9, 2 bits at [19:18], 50MHz = 3.
+    assert_eq!(read(OSPD), 3 << 18);
+    // PUD: pin 9, 2 bits at [19:18], pull-up = 1.
+    assert_eq!(read(PUD), 1 << 18);
+    // No AF mux written for a plain (non-AF) output.
+    assert_eq!(read(AFSEL1), 0);
+}
+
+#[test]
+fn f1x0_output_od_pb9_no_pullup_leaves_pud_floating() {
+    let _g = seed();
+    configure_output_od(PORT_BASE, GpioPath::AhbCtlAfsel, PB9, false);
+    assert_eq!(read(OMODE) & (1 << 9), 1 << 9, "still open-drain");
+    assert_eq!(read(PUD), 0, "no pull configured");
 }
 
 #[test]

@@ -499,3 +499,109 @@ fn timeout_maps_to_other() {
     let e = dev.write(IMU, &[0x00]).unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Other);
 }
+
+// --- warm-reset bus-clear sequencer (round-10 hang) -------------------------------------------
+//
+// The bit-bang itself is silicon-only; the DECISION LOGIC (only-if-needed, the pulse bound, the
+// early-stop, the trailing STOP) is pure and host-tested here through `bus_clear_seq` with recording
+// closures. Levels: `drive_*(true)` releases the line, `drive_*(false)` drives it low.
+
+/// One recorded line event from the closures: which line, and the level driven (`false` = low).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ev {
+    Scl(bool),
+    Sda(bool),
+}
+
+#[test]
+fn bus_clear_clean_bus_issues_no_pulses_and_no_stop() {
+    // SDA reads high from the start: the bus is clean, so recovery is skipped entirely.
+    let events = core::cell::RefCell::new(Vec::<Ev>::new());
+    let n = bus_clear_seq(
+        || true,
+        |high| events.borrow_mut().push(Ev::Scl(high)),
+        |high| events.borrow_mut().push(Ev::Sda(high)),
+        || {},
+    );
+    assert_eq!(n, 0, "a clean bus issues zero pulses");
+    // No SCL low pulse and no SDA low (a STOP needs an SDA low->high edge, never generated here).
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|e| matches!(e, Ev::Scl(false) | Ev::Sda(false))),
+        "clean bus must not drive either line low: {:?}",
+        events.borrow()
+    );
+}
+
+#[test]
+fn bus_clear_stuck_bus_issues_the_full_bound() {
+    // SDA never releases: the sequencer must clock exactly BUS_CLEAR_MAX_PULSES (9) times and stop.
+    let mut scl_low = 0u32;
+    let n = bus_clear_seq(
+        || false,
+        |high| {
+            if !high {
+                scl_low += 1;
+            }
+        },
+        |_| {},
+        || {},
+    );
+    assert_eq!(
+        n, BUS_CLEAR_MAX_PULSES,
+        "a never-releasing slave hits the 9-pulse bound"
+    );
+    assert_eq!(scl_low, BUS_CLEAR_MAX_PULSES, "one SCL low edge per pulse");
+}
+
+#[test]
+fn bus_clear_stops_as_soon_as_sda_releases() {
+    // SDA low for the first few reads, then high: the loop stops early (fewer than 9 pulses).
+    // read_sda calls: [0]=only-if-needed check, then one per while-condition. Return high once the
+    // call index reaches `release_at`, so pulses issued = release_at - 1.
+    for release_at in 1..=BUS_CLEAR_MAX_PULSES {
+        let mut call = 0u32;
+        let mut scl_low = 0u32;
+        let n = bus_clear_seq(
+            || {
+                let high = call >= release_at;
+                call += 1;
+                high
+            },
+            |high| {
+                if !high {
+                    scl_low += 1;
+                }
+            },
+            |_| {},
+            || {},
+        );
+        assert_eq!(n, release_at - 1, "stops the pulse train when SDA releases");
+        assert!(n < BUS_CLEAR_MAX_PULSES);
+        assert_eq!(scl_low, n, "one SCL low edge per issued pulse");
+    }
+}
+
+#[test]
+fn bus_clear_generates_a_trailing_stop_after_recovery() {
+    // A stuck bus that never releases still ends with a STOP: an SDA low->high transition while SCL
+    // is left released high. Record the tail of the event stream and check the STOP edge.
+    let events = core::cell::RefCell::new(Vec::<Ev>::new());
+    let n = bus_clear_seq(
+        || false,
+        |high| events.borrow_mut().push(Ev::Scl(high)),
+        |high| events.borrow_mut().push(Ev::Sda(high)),
+        || {},
+    );
+    assert_eq!(n, BUS_CLEAR_MAX_PULSES);
+    // The final three line events are the STOP: SCL released high, SDA low, SDA high.
+    let ev = events.borrow();
+    let tail: Vec<Ev> = ev.iter().rev().take(3).rev().copied().collect();
+    assert_eq!(
+        tail,
+        vec![Ev::Scl(true), Ev::Sda(false), Ev::Sda(true)],
+        "STOP = SDA low->high while SCL is high: {ev:?}"
+    );
+}

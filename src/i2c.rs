@@ -293,6 +293,64 @@ pub struct I2c {
 /// the SPL only depends on writing it directly the SPL way).
 const MASTER_OWN_ADDR: u8 = 0x24;
 
+/// The maximum SCL pulses a bus-clear issues: 9 (a full stuck byte's 8 data clocks + the ACK clock),
+/// the standard I2C recovery clock count (NXP UM10204 / AN10216 §3.1.7 "bus clear").
+const BUS_CLEAR_MAX_PULSES: u32 = 9;
+
+/// Pure I2C bus-clear sequencer, driven by pin closures so the decision logic (and the pulse bound)
+/// is host-testable without silicon.
+///
+/// A slave that was mid-READ when the master reset (a warm MCU reset, NOT a POR) can be left holding
+/// SDA low, wedging the bus so the next master bring-up's `probe` bus-errors (the round-10 warm-reset
+/// hang; POR-cleared only). This clocks the slave out: if SDA is already high the bus is clean and NO
+/// pulses are issued (only-if-needed); otherwise it pulses SCL (drive low, release high) up to
+/// [`BUS_CLEAR_MAX_PULSES`] times, stopping as SOON as the slave releases SDA, then generates a STOP
+/// (SDA low then released high while SCL is high) to leave the bus idle for the peripheral. Returns the
+/// number of SCL pulses issued (0 on a clean bus, at most 9), so the pulse bound is host-assertable.
+///
+/// The closures ARE the HAL gpio surface bound by the hardware caller ([`set_pin`](crate::gpio) /
+/// [`read_pin`](crate::gpio)); this function pokes no registers itself (SPEC: no ad-hoc register access
+/// from the I2C module, route through the HAL gpio surface). `drive_*(true)` RELEASES the open-drain
+/// line (high-Z, pulled up); `drive_*(false)` drives it low.
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+fn bus_clear_seq(
+    mut read_sda: impl FnMut() -> bool,
+    mut drive_scl: impl FnMut(bool),
+    mut drive_sda: impl FnMut(bool),
+    mut settle: impl FnMut(),
+) -> u32 {
+    // Start with both lines released (high-Z, pulled up) and let them settle.
+    drive_scl(true);
+    drive_sda(true);
+    settle();
+
+    // Only-if-needed: a clean bus (SDA reads high) needs no recovery at all.
+    if read_sda() {
+        return 0;
+    }
+
+    // Clock the stuck slave out: SCL pulses (low then release-high), stopping when SDA releases.
+    let mut pulses = 0;
+    while pulses < BUS_CLEAR_MAX_PULSES && !read_sda() {
+        drive_scl(false);
+        settle();
+        drive_scl(true);
+        settle();
+        pulses += 1;
+    }
+
+    // STOP: with SCL released high, pull SDA low then release it high. A low->high SDA edge while SCL
+    // is high is a STOP condition, which returns any confused slave to its idle state.
+    drive_scl(true);
+    settle();
+    drive_sda(false);
+    settle();
+    drive_sda(true);
+    settle();
+
+    pulses
+}
+
 impl I2c {
     /// Bring up the I2C master, CONSUMING the SCL/SDA [`Pin`] handles from `split()`.
     ///
@@ -329,6 +387,14 @@ impl I2c {
         // 2. Enable the I2C peripheral clock (the GPIO-port clock was enabled by `chip.gpiob()`).
         crate::clock::enable_i2c(chip.rcu_base()?, chip.clock(), instance)?;
 
+        // 2a. Warm-reset bus-clear (round-10 warm-reset I2C hang): a warm MCU reset mid-transaction can
+        //     leave a slave holding SDA low, wedging the bus so the NEXT bring-up's `probe` bus-errors
+        //     (imu_configured=0; POR-cleared only). BEFORE the peripheral claims the pins, clock the
+        //     stuck slave out and STOP, as a GPIO-level bit-bang through the HAL's own gpio surface
+        //     (open-drain drive + level read), NOT a raw-I2C probe. A clean bus (SDA already high) is a
+        //     no-op (only-if-needed), so this is harmless on every boot and on both families.
+        Self::bus_clear_before_claim(&scl, &sda, clock);
+
         // 3. SCL/SDA as AF open-drain with pull-up. Take the resolved port base + register-model path
         //    + logical pin byte straight from each consumed Pin; the application never built them.
         configure_af(
@@ -356,6 +422,37 @@ impl I2c {
         dev.set_ack(true);
         Ok(dev)
     }
+
+    /// Run the warm-reset bus-clear on the SCL/SDA pins BEFORE the peripheral claims them (hardware).
+    ///
+    /// Configures both pins as general-purpose OPEN-DRAIN outputs through the HAL gpio surface, then
+    /// runs [`bus_clear_seq`] with closures bound to `set_pin` / `read_pin` and a ~100 kHz busy-wait
+    /// settle (half-period = `sysclk / 200_000` cycles). No raw register access lives here: the drive
+    /// and level-read go through the gpio module. A clean bus issues zero pulses. The pins are left as
+    /// open-drain outputs; the caller's [`configure_af`] immediately re-claims them as AF open-drain.
+    #[cfg(target_arch = "arm")]
+    fn bus_clear_before_claim<S, D>(scl: &Pin<S>, sda: &Pin<D>, clock: &ClockConfig) {
+        let (scl_base, path, scl_pin) = (scl.port_base(), scl.path(), scl.pin());
+        let (sda_base, sda_pin) = (sda.port_base(), sda.pin());
+        // Both bus pins as open-drain outputs with the internal pull-up (F1x0; F10x relies on the
+        // board's external I2C pull-up). Idle level is high (released) once driven high below.
+        crate::gpio::configure_output_od(scl_base, path, scl_pin, true);
+        crate::gpio::configure_output_od(sda_base, path, sda_pin, true);
+        // ~100 kHz half-period in CPU cycles for the busy-wait settle between edges.
+        let half = (clock.sysclk_hz / 200_000).max(1);
+        bus_clear_seq(
+            || crate::gpio::read_pin(sda_base, path, sda_pin),
+            |high| crate::gpio::set_pin(scl_base, path, scl_pin, high),
+            |high| crate::gpio::set_pin(sda_base, path, sda_pin, high),
+            || cortex_m::asm::delay(half),
+        );
+    }
+
+    /// Host stub for [`bus_clear_before_claim`]: the bit-bang needs real silicon + timing, so on the
+    /// host it is a no-op (the `new` host tests still exercise the AF-config path). The sequencer
+    /// logic is host-tested directly via [`bus_clear_seq`].
+    #[cfg(not(target_arch = "arm"))]
+    fn bus_clear_before_claim<S, D>(_scl: &Pin<S>, _sda: &Pin<D>, _clock: &ClockConfig) {}
 
     /// Program CTL1 I2CCLK, RT, then CKCFG, exactly as `i2c_clock_config` does (CTL1 via a
     /// clear-then-set of the I2CCLK field; RT and CKCFG are written directly, CKCFG from its reset

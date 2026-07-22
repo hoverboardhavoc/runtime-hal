@@ -531,6 +531,60 @@ fn configure_output_f1x0(port_base: u32, n: u32) {
     Reg32::new(port_base, F1X0_OSPD).modify(0x3u32 << sp_shift, F1X0_OSPEED_50MHZ << sp_shift);
 }
 
+/// Configure a logical pin as a general-purpose OPEN-DRAIN output, 50 MHz, with an optional internal
+/// pull-up.
+///
+/// The open-drain counterpart to [`configure_output`] (which is push-pull). This is the bit-bang
+/// drive mode a manual I2C bus-clear needs BEFORE the peripheral owns the pins: an open-drain output
+/// drives the line LOW when the pin is written 0 and RELEASES it (high-Z, pulled up) when written 1,
+/// so an SCL pulse train and an SDA STOP never contend with a slave still holding the line, and the
+/// same pin's live level reads back through [`read_pin`] (the input buffer stays connected in
+/// open-drain mode on both families). It owns the F10x/F1x0 register-model branch internally so
+/// callers never see the [`GpioPath`] split (the same as `configure_output`).
+///
+/// - F10x (CRL/CRH): the pin's 4-bit nibble = general-purpose open-drain output (CNF = `0b01`) at
+///   50 MHz (MODE = `0b11`) -> `0x7` (`gd32f10x_gpio.c::gpio_init`). F10x has no per-pin pull register
+///   for outputs, so `pull_up` does not change the write there (the I2C bus relies on the board's
+///   external resistor).
+/// - F1x0 (CTL/OMODE/OSPD/PUD): `CTL` = output (`1`), `OMODE` = open-drain (`1`), `OSPD` = 50 MHz
+///   (`3`), and `PUD` = pull-up (`01`) when `pull_up`, else floating (`gd32f1x0_gpio.c`).
+///
+/// Bound by the arm-only I2C bus-clear (and the gpio host tests); on a non-arm lib build it is
+/// unreferenced, so allow dead code there (the same shape the other arm-only helpers use).
+#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+pub(crate) fn configure_output_od(port_base: u32, path: GpioPath, pin: u8, pull_up: bool) {
+    let n = (pin & 0x0F) as u32;
+    match path {
+        GpioPath::ApbCrlCrh => {
+            // F10x: GP open-drain output 50 MHz = nibble 0x7 (CNF 0b01 open-drain | MODE 0b11 50MHz).
+            let (offset, within) = if n < 8 {
+                (F10X_CTL0, n)
+            } else {
+                (F10X_CTL1, n - 8)
+            };
+            let shift = 4 * within;
+            Reg32::new(port_base, offset).modify(0xFu32 << shift, 0x7u32 << shift);
+        }
+        GpioPath::AhbCtlAfsel => {
+            // F1x0: CTL = output (1), OMODE = open-drain (1), OSPD = 50 MHz (3), PUD = pull-up or none.
+            let ctl_shift = 2 * n;
+            Reg32::new(port_base, F1X0_CTL)
+                .modify(0x3u32 << ctl_shift, F1X0_MODE_OUTPUT << ctl_shift);
+            Reg32::new(port_base, F1X0_OMODE).modify(1u32 << n, 1u32 << n);
+            let sp_shift = 2 * n;
+            Reg32::new(port_base, F1X0_OSPD)
+                .modify(0x3u32 << sp_shift, F1X0_OSPEED_50MHZ << sp_shift);
+            let pud_shift = 2 * n;
+            let pupd = if pull_up {
+                F1X0_PUPD_PULLUP
+            } else {
+                F1X0_PUPD_NONE
+            };
+            Reg32::new(port_base, F1X0_PUD).modify(0x3u32 << pud_shift, pupd << pud_shift);
+        }
+    }
+}
+
 /// Drive a logical output pin high or low via the family's atomic bit set/reset register.
 ///
 /// Both register models expose one 32-bit bit-operate register (`GPIO_BOP`): writing `1 << pin`
