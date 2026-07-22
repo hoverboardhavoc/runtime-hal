@@ -30,7 +30,7 @@ jobs:
 
       # Rust thumbv7m target: the runtime-hal snippet crate is a no_std
       # thumbv7m-none-eabi staticlib.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: thumbv7m-none-eabi
 
@@ -208,7 +208,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: thumbv7m-none-eabi
       - name: Install arm-none-eabi-gcc
