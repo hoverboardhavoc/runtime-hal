@@ -626,7 +626,10 @@ pub fn disarm_busfault(prev: bool) {
 pub fn probe_present(addr: u32) -> Option<u32> {
     PROBED_ADDR.store(addr, Ordering::SeqCst);
     FAULTED.store(false, Ordering::SeqCst);
-    // Arm: a fault between here and the disarm below is treated as a probe fault and fixed up (+4).
+    // Arm: a fault between here and the disarm below is treated as a probe fault; `on_bus_fault`
+    // advances the stacked PC by the DECODED faulting-instruction width (2 or 4 B), and only when the
+    // stacked PC lies within `probe_read32`'s code extent (the round-18 range gate) -- an out-of-
+    // function fault is left unchanged so the caller re-executes.
     EXPECTING_FAULT.store(true, Ordering::SeqCst);
     cortex_m::asm::dsb();
 

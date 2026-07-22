@@ -11,16 +11,22 @@
 //! peripheral-presence sweep reads absent slots as zero rather than bus-faulting. So the family that
 //! never triggers the fixup in production has no on-silicon coverage of the resume path.
 //!
-//! This image closes that gap. It deliberately reads a KNOWN-reserved, bus-faulting address
-//! (`0x6000_0000`, the unpopulated FSMC / external-memory region on these parts) through runtime-hal's
-//! public armed-probe harness, so the HAL's naked BusFault entry and the range-gated PC fixup run on
-//! REAL silicon of BOTH the F103 and the F130. (The round-14 pinning showed the F1x0's late external
-//! fault stacks the CALLER's frame, which is exactly why an absolute symbol-anchored resume was
-//! rejected: only a relative advance is SP-consistent in every observed frame.) Round 18 range-gated
-//! the fixup on `probe_read32`'s code extent, so this F1x0 caller-frame case is now the on-silicon
-//! coverage of the OUT-of-function branch: the handler leaves the stacked PC UNCHANGED and the caller
-//! RE-EXECUTES its not-yet-run instruction (rather than the old skip). The recorded observables are
-//! unchanged by the gate -- both resume cleanly -- so a clean run (magic written) still validates it.
+//! This image was meant to close that gap by reading `0x6000_0000` (the FSMC / external-memory
+//! region, expected unpopulated on these parts) through runtime-hal's public armed-probe harness, so
+//! the HAL's naked BusFault entry and the range-gated PC fixup would run on REAL silicon of BOTH the
+//! F103 and the F130. (The round-14 pinning showed the F1x0's late external fault stacks the CALLER's
+//! frame, which is why an absolute symbol-anchored resume was rejected: only a relative advance is
+//! SP-consistent in every observed frame. Round 18 range-gated the fixup on `probe_read32`'s code
+//! extent, so an out-of-function caller-frame fault leaves the stacked PC UNCHANGED and the caller
+//! RE-EXECUTES its not-yet-run instruction rather than skipping it.)
+//!
+//! ROUND-18 SILICON REALITY: `0x6000_0000` does NOT fault. On both parts (the new range-gated build
+//! AND the committed build) the armed read returned CLEANLY, `faulted = 0` -- the address reads back
+//! a value instead of raising a BusFault, so no fault path is exercised and this image does NOT
+//! currently cover the resume/out-of-function branch on either family. The F1x0 fixup therefore still
+//! has NO on-silicon coverage. Finding a GD32F103/F130 address that genuinely bus-faults (an
+//! address-sweep to replace `RESERVED_FAULT_ADDR`) is QUEUED; until then a clean run (magic written)
+//! only proves the harness/vector-table plumbing runs, not the fault-resume path.
 //! It records:
 //!   - `faulted`  = 1 if the read bus-faulted and was caught (`probe_present` returned `None`),
 //!   - `readback` = the value the read returned (garbage on a fault; meaningful only if `faulted == 0`),
@@ -39,9 +45,11 @@ use panic_halt as _;
 
 use runtime_hal::detect::probe;
 
-/// A known-reserved address that bus-faults on both bench parts: `0x6000_0000` is the FSMC /
-/// external-memory bank, which is unpopulated on the GD32F130C8 and the bench GD32F103C8, so a read
-/// there raises a precise BusFault (confirmed on silicon: an SWD `mdw 0x6000_0000` errors on the F130).
+/// The address the image reads to try to force a BusFault: `0x6000_0000`, the FSMC / external-memory
+/// bank. It was expected to be unpopulated (hence bus-faulting) on the GD32F130C8 and the bench
+/// GD32F103C8, but the round-18 silicon run showed it reads CLEANLY on both parts (`faulted = 0`), so
+/// it does NOT actually trap. Replacing this with an address that genuinely bus-faults on these parts
+/// (an address-sweep) is queued; until then this image does not exercise the fault-resume path.
 const RESERVED_FAULT_ADDR: u32 = 0x6000_0000;
 
 /// `0x46504E31` = "FPN1"; written LAST so a reader seeing it knows the whole run (fault caught +
@@ -92,13 +100,14 @@ fn main() -> ! {
     // SAFETY: RESULT_ADDR is reserved RAM (see memory.x); single writer, single-threaded bring-up.
     unsafe { core::ptr::write_volatile(result_ptr(), INIT_RESULT) };
 
-    // Force the fault on a known-reserved address through the HAL's armed-probe harness. This drives
-    // the exact machinery detect uses: the probe-scoped vector table (BusFault slot -> the naked
-    // `bus_fault_entry`), `SHCSR.BUSFAULTENA`, then the single armed `probe_read32`. A bus fault at
-    // `0x6000_0000` traps to `bus_fault_entry`, `on_bus_fault` advances the stacked PC by the
-    // decoded instruction width, and `probe_present` returns `None`. If any of that is wrong on this
-    // silicon (bad resume PC / clobbered callee-saved state) the core hangs or HardFaults here and
-    // `magic` is never written.
+    // Read the candidate fault address through the HAL's armed-probe harness. This drives the exact
+    // machinery detect uses: the probe-scoped vector table (BusFault slot -> the naked
+    // `bus_fault_entry`), `SHCSR.BUSFAULTENA`, then the single armed `probe_read32`. IF the read bus-
+    // faulted, it would trap to `bus_fault_entry`, `on_bus_fault` would advance the stacked PC by the
+    // decoded instruction width, and `probe_present` would return `None`. On round-18 silicon
+    // `0x6000_0000` reads cleanly (`faulted = 0`), so that fault path is NOT taken here; the read
+    // returns a value and `probe_present` returns `Some`. (Were the fixup wrong on a real fault, the
+    // core would hang or HardFault and `magic` would never be written.)
     let result = probe::with_probe_vector_table(|| {
         let prev = probe::arm_busfault();
         let read = probe::probe_present(RESERVED_FAULT_ADDR);
