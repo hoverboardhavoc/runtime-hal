@@ -17,12 +17,15 @@ description: |
 # (The contrast with the SPI AF-PP vector, nibble 0xB, is exactly the
 # open-drain-vs-push-pull slip the width-strict golden catches.)
 # After the refactor the only public path that routes I2C pins is I2c::new, which
-# routes BOTH SCL (PB6) and SDA (PB7) and also programs the I2C0 + RCU registers.
-# Scope the compare to the GPIOB window with assert_only (only CTL0 is touched).
+# routes BOTH SCL (PB6) and SDA (PB7) and also programs the I2C0 + RCU registers and,
+# since the bus-clear (I2c::new configure_output_od before configure_af), touches
+# GPIOB CTL0 open-drain nibbles before the AF write. Both the bus-clear OD config and
+# the final AF-OD write land in CTL0 (+0x00), and the AF write is last, so the CTL0
+# END STATE is unchanged; scope the compare to CTL0 (+0x00) only.
 mode: final_state
 
 assert_only:
-  - "<GPIOB_BASE>"
+  - "<GPIOB_BASE>+0x00"   # CTL0 only (PB6/PB7 nibbles; the AF-OD write is the last writer)
 
 implementations:
   gd-spl/gd32f10x:
