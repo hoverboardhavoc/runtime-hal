@@ -381,8 +381,16 @@ impl I2c {
         pins: (Pin<S>, Pin<D>),
         mode: I2cMode,
     ) -> Result<I2c, DescriptorError> {
-        let base = chip.base(instance)?;
         let (scl, sda) = pins;
+
+        // 1. The per-configuration pin-ownership backstop (Layer 7), FIRST: this constructor
+        //    configures both pins itself, and its bus-clear step drives them as open-drain
+        //    outputs before the peripheral claims them, so the refusal has to precede everything
+        //    or a refused pin would still have been driven.
+        crate::pincap::check_pin_ownership(chip, scl.pin(), crate::pincap::PinClaim::NonGate)?;
+        crate::pincap::check_pin_ownership(chip, sda.pin(), crate::pincap::PinClaim::NonGate)?;
+
+        let base = chip.base(instance)?;
 
         // 2. Enable the I2C peripheral clock (the GPIO-port clock was enabled by `chip.gpiob()`).
         crate::clock::enable_i2c(chip.rcu_base()?, chip.clock(), instance)?;

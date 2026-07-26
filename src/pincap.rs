@@ -29,6 +29,7 @@
 use crate::addr::PeriphLabel;
 use crate::chip::Chip;
 use crate::descriptor::GpioPath;
+use crate::error::DescriptorError;
 
 // --- the owned capability data (packed pin bytes; provenance in specs/pin-capability.md) ------
 
@@ -167,6 +168,47 @@ pub fn i2c_pair(chip: &Chip, scl: u8, sda: u8) -> Option<u8> {
     None
 }
 
+// --- the per-configuration ownership backstop (Layer 7) ---------------------------------------
+
+/// What a configure call claims a pin FOR, the question [`check_pin_ownership`] answers.
+///
+/// Two claims, because the property being defended is one bit: a gate-capable pin drives a
+/// MOSFET half-bridge, so it belongs to the advanced timer and to nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinClaim {
+    /// An advanced-timer complementary output: a motor gate. Only a gate-capable pin qualifies.
+    Gate,
+    /// Any other function (GPIO in or out, analog, USART, I2C, SPI, general-timer PWM). A
+    /// gate-capable pin is refused.
+    NonGate,
+}
+
+/// The Layer-7 per-configuration pin-ownership backstop: may `pin` be configured for `claim` on
+/// this chip? (`hoverboard-firmware/specs/board-model.md`'s second layer, the one the boot
+/// validator does not provide.)
+///
+/// The boot validator checks the persisted layout ONCE, as a set. This is the independent second
+/// layer: every individual configure call re-asks at the HAL boundary, so a bug that bypasses the
+/// validator entirely (a hardcoded pin, a mis-decoded field, a call made before the layout is
+/// read) still cannot route a gate-capable pin to a non-gate function. Two layers only help if
+/// they fail independently, which is why this one derives its answer from [`gate_capable`] and
+/// the descriptor alone, with no input from the layout the validator checked.
+///
+/// The refusal is symmetric, and deliberately so: a gate claim on a pin that is NOT gate-capable
+/// is equally a bug (it would write a complementary-output AF onto a pin no bridge is wired to),
+/// and catching it costs nothing.
+///
+/// Density-dependence is the point, not an artifact: on a part with a second advanced timer
+/// PB0/PB1 are TIMER7 complementary outputs, so the same pins that are legitimate ADC sense
+/// inputs on a medium-density part are refused for analog use on a high-density one.
+pub fn check_pin_ownership(chip: &Chip, pin: u8, claim: PinClaim) -> Result<(), DescriptorError> {
+    if gate_capable(chip, pin) == matches!(claim, PinClaim::Gate) {
+        Ok(())
+    } else {
+        Err(DescriptorError::PinOwnership)
+    }
+}
+
 // --- host tests (pure logic; the fleet descriptors + the synthesized high-density part) -------
 
 #[cfg(all(test, feature = "mock"))]
@@ -256,6 +298,56 @@ mod tests {
         }
         // A plain pin is never gate-capable.
         assert!(!gate_capable(&f103rc(), 0x04)); // PA4
+    }
+
+    #[test]
+    fn the_ownership_backstop_refuses_a_gate_pin_for_every_other_function() {
+        // The Layer-7 claim check, both directions, on both bench parts. The six TIMER0 gate
+        // pins are gate-only; the pins the fleet actually configures for other functions (the
+        // USART link pair PA2/PA3, the I2C pair PB6/PB7, VBATT PA4, the halls PC13/PA1/PC14,
+        // the LEDs PB3/PA15/PB4, the buzzer PB9) are refused as gates.
+        for chip in [f103c8(), f130c8()] {
+            for gate in [0x08u8, 0x09, 0x0A, 0x1D, 0x1E, 0x1F] {
+                assert_eq!(check_pin_ownership(&chip, gate, PinClaim::Gate), Ok(()));
+                assert_eq!(
+                    check_pin_ownership(&chip, gate, PinClaim::NonGate),
+                    Err(DescriptorError::PinOwnership),
+                    "gate pin {gate:#04x} claimed for a non-gate function"
+                );
+            }
+            for other in [
+                0x02u8, 0x03, 0x16, 0x17, 0x04, 0x2D, 0x01, 0x2E, 0x13, 0x0F, 0x14, 0x19,
+            ] {
+                assert_eq!(check_pin_ownership(&chip, other, PinClaim::NonGate), Ok(()));
+                assert_eq!(
+                    check_pin_ownership(&chip, other, PinClaim::Gate),
+                    Err(DescriptorError::PinOwnership),
+                    "non-gate pin {other:#04x} claimed as a gate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_ownership_backstop_follows_the_density_gated_timer7_set() {
+        // PB0 is a 6-FET phase-current sense pin (ADC channel 8) on a medium-density part and a
+        // TIMER7 complementary gate on a high-density one, so the same claim flips verdict with
+        // the measured second advanced timer. This is the case `motor-integration.md` records:
+        // the 6-FET sense pins are gate-capable on the 12-FET part and correctly refused there.
+        const PB0: u8 = 0x10;
+        assert_eq!(
+            check_pin_ownership(&f103c8(), PB0, PinClaim::NonGate),
+            Ok(())
+        );
+        assert_eq!(
+            check_pin_ownership(&f103rc(), PB0, PinClaim::NonGate),
+            Err(DescriptorError::PinOwnership)
+        );
+        assert_eq!(check_pin_ownership(&f103rc(), PB0, PinClaim::Gate), Ok(()));
+        assert_eq!(
+            check_pin_ownership(&f103c8(), PB0, PinClaim::Gate),
+            Err(DescriptorError::PinOwnership)
+        );
     }
 
     #[test]

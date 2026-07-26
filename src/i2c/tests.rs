@@ -86,6 +86,33 @@ fn pb6_pb7(
     (gpiob.pb6, gpiob.pb7)
 }
 
+#[test]
+fn new_refuses_gate_capable_pins_the_layer_7_backstop() {
+    // Layer 7 (`hoverboard-firmware/specs/motor-integration.md`): `I2c::new` configures the pins
+    // itself, so it re-asks the ownership question rather than trusting its caller. PB14/PB15 are
+    // TIMER0 CH1N/CH2N, motor gates, and the refusal comes before the bus-clear drives them.
+    let _g = seed_reset();
+    let chip = chip();
+    let gpiob = chip.gpiob().unwrap().split();
+    let before = Reg32::new(GPIOB_BASE, 0x04).read();
+    assert_eq!(
+        I2c::new(
+            &chip,
+            &ref_72m(),
+            PeriphLabel::I2c0,
+            (gpiob.pb14, gpiob.pb15),
+            I2cMode::standard(100_000),
+        )
+        .err(),
+        Some(crate::error::DescriptorError::PinOwnership)
+    );
+    assert_eq!(
+        Reg32::new(GPIOB_BASE, 0x04).read(),
+        before,
+        "a refused pair is never driven or configured"
+    );
+}
+
 /// Bring up I2C0 on PB6/PB7 at `speed_hz` (standard <= 100 kHz, fast otherwise) on `chip`.
 fn new_on(chip: &Chip, speed_hz: u32, duty: FastDuty) -> I2c {
     let mode = if speed_hz <= 100_000 {

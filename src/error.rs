@@ -29,6 +29,12 @@ pub enum DescriptorError {
     /// A routing entry point was handed a pin role it does not handle (e.g. a non-SPI
     /// [`crate::gpio::PinRole`] passed to [`crate::Chip::route_spi_pin`]).
     UnsupportedRole,
+    /// A configure call claimed a pin the chip does not allow for that function: a gate-capable
+    /// pin (an advanced-timer complementary output) claimed for a non-gate function, or a
+    /// non-gate-capable pin claimed as a motor gate. The per-configuration ownership backstop
+    /// ([`crate::pincap::check_pin_ownership`]) refuses at the HAL boundary, independently of any
+    /// board-layout validation the caller may have done.
+    PinOwnership,
     /// A configuration value is outside the range this driver supports (e.g. a DMA-ring buffer length
     /// of 0 or above the 16-bit `CHxCNT` limit).
     Unsupported,

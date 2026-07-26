@@ -418,11 +418,19 @@ impl Usart {
         pins: (Pin<TX>, Pin<RX>),
         baud: u32,
     ) -> Result<Usart, DescriptorError> {
+        let (tx, rx) = pins;
+
+        // 1. The per-configuration pin-ownership backstop (Layer 7), FIRST: this constructor
+        //    writes the USART AF onto both pins itself, so it is a configure seam in its own
+        //    right and asks the ownership question directly rather than relying on its caller
+        //    having asked. Ahead of the instance resolution, so a refused pin is refused as such.
+        crate::pincap::check_pin_ownership(chip, tx.pin(), crate::pincap::PinClaim::NonGate)?;
+        crate::pincap::check_pin_ownership(chip, rx.pin(), crate::pincap::PinClaim::NonGate)?;
+
         let base = chip.base(instance)?;
         let path = chip.clock();
         let bus = UsartBus::of(instance).ok_or(DescriptorError::UnknownSelector)?;
         let model = UsartModel::for_path(path);
-        let (tx, rx) = pins;
 
         // 2. Enable the USART peripheral clock (the GPIO-port clock was enabled by `chip.gpioa()`).
         crate::clock::enable_usart(chip.rcu_base()?, path, instance)?;

@@ -505,3 +505,24 @@ fn rejoin_of_mismatched_halves_panics() {
     let (_tx2, rx2) = u2.split();
     let _ = Usart::rejoin(tx1, rx2); // cross-peripheral rejoin: programming error, fail loud
 }
+
+#[test]
+fn new_refuses_gate_capable_pins_the_layer_7_backstop() {
+    // Layer 7 (`hoverboard-firmware/specs/motor-integration.md`): PA9/PA10 are TIMER0 CH1/CH2,
+    // the 6-FET high-side gates, AND the USART0 console pins on both families -- exactly the
+    // collision this backstop exists for. `Usart::new` writes the AF itself, so it refuses.
+    let _g = seed_reset();
+    let chip = Chip::from_descriptor(crate::detect::descriptor_f130());
+    let gpioa = chip.gpioa().unwrap().split();
+    assert_eq!(
+        Usart::new(
+            &chip,
+            &ClockConfig::REFERENCE_72M_IRC8M,
+            PeriphLabel::Usart1,
+            (gpioa.pa9, gpioa.pa10),
+            115_200,
+        )
+        .err(),
+        Some(crate::error::DescriptorError::PinOwnership)
+    );
+}

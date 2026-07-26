@@ -22,6 +22,7 @@ use crate::gpio::{
     self, GpioOutput, GpioPort, InputGroup, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins,
     PortPins,
 };
+use crate::pincap::PinClaim;
 
 /// The chip context: built once from the parsed descriptor, it resolves a [`PeriphLabel`] to a base
 /// and carries the register-model selectors and the RCU base. This is the descriptor's chip-only
@@ -94,6 +95,7 @@ impl Chip {
     /// base is absent from the descriptor.
     #[inline]
     pub fn output_pin(&self, port: PeriphLabel, pin: u8) -> Result<GpioOutput, DescriptorError> {
+        crate::pincap::check_pin_ownership(self, packed_pin(port, pin)?, PinClaim::NonGate)?;
         let base = self.base(port)?;
         let rcu = self.rcu_base()?;
         crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
@@ -113,6 +115,7 @@ impl Chip {
     /// absent from the descriptor.
     #[inline]
     pub fn analog_pin(&self, port: PeriphLabel, pin: u8) -> Result<(), DescriptorError> {
+        crate::pincap::check_pin_ownership(self, packed_pin(port, pin)?, PinClaim::NonGate)?;
         let base = self.base(port)?;
         let rcu = self.rcu_base()?;
         crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
@@ -361,6 +364,7 @@ impl Chip {
     /// Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU, needed for the F10x
     /// remap) is not in the descriptor.
     pub fn route_general_pwm_pin(&self, pin: u8) -> Result<(), DescriptorError> {
+        crate::pincap::check_pin_ownership(self, pin, PinClaim::NonGate)?;
         let port = gpio_port_label(pin)?;
         let port_base = self.base(port)?;
         let rcu = self.rcu_base()?;
@@ -399,6 +403,7 @@ impl Chip {
     /// (a motor application) passes its board gate pins as DATA; the family difference is absorbed.
     /// Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU) is not in the descriptor.
     pub fn route_advanced_pwm_pin(&self, pin: u8) -> Result<(), DescriptorError> {
+        crate::pincap::check_pin_ownership(self, pin, PinClaim::Gate)?;
         let port = gpio_port_label(pin)?;
         let port_base = self.base(port)?;
         let rcu = self.rcu_base()?;
@@ -429,6 +434,7 @@ impl Chip {
         if !matches!(role, gpio::PinRole::SpiAfPushPull | gpio::PinRole::SpiInput) {
             return Err(DescriptorError::UnsupportedRole);
         }
+        crate::pincap::check_pin_ownership(self, pin, PinClaim::NonGate)?;
         let port = gpio_port_label(pin)?;
         let port_base = self.base(port)?;
         let rcu = self.rcu_base()?;
@@ -452,6 +458,7 @@ impl Chip {
         if !matches!(role, gpio::PinRole::Tx | gpio::PinRole::Rx) {
             return Err(DescriptorError::UnsupportedRole);
         }
+        crate::pincap::check_pin_ownership(self, pin, PinClaim::NonGate)?;
         let port = gpio_port_label(pin)?;
         let port_base = self.base(port)?;
         let rcu = self.rcu_base()?;
@@ -475,6 +482,24 @@ fn gpio_port_label(pin: u8) -> Result<PeriphLabel, DescriptorError> {
         // No Gpioe label in this crate's catalog; report a GPIO base miss rather than guess a port.
         _ => Err(DescriptorError::MissingBase(PeriphLabel::Gpioa)),
     }
+}
+
+/// The inverse of [`gpio_port_label`]: the packed logical pin byte (`port << 4 | pin`) for a port
+/// label and a pin number within it, the encoding [`crate::pincap`] states its queries in. The
+/// split `(label, 0..15)` form is what [`Chip::output_pin`] / [`Chip::analog_pin`] take, and the
+/// ownership backstop asks its question in packed bytes, so the two forms meet here rather than in
+/// each caller. A non-GPIO label is a caller error, reported as a base miss on the label passed
+/// (before this existed such a call resolved that peripheral's base and wrote GPIO config into it).
+fn packed_pin(port: PeriphLabel, pin: u8) -> Result<u8, DescriptorError> {
+    let index = match port {
+        PeriphLabel::Gpioa => 0,
+        PeriphLabel::Gpiob => 1,
+        PeriphLabel::Gpioc => 2,
+        PeriphLabel::Gpiod => 3,
+        PeriphLabel::Gpiof => 5,
+        other => return Err(DescriptorError::MissingBase(other)),
+    };
+    Ok((index << 4) | (pin & 0x0F))
 }
 
 #[cfg(all(test, feature = "mock"))]
@@ -755,6 +780,53 @@ mod tests {
         assert_eq!(
             Reg32::new(F10X_GPIOA_BASE, 0x00).read() & (0xF << 24),
             0x4 << 24
+        );
+    }
+
+    #[test]
+    fn the_pin_ownership_backstop_refuses_gate_pins_at_every_routing_entry_point() {
+        // Layer 7 (`hoverboard-firmware/specs/motor-integration.md`, the stage-4 gate): every
+        // configure entry point re-asks whether the pin may take the function, independently of
+        // any board-layout validation the caller did. PA8 is TIMER0 CH0, a motor gate.
+        let _g = mock::lock();
+        mock::reset();
+        let chip = Chip::from_descriptor(descriptor_f130());
+        const PA8: u8 = 8;
+        let before_ctl = Reg32::new(F1X0_GPIOA_BASE, 0x00).read();
+        let before_afsel = Reg32::new(F1X0_GPIOA_BASE, 0x20).read();
+
+        assert_eq!(
+            chip.route_general_pwm_pin(PA8),
+            Err(DescriptorError::PinOwnership)
+        );
+        assert_eq!(
+            chip.route_spi_pin(PA8, gpio::PinRole::SpiAfPushPull),
+            Err(DescriptorError::PinOwnership)
+        );
+        assert_eq!(
+            chip.route_usart_pin(PA8, gpio::PinRole::Tx),
+            Err(DescriptorError::PinOwnership)
+        );
+        assert_eq!(
+            chip.analog_pin(PeriphLabel::Gpioa, 8),
+            Err(DescriptorError::PinOwnership)
+        );
+        assert!(matches!(
+            chip.output_pin(PeriphLabel::Gpioa, 8),
+            Err(DescriptorError::PinOwnership)
+        ));
+
+        // A refused claim configures NOTHING: the check runs before the port-clock enable and
+        // before any AF write, so the pin is left exactly as it was.
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x00).read(), before_ctl);
+        assert_eq!(Reg32::new(F1X0_GPIOA_BASE, 0x20).read(), before_afsel);
+
+        // The gate route itself is what PA8 is FOR, and it still works; the symmetric half
+        // refuses a non-gate pin claimed as a gate (PB3 is the green LED / TIMER1_CH1).
+        assert_eq!(chip.route_advanced_pwm_pin(PA8), Ok(()));
+        assert_eq!(
+            chip.route_advanced_pwm_pin(PB3),
+            Err(DescriptorError::PinOwnership)
         );
     }
 
