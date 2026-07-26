@@ -448,3 +448,109 @@ fn isr_metrics_count_entries_per_vector() {
 
     mock_vtor::reset();
 }
+
+// --- R7: NVIC / SysTick interrupt-priority configuration --------------------------------------
+
+use super::{
+    apply_motor_era_priorities, irq_priority, motor_era_irqs, set_irq_priority,
+    set_systick_priority, systick_priority, DMA_RX_PRIORITY, F10X_ADC0_1_IRQ as R7_F10X_ADC,
+    F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ, MOTOR_ISR_PRIORITY, NVIC_IPR_BASE, SCB_SHPR3,
+    SYSTICK_PRIORITY, USART1_RX_PRIORITY,
+};
+
+/// The priority levels are strictly ordered (lower numeric = higher urgency): period ISR ABOVE
+/// USART1 RX ABOVE DMA RX ABOVE SysTick, the execution-model ordering the IPR read-back gate checks.
+#[test]
+fn r7_priority_constants_strictly_ordered() {
+    assert!(MOTOR_ISR_PRIORITY < USART1_RX_PRIORITY);
+    assert!(USART1_RX_PRIORITY < DMA_RX_PRIORITY);
+    assert!(DMA_RX_PRIORITY < SYSTICK_PRIORITY);
+}
+
+/// `set_irq_priority` writes IRQ `n`'s byte in the containing IPR word and preserves the three
+/// neighbouring IRQs' priority bytes (a byte-in-word RMW), and `irq_priority` reads it back.
+#[test]
+fn r7_set_irq_priority_round_trips_and_preserves_neighbours() {
+    let _g = mock::lock();
+    mock::reset();
+
+    // IRQ 12 (F1x0 ADC): its byte is IPR word 3 (12/4), shift 0 (12%4). Pre-seed the whole word
+    // with a sentinel so we can prove the RMW touched only IRQ 12's byte.
+    let word_addr = NVIC_IPR_BASE + (12 / 4) * 4;
+    Reg32::new(word_addr, 0).write(0xAABBCCDD);
+
+    set_irq_priority(12, MOTOR_ISR_PRIORITY);
+    assert_eq!(irq_priority(12), MOTOR_ISR_PRIORITY, "IRQ 12 priority set");
+    // Neighbours (IRQs 13/14/15 = bytes 1/2/3 of the same word) unchanged.
+    let w = Reg32::new(word_addr, 0).read();
+    assert_eq!((w >> 8) & 0xFF, 0xCC, "IRQ 13 byte preserved");
+    assert_eq!((w >> 16) & 0xFF, 0xBB, "IRQ 14 byte preserved");
+    assert_eq!((w >> 24) & 0xFF, 0xAA, "IRQ 15 byte preserved");
+    assert_eq!(
+        w & 0xFF,
+        MOTOR_ISR_PRIORITY as u32,
+        "IRQ 12 byte is the new priority"
+    );
+
+    // A byte at a non-zero shift (IRQ 28 = word 7, shift 0; IRQ 30 = word 7, shift 16).
+    set_irq_priority(30, USART1_RX_PRIORITY);
+    assert_eq!(irq_priority(30), USART1_RX_PRIORITY);
+}
+
+/// `set_systick_priority` writes SHPR3's top byte and `systick_priority` reads it back; the low
+/// three bytes of SHPR3 are preserved.
+#[test]
+fn r7_set_systick_priority_round_trips_top_byte_only() {
+    let _g = mock::lock();
+    mock::reset();
+    Reg32::new(SCB_SHPR3, 0).write(0x0011_2233);
+    set_systick_priority(SYSTICK_PRIORITY);
+    assert_eq!(systick_priority(), SYSTICK_PRIORITY);
+    assert_eq!(
+        Reg32::new(SCB_SHPR3, 0).read() & 0x00FF_FFFF,
+        0x0011_2233,
+        "SHPR3 low three bytes preserved"
+    );
+}
+
+/// `motor_era_irqs` resolves the per-family (period, usart1, dma) vector numbers: the ADC
+/// injected-EOC vector is the period ISR on both families.
+#[test]
+fn r7_motor_era_irqs_resolve_per_family() {
+    assert_eq!(
+        motor_era_irqs(IrqLayout::F1x0Grouped),
+        (F1X0_ADC_CMP_IRQ, F1X0_USART1_IRQ, F1X0_DMA_CH3_4_IRQ)
+    );
+    assert_eq!(
+        motor_era_irqs(IrqLayout::F10xSeparate),
+        (R7_F10X_ADC, F10X_USART1_IRQ, F10X_DMA0_CH5_IRQ)
+    );
+}
+
+/// `apply_motor_era_priorities` sets the full ordering (period > usart1 > dma > systick) for both
+/// families, read back the way the silicon stage-1 gate reads the IPR + SHPR3 over SWD.
+#[test]
+fn r7_apply_motor_era_priorities_both_families() {
+    for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
+        let _g = mock::lock();
+        mock::reset();
+        apply_motor_era_priorities(layout);
+        let (period, usart1, dma) = motor_era_irqs(layout);
+        assert_eq!(
+            irq_priority(period),
+            MOTOR_ISR_PRIORITY,
+            "period ISR highest"
+        );
+        assert_eq!(
+            irq_priority(usart1),
+            USART1_RX_PRIORITY,
+            "usart1 RX below period"
+        );
+        assert_eq!(irq_priority(dma), DMA_RX_PRIORITY, "dma RX below usart1");
+        assert_eq!(systick_priority(), SYSTICK_PRIORITY, "systick lowest");
+        // The ordering is strict: period < usart1 < dma < systick (numeric = inverse urgency).
+        assert!(irq_priority(period) < irq_priority(usart1));
+        assert!(irq_priority(usart1) < irq_priority(dma));
+        assert!(irq_priority(dma) < systick_priority());
+    }
+}

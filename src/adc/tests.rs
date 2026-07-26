@@ -236,6 +236,10 @@ fn configure_injected_end_state() {
     let chans = [(4u8, 1u8), (5u8, 1u8)];
     let _ = Adc::configure_injected(ADC0_BASE, &chans, true, ETSIC_T0_CH3);
 
+    // CTL0: SM (scan) set, because the group has more than one rank (readiness delta 7: without
+    // scan a two-rank inserted group converts only rank 0 / phase A).
+    assert_ne!(r(CTL0) & CTL0_SM, 0, "SM set (multi-rank injected group)");
+
     // CTL1: DAL (left, bit 11), ETSIC = code 1 (TIMER0 CH3) in [14:12], ETEIC (bit 15), ADCON (0).
     let ctl1 = r(CTL1);
     assert_ne!(ctl1 & CTL1_DAL, 0, "left-aligned (DAL set)");
@@ -277,6 +281,13 @@ fn configure_injected_trgo_etsic_is_zero() {
     let chans = [(4u8, 1u8)];
     let _ = Adc::configure_injected(ADC0_BASE, &chans, true, ETSIC_T0_TRGO);
     assert_eq!(r(CTL1) & CTL1_ETSIC, 0, "ETSIC = TIMER0 TRGO (code 0)");
+    // A single-rank group derives SM CLEAR (readiness delta 7 is a len>1 derivation): rank 0
+    // converts without scan, so scan is not forced on for one channel.
+    assert_eq!(
+        r(CTL0) & CTL0_SM,
+        0,
+        "SM clear (single-rank injected group)"
+    );
 }
 
 /// `read_injected_data` reads IDATA0..3 (0x3C/0x40/0x44/0x48) by injected index.

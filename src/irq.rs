@@ -517,6 +517,116 @@ pub fn cycle_count() -> u32 {
     0
 }
 
+// --- NVIC / SysTick interrupt-priority configuration (R7) --------------------------------------
+//
+// The motor-era execution model (`specs/motor-integration.md`) requires a strict interrupt-priority
+// ordering the HAL previously could not express: every external IRQ runs at reset priority 0 and the
+// only priority ever set is SysTick (poked into SCB directly by the firmware). R7 is the missing
+// priority-configuration API, verified at silicon stage 1 by reading the NVIC IPR registers back over
+// SWD.
+//
+// Register facts (Cortex-M3, identical on both bench families):
+// - External-IRQ priorities live in the NVIC IPR byte array at 0xE000_E400: IRQ `n`'s 8-bit priority
+//   is the byte at `0xE000_E400 + n` (four IRQs per 32-bit IPR word).
+// - SysTick (a system exception, not an external IRQ) has its priority in SCB SHPR3 (0xE000_ED20),
+//   the top byte (`bits[31:24]`).
+// - GD32F10x/F1x0 implement `__NVIC_PRIO_BITS = 4`: only the TOP 4 bits of each 8-bit field are
+//   significant, so priorities move in steps of 0x10 and LOWER numeric value = HIGHER urgency.
+//
+// GROUPING DECISION (documented, no write): the priority-group split (AIRCR PRIGROUP) is left at its
+// reset value 0. On a 4-priority-bit part PRIGROUP = 0 makes all four implemented bits PREEMPTION
+// priority with zero sub-priority bits, so any two distinct priority values strictly preempt one
+// another, which is exactly the ordering the execution model needs. No AIRCR write is emitted (there
+// is nothing to change from reset), so this module never touches PRIGROUP.
+//
+// The writes go through [`crate::reg::Reg32`] (word RMW), so they are host-testable against the mock
+// register space and read back with [`irq_priority`] / [`systick_priority`] the same way a bench SWD
+// read confirms the IPR bytes on silicon.
+
+use crate::reg::Reg32;
+
+/// NVIC IPR byte-array base (`0xE000_E400`): external IRQ `n`'s priority byte is at `base + n`.
+pub const NVIC_IPR_BASE: u32 = 0xE000_E400;
+/// SCB SHPR3 (`0xE000_ED20`): the SysTick priority is its top byte (`bits[31:24]`).
+pub const SCB_SHPR3: u32 = 0xE000_ED20;
+
+/// The period (motor hot-path) ISR priority: the HIGHEST urgency in the image (lowest numeric). It
+/// must outrank the link RX vectors and SysTick, per the execution model (a link ISR delaying a
+/// commutation step is a torque glitch; the reverse is a few resync-tolerant dropped bytes).
+pub const MOTOR_ISR_PRIORITY: u8 = 0x10;
+/// The USART1 RX vector priority: below the period ISR, above the DMA-RX vector.
+pub const USART1_RX_PRIORITY: u8 = 0x40;
+/// The DMA-RX vector priority: below USART1 RX, above SysTick.
+pub const DMA_RX_PRIORITY: u8 = 0x70;
+/// The SysTick priority: the lowest urgency (highest numeric), the stock 0xF0 the scheduler runs at.
+pub const SYSTICK_PRIORITY: u8 = 0xF0;
+
+/// The NVIC IPR word holding IRQ `irq`'s priority byte, and the byte's shift within that word.
+#[inline]
+const fn ipr_word(irq: usize) -> (Reg32, u32) {
+    let word = (irq / 4) as u32 * 4;
+    let shift = (irq % 4) as u32 * 8;
+    (Reg32::new(NVIC_IPR_BASE, word), shift)
+}
+
+/// Set external IRQ `irq`'s NVIC priority (R7). RMW of the containing IPR word so the three
+/// neighbouring IRQs' priority bytes are preserved. Only the top `__NVIC_PRIO_BITS` (4) bits are
+/// significant on these parts; lower numeric value = higher urgency. Reads back via [`irq_priority`]
+/// (the same byte a bench SWD read of the IPR confirms).
+#[inline]
+pub fn set_irq_priority(irq: usize, priority: u8) {
+    let (reg, shift) = ipr_word(irq);
+    reg.modify(0xFF << shift, (priority as u32) << shift);
+}
+
+/// Read external IRQ `irq`'s NVIC priority byte back (the host-test / read-back companion to
+/// [`set_irq_priority`]; the bench reads the same byte over SWD).
+#[inline]
+pub fn irq_priority(irq: usize) -> u8 {
+    let (reg, shift) = ipr_word(irq);
+    ((reg.read() >> shift) & 0xFF) as u8
+}
+
+/// Set the SysTick exception priority (SCB SHPR3 top byte). RMW so the other three system-handler
+/// priority bytes in SHPR3 (bits[23:0], reserved on these parts) are preserved. This is the HAL
+/// surface for the SysTick priority the firmware otherwise pokes into SCB directly.
+#[inline]
+pub fn set_systick_priority(priority: u8) {
+    Reg32::new(SCB_SHPR3, 0).modify(0xFF00_0000, (priority as u32) << 24);
+}
+
+/// Read the SysTick exception priority back (SCB SHPR3 top byte).
+#[inline]
+pub fn systick_priority() -> u8 {
+    (Reg32::new(SCB_SHPR3, 0).read() >> 24) as u8
+}
+
+/// The motor-era vector IRQ numbers for `layout`, in the order the priority ordering names them:
+/// `(period_isr, usart1_rx, dma_rx)`. The PERIOD ISR is the ADC injected-EOC vector (the reference's
+/// current-sense driving model: the loop rate IS the PWM rate, so the period vector completes an
+/// injected conversion). The no-current-sense update-vector period path is not wired here (no such
+/// board is in the validation loop; `set_irq_priority` serves it directly when it lands).
+#[inline]
+pub const fn motor_era_irqs(layout: IrqLayout) -> (usize, usize, usize) {
+    match layout {
+        IrqLayout::F1x0Grouped => (F1X0_ADC_CMP_IRQ, F1X0_USART1_IRQ, F1X0_DMA_CH3_4_IRQ),
+        IrqLayout::F10xSeparate => (F10X_ADC0_1_IRQ, F10X_USART1_IRQ, F10X_DMA0_CH5_IRQ),
+    }
+}
+
+/// Apply the motor-era interrupt-priority ordering for `layout` (R7, the single-owner surface): the
+/// period (ADC injected-EOC) ISR above the USART1 RX vector above the DMA-RX vector above SysTick.
+/// Resolves the per-family vector numbers from [`motor_era_irqs`] and writes the four priorities;
+/// silicon stage 1 reads the IPR + SHPR3 bytes back over SWD to confirm the ordering is real. Call
+/// once at boot, before the vectors are unmasked.
+pub fn apply_motor_era_priorities(layout: IrqLayout) {
+    let (period, usart1, dma) = motor_era_irqs(layout);
+    set_irq_priority(period, MOTOR_ISR_PRIORITY);
+    set_irq_priority(usart1, USART1_RX_PRIORITY);
+    set_irq_priority(dma, DMA_RX_PRIORITY);
+    set_systick_priority(SYSTICK_PRIORITY);
+}
+
 // --- The owned RAM vector table (DECISIONS.md #6) ---------------------------------------------
 
 /// The owned RAM vector table (DECISIONS.md #6): an alignment-correct `static` in a dedicated

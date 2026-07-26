@@ -295,6 +295,14 @@ impl Adc {
     /// external-trigger-source field value ([`ETSIC_T0_CH3`] / [`ETSIC_T0_TRGO`], derived from the
     /// descriptor's timer-trigger link). Reproduces the SPL:
     ///
+    /// - `adc_special_function_config(SCAN_MODE, ...)`: set CTL0 SM when the group has more than one
+    ///   rank, clear it for a single rank. **Scan mode is a correctness-derivation from
+    ///   `channels.len()`, not a config field** (`config.rs` "No hidden HAL defaults"): a multi-rank
+    ///   inserted group does NOT convert ranks past rank 0 unless SM is set, so a two-phase-current
+    ///   group (the motor hot path) reads only phase A and never phase B with SM clear. This is
+    ///   `plan-hotpath-readiness.md` delta 7 (the one real missing write in the group): the regular
+    ///   [`Adc::configure`] path explicitly CLEARS SM (single conversion); the injected path derives
+    ///   it from the rank count.
     /// - `adc_data_alignment_config(LEFT)`: set CTL1 DAL (or clear for right-aligned).
     /// - `adc_inserted_channel_length_config(len)`: ISQ IL = `len - 1`.
     /// - per rank `adc_inserted_channel_config(rank, channel, sample_time)`: the rank's 5-bit ISQ
@@ -318,11 +326,17 @@ impl Adc {
         etsic: u32,
     ) -> Adc {
         let dev = Adc { base };
+        // adc_special_function_config(SCAN_MODE, ...): SM derived from the rank count (readiness
+        // delta 7). A multi-rank inserted group needs scan mode to convert ranks past rank 0, so
+        // set SM when len > 1 and clear it for a single rank. Without this, a two-phase-current
+        // group converts only phase A and R1's two-rank sequence never works.
+        let len = channels.len().max(1) as u32;
+        dev.ctl0()
+            .modify(CTL0_SM, if len > 1 { CTL0_SM } else { 0 });
         // adc_data_alignment_config: DAL set = left-aligned, clear = right.
         dev.ctl1()
             .modify(CTL1_DAL, if left_aligned { CTL1_DAL } else { 0 });
         // adc_inserted_channel_length_config(len): ISQ IL = len - 1.
-        let len = channels.len().max(1) as u32;
         dev.set_injected_length(len as u8);
         // adc_inserted_channel_config(rank, channel, sample_time) per rank.
         let mut internal = false;
