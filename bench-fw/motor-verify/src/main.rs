@@ -12,13 +12,19 @@
 //!    reference `PwmConfig`. This is CONFIG-ONLY: it programs the time base, the three complementary
 //!    channel pairs, dead-time and the break/off-state word, and leaves MOE (the main-output-enable
 //!    arming gate) OFF. The bridge is configured but DISARMED, so no current can flow.
-//! 3. Reads the configured registers back with `chip.dump_config(timer, adc)` (pure
+//! 3. Applies the motor-era NVIC interrupt-priority ordering (`irq::apply_motor_era_priorities`,
+//!    HAL requirement R7): the period (ADC injected-EOC) vector above the USART1 RX vector above the
+//!    DMA-RX vector above SysTick. This is the surface `specs/motor-integration.md`'s silicon stage 1
+//!    verifies by reading the NVIC IPR bytes + SCB SHPR3 back over SWD, so this image is the vehicle
+//!    that carries it onto silicon on BOTH families (the per-family vector numbers come from the
+//!    detected `IrqLayout`). Writing priorities enables nothing: the vectors stay masked.
+//! 4. Reads the configured registers back with `chip.dump_config(timer, adc)` (pure
 //!    reads, no writes, never an MOE write) and checks them against what was configured:
 //!    - the period (CAR) and prescaler (PSC) match the config,
 //!    - the dead-time field in CCHP matches,
 //!    - and, the load-bearing SAFETY check, MOE is CLEAR (`!regs.moe()`): a config-only bring-up
 //!      must never have armed the bridge.
-//! 4. Reports the verdict on an LED: a SLOW blink means "verified, all fields match and the bridge
+//! 5. Reports the verdict on an LED: a SLOW blink means "verified, all fields match and the bridge
 //!    is disarmed"; a FAST blink means "the read-back did not match the configured state" (a fault
 //!    a bench operator can see without a debugger or a UART).
 //!
@@ -50,6 +56,7 @@ use embedded_hal::digital::OutputPin;
 use panic_halt as _;
 
 use runtime_hal::config::TrgoSource;
+use runtime_hal::irq;
 use runtime_hal::{
     detect_chip, BreakConfig, ClockDiv, ComplementaryPwm, OcMode, PeriphLabel, PwmAlign,
     PwmChannelConfig, PwmConfig, PwmController,
@@ -95,6 +102,19 @@ fn reference_config() -> PwmConfig {
     }
 }
 
+/// Check the motor-era interrupt-priority ordering back out of the NVIC/SCB (R7's read-back
+/// companion): the period (ADC injected-EOC) vector, the USART1 RX vector and the DMA-RX vector at
+/// their named priorities, and SysTick at the stock 0xF0. The per-family vector numbers come from the
+/// detected [`runtime_hal::descriptor::IrqLayout`], so the same check is meaningful on both families.
+/// The bench reads the same IPR bytes over SWD; this is the on-board half of that gate.
+fn verify_priorities(layout: runtime_hal::descriptor::IrqLayout) -> bool {
+    let (period, usart1, dma) = irq::motor_era_irqs(layout);
+    irq::irq_priority(period) == irq::MOTOR_ISR_PRIORITY
+        && irq::irq_priority(usart1) == irq::USART1_RX_PRIORITY
+        && irq::irq_priority(dma) == irq::DMA_RX_PRIORITY
+        && irq::systick_priority() == irq::SYSTICK_PRIORITY
+}
+
 /// Check a register-dump snapshot against the configured state. Returns `true` only if every checked
 /// field matches AND the bridge is disarmed (MOE clear). This is the verification gate in miniature:
 /// the same fields a host golden or a bench SWD read would diff.
@@ -120,6 +140,13 @@ fn main() -> ! {
     // Free the JTAG-overlay pins so PB3 can drive the verdict LED (F10x: keeps SWD live; F1x0: no-op).
     chip.free_jtag_pins().ok();
 
+    // Apply the motor-era NVIC priority ordering (R7) for the DETECTED layout, at boot, before any
+    // vector is unmasked. Pure NVIC IPR + SCB SHPR3 writes: it enables no interrupt and arms nothing.
+    // Silicon stage 1 reads these bytes back over SWD; `verify_priorities` below is the on-board half.
+    let layout = chip.irq();
+    irq::apply_motor_era_priorities(layout);
+    let priorities_ok = verify_priorities(layout);
+
     // Verdict LED on PB3 (green), push-pull output, parked low.
     let gpiob = chip.gpiob().unwrap().split();
     let mut led = gpiob.pb3.into_push_pull_output();
@@ -128,7 +155,7 @@ fn main() -> ! {
     // CONFIG-ONLY bring-up: programs the timer, leaves MOE OFF (the bridge stays disarmed). We hold
     // only the per-cycle handle; arming is a separate ArmGate call this example never makes.
     let cfg = reference_config();
-    let verified = match PwmController::new().configure(&chip, &cfg) {
+    let timer_ok = match PwmController::new().configure(&chip, &cfg) {
         Ok(_handle) => {
             // Read the configured registers back through the chip-based dump builder (pure reads, no
             // MOE write), which resolves the bases internally. This example does not bring up the
@@ -142,6 +169,9 @@ fn main() -> ! {
         // A config failure (e.g. the timer base did not resolve) is itself a verification failure.
         Err(_) => false,
     };
+    // The verdict is the conjunction: the timer read-back matched AND the bridge is disarmed AND the
+    // motor-era priority ordering reads back as written.
+    let verified = timer_ok && priorities_ok;
 
     // Build the SysTick-backed delay on the 8 MHz reset clock for the verdict blink.
     let mut delay = runtime_hal::Delay::new(cp.SYST, 8_000_000);
