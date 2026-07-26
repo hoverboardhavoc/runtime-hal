@@ -8,25 +8,29 @@
 //! # What it does
 //!
 //! 1. Detects the chip.
-//! 2. Runs the advanced-timer complementary-PWM bring-up (`PwmController::configure`) from a
-//!    reference `PwmConfig`. This is CONFIG-ONLY: it programs the time base, the three complementary
-//!    channel pairs, dead-time and the break/off-state word, and leaves MOE (the main-output-enable
-//!    arming gate) OFF. The bridge is configured but DISARMED, so no current can flow.
-//! 3. Applies the motor-era NVIC interrupt-priority ordering (`irq::apply_motor_era_priorities`,
+//! 2. Applies the motor-era NVIC interrupt-priority ordering (`irq::apply_motor_era_priorities`,
 //!    HAL requirement R7): the period (ADC injected-EOC) vector above the USART1 RX vector above the
 //!    DMA-RX vector above SysTick. This is the surface `specs/motor-integration.md`'s silicon stage 1
 //!    verifies by reading the NVIC IPR bytes + SCB SHPR3 back over SWD, so this image is the vehicle
 //!    that carries it onto silicon on BOTH families (the per-family vector numbers come from the
-//!    detected `IrqLayout`). Writing priorities enables nothing: the vectors stay masked.
-//! 4. Reads the configured registers back with `chip.dump_config(timer, adc)` (pure
+//!    detected `IrqLayout`). Writing priorities enables nothing: the vectors stay masked. It then
+//!    reads the same bytes back with `irq_priority` / `systick_priority` into the verdict.
+//! 3. Enables TIMER0's peripheral clock (`clock::enable_timer`), which is load-bearing: an unclocked
+//!    GD32 advanced timer silently ignores register writes and reads back zero, so the read-back in
+//!    step 5 would compare against an all-zero register block.
+//! 4. Runs the advanced-timer complementary-PWM bring-up (`PwmController::configure`) from a
+//!    reference `PwmConfig`. This is CONFIG-ONLY: it programs the time base, the three complementary
+//!    channel pairs, dead-time and the break/off-state word, and leaves MOE (the main-output-enable
+//!    arming gate) OFF. The bridge is configured but DISARMED, so no current can flow.
+//! 5. Reads the configured registers back with `chip.dump_config(timer, adc)` (pure
 //!    reads, no writes, never an MOE write) and checks them against what was configured:
 //!    - the period (CAR) and prescaler (PSC) match the config,
 //!    - the dead-time field in CCHP matches,
 //!    - and, the load-bearing SAFETY check, MOE is CLEAR (`!regs.moe()`): a config-only bring-up
 //!      must never have armed the bridge.
-//! 5. Reports the verdict on an LED: a SLOW blink means "verified, all fields match and the bridge
-//!    is disarmed"; a FAST blink means "the read-back did not match the configured state" (a fault
-//!    a bench operator can see without a debugger or a UART).
+//! 6. Reports the verdict on an LED: a SLOW blink means "verified, all fields match, the bridge is
+//!    disarmed and the priority ordering reads back as written"; a FAST blink means "a read-back did
+//!    not match" (a fault a bench operator can see without a debugger or a UART).
 //!
 //! # Why this is electrically safe to run on a board
 //!
@@ -34,7 +38,9 @@
 //! only READS registers. With MOE clear the timer counts and the compare events toggle the internal
 //! channels, but the gate driver outputs stay at their idle state, so no phase current flows. This
 //! is the disarmed-but-configured state the M3 SAFETY section calls electrically safe to scope. The
-//! example never builds an `ArmGate` and never calls `arm()`.
+//! example never builds an `ArmGate` and never calls `arm()`. Enabling the TIMER0 clock (step 3) does
+//! not change that: the counter now really runs, but the six gate pins are never routed to their
+//! alternate function (see "Pins"), so the timer's outputs stay inside the chip.
 //!
 //! # Pins
 //!
@@ -55,6 +61,7 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use panic_halt as _;
 
+use runtime_hal::clock;
 use runtime_hal::config::TrgoSource;
 use runtime_hal::irq;
 use runtime_hal::{
@@ -152,23 +159,36 @@ fn main() -> ! {
     let mut led = gpiob.pb3.into_push_pull_output();
     let _ = led.set_low();
 
-    // CONFIG-ONLY bring-up: programs the timer, leaves MOE OFF (the bridge stays disarmed). We hold
-    // only the per-cycle handle; arming is a separate ArmGate call this example never makes.
+    // Enable TIMER0's peripheral clock BEFORE configuring it. Load-bearing and measured: an unclocked
+    // GD32 advanced timer silently swallows every register write and reads back ZERO, so without this
+    // the bring-up below writes into the void and the read-back sees an all-zero register block. (That
+    // was this image's state until 2026-07-26, when the bench read TIMER0 all-zero on both families:
+    // the timer half of the verdict was vacuous. The NVIC half above is unaffected -- the core's NVIC
+    // needs no peripheral clock.) The clock enable is the HAL's (`clock::enable_timer`), resolved from
+    // the detected chip's RCU base + clock path; nothing here writes an RCU bit directly.
     let cfg = reference_config();
-    let timer_ok = match PwmController::new().configure(&chip, &cfg) {
-        Ok(_handle) => {
-            // Read the configured registers back through the chip-based dump builder (pure reads, no
-            // MOE write), which resolves the bases internally. This example does not bring up the
-            // injected ADC, so TIMER0 is passed for the ADC base too: the verdict only checks the
-            // timer half. A full verify example would pass the real injected-ADC label.
-            match chip.dump_config(PeriphLabel::Timer0, PeriphLabel::Timer0) {
-                Ok(snap) => verify(&snap.timer),
-                Err(_) => false,
-            }
-        }
-        // A config failure (e.g. the timer base did not resolve) is itself a verification failure.
+    let clock_ok = match chip.rcu_base() {
+        Ok(rcu) => clock::enable_timer(rcu, chip.clock(), cfg.timer).is_ok(),
         Err(_) => false,
     };
+
+    // CONFIG-ONLY bring-up: programs the timer, leaves MOE OFF (the bridge stays disarmed). We hold
+    // only the per-cycle handle; arming is a separate ArmGate call this example never makes.
+    let timer_ok = clock_ok
+        && match PwmController::new().configure(&chip, &cfg) {
+            Ok(_handle) => {
+                // Read the configured registers back through the chip-based dump builder (pure reads,
+                // no MOE write), which resolves the bases internally. This example does not bring up
+                // the injected ADC, so TIMER0 is passed for the ADC base too: the verdict only checks
+                // the timer half. A full verify example would pass the real injected-ADC label.
+                match chip.dump_config(PeriphLabel::Timer0, PeriphLabel::Timer0) {
+                    Ok(snap) => verify(&snap.timer),
+                    Err(_) => false,
+                }
+            }
+            // A config failure (e.g. the timer base did not resolve) is itself a verification failure.
+            Err(_) => false,
+        };
     // The verdict is the conjunction: the timer read-back matched AND the bridge is disarmed AND the
     // motor-era priority ordering reads back as written.
     let verified = timer_ok && priorities_ok;
