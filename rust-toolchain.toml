@@ -1,3 +1,16 @@
+# This pin governs runtime-hal's OWN checks only, and it stays on stable deliberately.
+#
+# The consumer that ships this crate to silicon (hoverboard-firmware) pins a dated nightly, because
+# its shipping image is built with -Z build-std. That pin governs the image: rustup resolves the
+# toolchain from the directory cargo is invoked in, the image is always built in the firmware repo,
+# and this crate is a path dependency there, so the HAL that reaches flash is compiled by the
+# firmware's nightly, never by this file.
+#
+# Keeping this side on stable is what makes runtime-hal provably stable-compatible for any consumer
+# that is not on nightly, which is the property its own CI (host + thumbv7m checks) should be
+# proving. The divergence it creates, that this repo's CI never compiles the crate on nightly, is
+# covered on the other side: the firmware's build and clippy jobs compile runtime-hal under the
+# pinned nightly on every push, and that is the gate guarding the shipping image.
 [toolchain]
 channel = "1.96.0"
 targets = ["thumbv7m-none-eabi"]
