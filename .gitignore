@@ -25,3 +25,7 @@ __pycache__/
 
 # Reverse-engineering-derived spec/plan/research docs; kept local, not published.
 /specs/
+
+# Editor and OS droppings; local to a machine, never published.
+.DS_Store
+.vscode/

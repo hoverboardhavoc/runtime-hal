@@ -350,7 +350,10 @@ impl Adc {
         }
         // adc_external_trigger_source_config(INSERTED, src): ETSIC = the timer trigger code.
         dev.ctl1().modify(CTL1_ETSIC, (etsic << 12) & CTL1_ETSIC);
-        // adc_external_trigger_config(INSERTED, ENABLE): set ETEIC.
+        // adc_external_trigger_config(INSERTED, ENABLE): set ETEIC. The caller does not leave this
+        // write as the only assertion of the enable: it re-asserts ETEIC once per period with
+        // `InjectedHandle::reassert_trigger_enable`, which is stock's own per-period
+        // `ADC_CTL1 |= 0x8000`. See that method for what the re-assert is and is not evidence for.
         dev.ctl1().modify(CTL1_ETEIC, CTL1_ETEIC);
         // adc_interrupt_enable(ADC_INT_EOIC): set CTL0 EOICIE (the PWM-rate control-loop interrupt).
         dev.ctl0().modify(CTL0_EOICIE, CTL0_EOICIE);
@@ -831,6 +834,9 @@ pub struct InjectedHandle {
     /// STAT accessor, resolved once: the per-period injected end-of-conversion flag lives here and
     /// the period ISR must clear it (see [`InjectedHandle::clear_eoic`]).
     stat: Reg32,
+    /// CTL1 accessor, resolved once: the injected group's external-trigger enable (ETEIC) lives
+    /// here and is RE-ASSERTED every period (see [`InjectedHandle::reassert_trigger_enable`]).
+    ctl1: Reg32,
     /// Number of valid injected channels (<= [`MAX_INJECTED_CHANNELS`]).
     len: u8,
 }
@@ -853,6 +859,7 @@ impl InjectedHandle {
                 Reg32::new(adc_base, ADC_IDATA[3]),
             ],
             stat: Reg32::new(adc_base, STAT),
+            ctl1: Reg32::new(adc_base, CTL1),
             len,
         }
     }
@@ -870,6 +877,50 @@ impl InjectedHandle {
     #[inline]
     pub fn clear_eoic(&self) {
         self.stat.modify(STAT_EOIC, 0);
+    }
+
+    /// Per-cycle: RE-ASSERT the injected group's external-trigger enable (CTL1 ETEIC, bit 15), the
+    /// stock firmware's `ADC_CTL1 |= 0x8000`.
+    ///
+    /// **Why re-assert a bit that is already set: parity with the reference, at one RMW per
+    /// period.** The stock firmware re-asserts this bit and clears EOIC on every PWM period out of
+    /// its TIMER0 update ISR, so in the contract this HAL matches the trigger enable is a
+    /// maintained fact rather than a one-shot arming. A caller re-asserts it (a) while confirming
+    /// the group has started at bring-up, where the counter is running, and (b) once per period
+    /// from the end-of-conversion ISR.
+    ///
+    /// This is NOT a fix for a bring-up race. Reading the F10x bring-up failure as a
+    /// layout-sensitive race that a once-only ETEIC loses was refuted the same day it was written
+    /// (2026-07-26, same board, same staged fields): the re-assert does not start the trigger, and
+    /// the actual defect was trigger WIDTH (a single-timer-tick TRGO pulse against this family's
+    /// 12 MHz ADC clock). What proves the group started is the caller's bring-up start-confirm poll
+    /// of [`Self::eoic`], which fails loud instead of booting with a silently absent motor.
+    ///
+    /// This touches ONLY the ADC's own trigger enable. It is not an arming act: nothing here
+    /// reaches the timer's break-and-dead-time register, and the bridge's master output enable is
+    /// [`crate::timer::arming::ArmGate`]'s alone.
+    ///
+    /// Side effect, recorded because it is real: the read-modify-write puts a 1 into CTL1 ADCON
+    /// with the bit already set, which on this silicon starts a ROUTINE conversion (measured at
+    /// bring-up: STAT reads back 0x12, STRC + EOC). Nothing reads the regular data register, the
+    /// regular group raises no interrupt here (only EOICIE is enabled), and the injected group
+    /// preempts the regular one, so the cost is ADC activity rather than a correctness or latency
+    /// effect. Stock carries the same side effect from the same write.
+    #[inline]
+    pub fn reassert_trigger_enable(&self) {
+        self.ctl1.modify(CTL1_ETEIC, CTL1_ETEIC);
+    }
+
+    /// Read the injected end-of-conversion flag (STAT EOIC): true once the injected group has
+    /// completed a conversion sequence and has not been cleared since.
+    ///
+    /// The bring-up's start-confirm polls this: with the counter running, EOIC setting is the proof
+    /// that the timer-triggered injected group actually started, and it is the only such proof the
+    /// bring-up has. The period ISR does not read it (it is
+    /// entered because of it) and clears it through [`Self::clear_eoic`].
+    #[inline]
+    pub fn eoic(&self) -> bool {
+        self.stat.read() & STAT_EOIC != 0
     }
 
     /// Per-cycle: read the injected conversion results in injected-rank order (left-aligned, raw).

@@ -414,6 +414,62 @@ mod injected {
         assert_ne!(stat & (1 << 4), 0, "neighbouring STAT bit untouched");
     }
 
+    /// `reassert_trigger_enable` sets CTL1 ETEIC (bit 15) and touches no other CTL1 bit: the
+    /// maintained-trigger rule's per-period write (stock parity at one read-modify-write per
+    /// period, not a race fix; see the method's doc). It must in particular preserve ADCON, the
+    /// trigger-source field and the alignment bit, since it runs on a fully configured group.
+    #[test]
+    fn reassert_trigger_enable_sets_only_eteic() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        const CTL1_OFF: u32 = 0x08;
+        // A configured group with ETEIC CLEAR: ADCON (bit 0), DAL (bit 11), ETSIC = CH3 (1 << 12),
+        // plus a high sentinel bit that must survive.
+        Reg32::new(ADC0_BASE, CTL1_OFF).write(1 | (1 << 11) | (1 << 12) | (1 << 23));
+
+        let h = InjectedHandle::new(ADC0_BASE, 2);
+        h.reassert_trigger_enable();
+
+        let ctl1 = Reg32::new(ADC0_BASE, CTL1_OFF).read();
+        assert_ne!(ctl1 & (1 << 15), 0, "ETEIC re-asserted");
+        assert_eq!(ctl1 & 1, 1, "ADCON preserved");
+        assert_ne!(ctl1 & (1 << 11), 0, "DAL preserved");
+        assert_eq!(ctl1 & (0x7 << 12), 1 << 12, "ETSIC preserved");
+        assert_ne!(ctl1 & (1 << 23), 0, "neighbouring CTL1 bit untouched");
+
+        // Idempotent: re-asserting an already-set ETEIC changes nothing else either (this is the
+        // steady-state per-period case).
+        let before = ctl1;
+        h.reassert_trigger_enable();
+        assert_eq!(Reg32::new(ADC0_BASE, CTL1_OFF).read(), before);
+    }
+
+    /// `eoic` reads STAT bit 2 and nothing else: the bring-up start-confirm's poll. It reports the
+    /// flag rather than clearing it, so a confirm that succeeds leaves the flag for
+    /// [`InjectedHandle::clear_eoic`].
+    #[test]
+    fn eoic_reads_the_injected_eoc_flag_without_clearing_it() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        const STAT_OFF: u32 = 0x00;
+        let h = InjectedHandle::new(ADC0_BASE, 2);
+
+        // Regular EOC set but EOIC clear: the injected group has NOT converted.
+        Reg32::new(ADC0_BASE, STAT_OFF).write(1 << 1);
+        assert!(!h.eoic(), "regular EOC is not the injected flag");
+
+        Reg32::new(ADC0_BASE, STAT_OFF).write((1 << 1) | (1 << 2));
+        assert!(h.eoic(), "EOIC set");
+        assert!(h.eoic(), "reading it does not clear it");
+        assert_ne!(
+            Reg32::new(ADC0_BASE, STAT_OFF).read() & (1 << 2),
+            0,
+            "STAT untouched by the read"
+        );
+    }
+
     /// `TriggeredAdc::configure` runs the T8 injected bring-up INCLUDING the calibration poll. In the
     /// flat mock register space the calibration self-clearing bit (RSTCLB) never clears, so the
     /// bounded poll exits as `Timeout`. The point here: the trait does wire the config writes AND
