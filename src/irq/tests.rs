@@ -554,3 +554,20 @@ fn r7_apply_motor_era_priorities_both_families() {
         assert!(irq_priority(dma) < systick_priority());
     }
 }
+
+/// `unmask_irq` is the crate's NVIC set-enable owner and is a no-op under the host `mock` build
+/// (there is no NVIC there), so calling it from host-test code is safe and changes no register.
+/// The hardware body is exercised on silicon by every RX bring-up and by the motor period vector.
+#[test]
+fn unmask_irq_is_inert_under_mock() {
+    let _g = mock::lock();
+    mock::reset();
+    // Both the F1x0 and F10x period-vector numbers; nothing is written anywhere.
+    super::unmask_irq(F1X0_ADC_CMP_IRQ);
+    super::unmask_irq(R7_F10X_ADC);
+    assert_eq!(
+        Reg32::new(NVIC_IPR_BASE, 0).read(),
+        0,
+        "unmask writes no IPR byte"
+    );
+}

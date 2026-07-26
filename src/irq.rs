@@ -627,6 +627,43 @@ pub fn apply_motor_era_priorities(layout: IrqLayout) {
     set_systick_priority(SYSTICK_PRIORITY);
 }
 
+/// A device IRQ number as a [`cortex_m::interrupt::InterruptNumber`] for `NVIC::unmask`.
+#[cfg(not(feature = "mock"))]
+#[derive(Clone, Copy)]
+struct IrqNum(u16);
+
+#[cfg(not(feature = "mock"))]
+// SAFETY: the value is a GD SPL `IRQn_Type` number, a valid device IRQ number for this part.
+unsafe impl cortex_m::interrupt::InterruptNumber for IrqNum {
+    #[inline]
+    fn number(self) -> u16 {
+        self.0
+    }
+}
+
+/// Unmask (enable) an external IRQ in the NVIC: the "enable its vector" half of registering a
+/// handler, and the single owner of NVIC set-enable writes (as [`set_irq_priority`] is of the
+/// priority bytes).
+///
+/// The caller is responsible for the vector's table routing (the RAM table's slot) and for its
+/// priority BEFORE unmasking: unmasking is what first allows the IRQ to fire. Hardware-only; under
+/// the host `mock` build there is no NVIC and this is a no-op (the host suite drives ISR bodies
+/// through `mock_vtor::dispatch` instead).
+#[cfg(not(feature = "mock"))]
+#[inline]
+pub fn unmask_irq(irq: usize) {
+    // SAFETY: enabling a vector whose table slot + priority the caller has already set up; the
+    // masking-based critical sections this crate uses do not rely on this IRQ staying masked.
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(IrqNum(irq as u16));
+    }
+}
+
+/// Host stand-in: no NVIC under `cargo test`.
+#[cfg(feature = "mock")]
+#[inline]
+pub fn unmask_irq(_irq: usize) {}
+
 // --- The owned RAM vector table (DECISIONS.md #6) ---------------------------------------------
 
 /// The owned RAM vector table (DECISIONS.md #6): an alignment-correct `static` in a dedicated
@@ -764,9 +801,13 @@ extern "C" fn systick_handler() {
 }
 
 /// The ADC injected-EOC vector body (F1x0 IRQ 12 / F10x IRQ 18). This is where the control loop
-/// runs at the PWM rate (the reference + SPEC.md). T8 enables the injected group and this body
-/// clears the EOIC flag then calls the registered control handler; the T2 substrate just routes to
-/// the registered handler so the wiring is in place.
+/// runs at the PWM rate (the reference + SPEC.md): it routes to the registered control handler.
+///
+/// The EOIC flag is cleared by the REGISTERED handler, through
+/// [`crate::adc::InjectedHandle::clear_eoic`], not here: this body holds no ADC base (the base is
+/// resolved into the handle the bring-up returns), and the handle is the injected group's per-cycle
+/// register surface. A registered handler that returns without clearing EOIC re-enters immediately
+/// (EOIC is a level source into the NVIC).
 extern "C" fn adc_isr() {
     call_control_handler();
 }

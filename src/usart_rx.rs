@@ -446,31 +446,16 @@ fn dma_irq_num(chip: &Chip, instance: RxInstance) -> usize {
 
 // --- NVIC interrupt number (hardware build only) ----------------------------------------------
 
-/// A device IRQ number as a [`cortex_m::interrupt::InterruptNumber`] for [`NVIC::unmask`]. This is the
-/// first place the crate drives the NVIC (the firmware owns enabling its interrupts).
-#[cfg(not(feature = "mock"))]
-#[derive(Clone, Copy)]
-struct IrqNum(u16);
-
-#[cfg(not(feature = "mock"))]
-// SAFETY: the value is a GD SPL `IRQn_Type` number (USART1 / DMA channel), a valid device IRQ number.
-unsafe impl cortex_m::interrupt::InterruptNumber for IrqNum {
-    #[inline]
-    fn number(self) -> u16 {
-        self.0
-    }
-}
-
-/// Unmask a device IRQ in the NVIC. Hardware only: there is no NVIC under `cargo test`, where the host
-/// suite fires the ISR via `mock_vtor::dispatch` instead.
+/// Unmask a device IRQ in the NVIC, through the crate's single owner of NVIC set-enable writes
+/// ([`irq::unmask_irq`], which sits with the priority writes). Hardware only: there is no NVIC under
+/// `cargo test`, where the host suite fires the ISR via `mock_vtor::dispatch` instead (the HAL entry
+/// is a no-op there, so this wrapper stays hardware-gated to keep the call sites unchanged).
 #[cfg(not(feature = "mock"))]
 #[inline]
 fn nvic_unmask(irq_num: usize) {
-    // SAFETY: the RAM vector table routing this IRQ is the caller's pre-`new` responsibility; unmasking
-    // now is what first allows the IRQ to fire.
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(IrqNum(irq_num as u16));
-    }
+    // The RAM vector table routing this IRQ is the caller's pre-`new` responsibility; unmasking now
+    // is what first allows the IRQ to fire.
+    irq::unmask_irq(irq_num);
 }
 
 // --- the public type --------------------------------------------------------------------------

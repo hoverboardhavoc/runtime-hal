@@ -394,6 +394,26 @@ mod injected {
         assert!(!h.is_empty());
     }
 
+    /// `clear_eoic` clears STAT bit 2 (the injected end-of-conversion flag) and touches no other
+    /// STAT bit: the period ISR's mandatory per-entry write (EOIC is a level source into the NVIC,
+    /// and reading IDATAx does not clear it, so without this the handler re-enters forever).
+    #[test]
+    fn clear_eoic_clears_only_the_injected_eoc_flag() {
+        let _serial = mock::lock();
+        mock::reset();
+
+        // STAT with EOIC (bit 2) set alongside the regular EOC (bit 1) and a high sentinel bit.
+        const STAT_OFF: u32 = 0x00;
+        Reg32::new(ADC0_BASE, STAT_OFF).write(0b110 | (1 << 4));
+
+        InjectedHandle::new(ADC0_BASE, 2).clear_eoic();
+
+        let stat = Reg32::new(ADC0_BASE, STAT_OFF).read();
+        assert_eq!(stat & (1 << 2), 0, "EOIC cleared");
+        assert_ne!(stat & (1 << 1), 0, "regular EOC untouched");
+        assert_ne!(stat & (1 << 4), 0, "neighbouring STAT bit untouched");
+    }
+
     /// `TriggeredAdc::configure` runs the T8 injected bring-up INCLUDING the calibration poll. In the
     /// flat mock register space the calibration self-clearing bit (RSTCLB) never clears, so the
     /// bounded poll exits as `Timeout`. The point here: the trait does wire the config writes AND

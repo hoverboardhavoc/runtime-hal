@@ -806,6 +806,9 @@ impl TriggeredAdc for InjectedAdcController {
 pub struct InjectedHandle {
     /// IDATA0..IDATA3 accessors (the injected data registers), resolved once.
     idata: [Reg32; MAX_INJECTED_CHANNELS],
+    /// STAT accessor, resolved once: the per-period injected end-of-conversion flag lives here and
+    /// the period ISR must clear it (see [`InjectedHandle::clear_eoic`]).
+    stat: Reg32,
     /// Number of valid injected channels (<= [`MAX_INJECTED_CHANNELS`]).
     len: u8,
 }
@@ -827,8 +830,24 @@ impl InjectedHandle {
                 Reg32::new(adc_base, ADC_IDATA[2]),
                 Reg32::new(adc_base, ADC_IDATA[3]),
             ],
+            stat: Reg32::new(adc_base, STAT),
             len,
         }
+    }
+
+    /// Per-cycle: clear the injected end-of-conversion flag (STAT EOIC), the SPL's
+    /// `adc_flag_clear(ADC_FLAG_EOIC)` (a write-0-to-clear of the bit), mirroring
+    /// [`Adc::clear_eoc`] for the regular group.
+    ///
+    /// **The period ISR must call this.** EOIC is a level source into the NVIC: reading IDATAx does
+    /// NOT clear it (unlike the regular group's EOC, which the RDATA read clears), so an injected-EOC
+    /// handler that returns without clearing it re-enters immediately and the core makes no forward
+    /// progress. The clear lives on the handle because the handle is the injected group's per-cycle
+    /// register surface (the same reason `read_injected` does); the HAL's ADC vector body only
+    /// routes to the registered control handler and holds no ADC base of its own.
+    #[inline]
+    pub fn clear_eoic(&self) {
+        self.stat.modify(STAT_EOIC, 0);
     }
 
     /// Per-cycle: read the injected conversion results in injected-rank order (left-aligned, raw).
