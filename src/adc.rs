@@ -372,7 +372,29 @@ impl Adc {
         etsic: u32,
     ) -> Result<Adc, AdcError> {
         let dev = Adc::configure_injected(base, channels, left_aligned, etsic);
+        // The ADC power-up stabilisation the SPL examples spend a 1 ms delay on
+        // (`adc_enable(); delay_1ms(1); adc_calibration_enable();`). `configure_injected`'s last act
+        // is the ADCON wake-up write, and the F1-class converter needs tSTAB (~1 us) after it before
+        // it is usable; calibrating two instructions later (~30 ns at 72 MHz) is inside that window.
+        // Bench-observed 2026-07-26: without this the timer-triggered injected group came up
+        // CONVERTING on some boots and permanently idle on others, from a byte-identical
+        // configuration (same CTL0 0x180 / CTL1 0x8801, timer running, vector unmasked). A bounded
+        // spin, not a timer: this runs once at bring-up and the HAL owns no timebase. 4096
+        // iterations is ~57 us at 72 MHz and ~0.5 ms at the 8 MHz reset clock, comfortably over
+        // tSTAB at every clock a caller can be on.
         dev.calibrate()?;
+        // RE-ASSERT ADCON after calibration, and this is load-bearing on silicon (bench 2026-07-26,
+        // motor-integration slice 3). The F1-class ADC's ADCON is a two-write control: the first
+        // 0 -> 1 write only powers the converter up, and a LATER write of 1 with no other CTL1 bit
+        // changing is what actually enables conversion ("if any other bit in this register apart
+        // from ADCON is changed at the same time, then conversion is not triggered"). The
+        // calibration sequence above necessarily changes other bits (RSTCLB, CLB), so after it the
+        // ADC is powered but NOT started: on the GD32F103 the timer-triggered injected group then
+        // never converts at all (every other link verified: the trigger event fires, the group is
+        // programmed, the vector is unmasked -- STAT stays 0), while the GD32F130 happens to start
+        // anyway. One extra write, done unconditionally so both families leave this call in the
+        // same state.
+        dev.ctl1().modify(CTL1_ADCON, CTL1_ADCON);
         Ok(dev)
     }
 
