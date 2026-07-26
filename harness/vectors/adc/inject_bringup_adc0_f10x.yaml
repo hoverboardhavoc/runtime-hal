@@ -1,15 +1,16 @@
 name: inject_bringup_adc0_f10x
 description: |
   ADC0 timer-triggered INJECTED (inserted) conversion-group bring-up (M3 T8) on the F10x family:
-  two phase-current channels (4, 5) at 7.5-cycle sample time, LEFT-aligned, injected external trigger
-  source = TIMER0 CH3, the injected end-of-conversion (EOIC) interrupt enabled, ADC enabled. No
-  conversion (calibration is inject_calibrate; trigger-then-read is inject_read). The injected
-  register block is identical on both families; only the SPL adc_* signatures differ (F10x passes
-  ADC0 + the ADC0_1_EXTTRIG_INSERTED_T0_CH3 macro).
+  two phase-current channels (4, 5) at 7.5-cycle sample time, LEFT-aligned, SCAN mode on (the group
+  has two ranks), injected external trigger source = TIMER0 CH3, the injected end-of-conversion
+  (EOIC) interrupt enabled, ADC enabled. No conversion (calibration is inject_calibrate;
+  trigger-then-read is inject_read). The injected register block is identical on both families; only
+  the SPL adc_* signatures differ (F10x passes ADC0 + the ADC0_1_EXTTRIG_INSERTED_T0_CH3 macro).
 
   runtime-hal: Adc::configure_injected(ADC0_BASE, &[(4,1),(5,1)], true, ETSIC_T0_CH3). Same shared
     body as F1x0 (the injected register model is family-independent).
-  GD SPL (F10x): adc_data_alignment_config(ADC0, ADC_DATAALIGN_LEFT);
+  GD SPL (F10x): adc_special_function_config(ADC0, ADC_SCAN_MODE, ENABLE);
+          adc_data_alignment_config(ADC0, ADC_DATAALIGN_LEFT);
           adc_channel_length_config(ADC0, ADC_INSERTED_CHANNEL, 2);
           adc_inserted_channel_config(ADC0, 0, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
           adc_inserted_channel_config(ADC0, 1, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
@@ -25,9 +26,14 @@ description: |
 # registers (CTL0/SAMPT1/ISQ), excluding CTL1 which the public injected path's calibration perturbs.
 # See inject_bringup_adc0_f1x0 for the full API-forced-scoping rationale. CTL1 ETSIC/ETEIC is
 # validated by test_trigger_matrix_invariant on the raw trace.
-#   CTL0   +0x04 : EOICIE (bit 7)                                          0x00000080
+#   CTL0   +0x04 : SM (bit 8, scan) + EOICIE (bit 7)                       0x00000180
 #   SAMPT1 +0x10 : ch4 (3*4=12) + ch5 (3*5=15) sample-time = 1 each        0x00009000
 #   ISQ    +0x38 : IL=1 (len-1, 1<<20); rank0 ch4 @10; rank1 ch5 @15       0x00129000
+#
+# CTL0 SM (readiness delta 7): a multi-rank inserted group does not convert ranks past rank 0 with
+# scan mode clear, so this two-rank phase-current group needs SM set. Both oracles set it: the SPL
+# body via adc_special_function_config(ADC0, ADC_SCAN_MODE, ENABLE) (ADC_SCAN_MODE == ADC_CTL0_SM ==
+# BIT(8)), runtime-hal by deriving it from channels.len() > 1 in configure_injected.
 mode: final_state
 
 assert_only:
@@ -39,6 +45,7 @@ implementations:
   gd-spl/gd32f10x:
     includes: [gd32f10x.h, gd32f10x_adc.h]
     body: |
+      adc_special_function_config(ADC0, ADC_SCAN_MODE, ENABLE);
       adc_data_alignment_config(ADC0, ADC_DATAALIGN_LEFT);
       adc_channel_length_config(ADC0, ADC_INSERTED_CHANNEL, 2U);
       adc_inserted_channel_config(ADC0, 0U, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);

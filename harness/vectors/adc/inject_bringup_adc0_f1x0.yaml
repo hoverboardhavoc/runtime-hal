@@ -1,22 +1,25 @@
 name: inject_bringup_adc0_f1x0
 description: |
   ADC0 timer-triggered INJECTED (inserted) conversion-group bring-up (M3 T8) on the F1x0 family:
-  two phase-current channels (4, 5) at 7.5-cycle sample time, LEFT-aligned, the injected external
-  trigger source = TIMER0 CH3, the injected end-of-conversion (EOIC) interrupt enabled, ADC enabled.
+  two phase-current channels (4, 5) at 7.5-cycle sample time, LEFT-aligned, SCAN mode on (the group
+  has two ranks), the injected external trigger source = TIMER0 CH3, the injected end-of-conversion
+  (EOIC) interrupt enabled, ADC enabled.
   No conversion (the calibration poll is the separate inject_calibrate vector; the trigger-then-read
   sequence is inject_read). This is M3 T8's config golden: runtime-hal's injected-group config writes
   reach the same END STATE as the GD SPL adc_* injected recipe.
 
   The injected register block is identical on both families (gd32f1x0_adc.h / gd32f10x_adc.h: ISQ
-  0x38, IDATA0..3 0x3C..0x48, STAT EOIC bit 2, CTL0 EOICIE bit 7, CTL1 ETSIC[14:12] / ETEIC bit 15,
-  DAL bit 11), so the same vector runs on F10x (inject_bringup_adc0_f10x); the family difference is
-  the SPL adc_* signatures (F10x passes ADCx + the ADC0_1_EXTTRIG_INSERTED_* macro).
+  0x38, IDATA0..3 0x3C..0x48, STAT EOIC bit 2, CTL0 SM bit 8, CTL0 EOICIE bit 7, CTL1 ETSIC[14:12] /
+  ETEIC bit 15, DAL bit 11), so the same vector runs on F10x (inject_bringup_adc0_f10x); the family
+  difference is the SPL adc_* signatures (F10x passes ADCx + the ADC0_1_EXTTRIG_INSERTED_* macro).
 
-  runtime-hal: Adc::configure_injected(ADC0_BASE, &[(4,1),(5,1)], true, ETSIC_T0_CH3). Programs DAL
-    (left), ISQ IL = len-1, the per-rank ISQ channel fields (SPL reversed packing) + per-channel
-    SAMPT, ETSIC = TIMER0 CH3 (code 1), ETEIC, CTL0 EOICIE, ADCON. (The calibration RSTCLB/CLB poll
-    is split into inject_calibrate, exactly as the M2 regular bring-up split it.)
-  GD SPL: adc_data_alignment_config(ADC_DATAALIGN_LEFT);
+  runtime-hal: Adc::configure_injected(ADC0_BASE, &[(4,1),(5,1)], true, ETSIC_T0_CH3). Programs CTL0
+    SM (scan, derived from the rank count), DAL (left), ISQ IL = len-1, the per-rank ISQ channel
+    fields (SPL reversed packing) + per-channel SAMPT, ETSIC = TIMER0 CH3 (code 1), ETEIC, CTL0
+    EOICIE, ADCON. (The calibration RSTCLB/CLB poll is split into inject_calibrate, exactly as the
+    M2 regular bring-up split it.)
+  GD SPL: adc_special_function_config(ADC_SCAN_MODE, ENABLE);
+          adc_data_alignment_config(ADC_DATAALIGN_LEFT);
           adc_channel_length_config(ADC_INSERTED_CHANNEL, 2);
           adc_inserted_channel_config(0, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);
           adc_inserted_channel_config(1, ADC_CHANNEL_5, ADC_SAMPLETIME_7POINT5);
@@ -40,9 +43,20 @@ description: |
 # cleanly (a REPLACE stub clobbers CTL1's accumulated config bits; an OR-mask stub cannot clear a
 # bit software just wrote). So this two-oracle config golden is scoped with assert_only to the
 # calibration-FREE injected config registers, excluding CTL1 (which calibration perturbs):
-#   CTL0   +0x04 : EOICIE (bit 7)                                          0x00000080
+#   CTL0   +0x04 : SM (bit 8, scan) + EOICIE (bit 7)                       0x00000180
 #   SAMPT1 +0x10 : ch4 (3*4=12) + ch5 (3*5=15) sample-time = 1 each        0x00009000
 #   ISQ    +0x38 : IL=1 (len-1, 1<<20); rank0 ch4 @10; rank1 ch5 @15       0x00129000
+#
+# CTL0 SM (readiness delta 7, specs/plan-hotpath-readiness.md): a multi-rank inserted group does not
+# convert ranks past rank 0 with scan mode clear, so this two-rank phase-current group needs SM set,
+# and the stock contract sets it: BalanceAgain findings/register_contracts records stock's
+# adc_dma_init setting the analog pin map, SCAN MODE (CTL0.SM), and the regular sequence length
+# (verified by full-boot emulation of the stock image), and the RoboDurden-derived setup.c enables
+# scan mode too (adc_special_function_config(ADC_SCAN_MODE, ENABLE) in its retained SPL adc_init) as
+# a second, independent SPL-shaped source. SM is a whole-ADC bit, not a per-group one, so the stock
+# inserted group runs with it set. Both oracles set it here: the SPL body via
+# adc_special_function_config (ADC_SCAN_MODE == ADC_CTL0_SM == BIT(8)), runtime-hal by deriving it
+# from channels.len() > 1 in configure_injected.
 # CTL1's ETSIC/ETEIC (the timer->ADC coupling) is validated separately by
 # test_trigger_matrix_invariant, which reads the raw runtime-hal CTL1 write (ETSIC=1, ETEIC set hold
 # regardless of the trailing calibration bit). runtime-hal here calibrates (its poll bounded-times-out
@@ -58,6 +72,7 @@ implementations:
   gd-spl/gd32f1x0:
     includes: [gd32f1x0.h, gd32f1x0_adc.h]
     body: |
+      adc_special_function_config(ADC_SCAN_MODE, ENABLE);
       adc_data_alignment_config(ADC_DATAALIGN_LEFT);
       adc_channel_length_config(ADC_INSERTED_CHANNEL, 2U);
       adc_inserted_channel_config(0U, ADC_CHANNEL_4, ADC_SAMPLETIME_7POINT5);

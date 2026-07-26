@@ -6,5 +6,20 @@ compiler:      arm-none-eabi-gcc (Arm GNU Toolchain 15.2.Rel1 (Build arm-15.86))
 chip_define:   GD32F10X_HD
 compile_flags: -Os -mcpu=cortex-m3 -mthumb -fno-common -ffreestanding -fno-builtin -std=gnu11 -Wall -ffunction-sections -fdata-sections -Wno-unused-but-set-variable -Wno-unused-variable -Wno-comment
 emulator:      unicorn 2.1.4 (UC_ARCH_ARM, UC_MODE_THUMB)
-emulation:     clean-exit (sentinel reached at instr 139)
+emulation:     clean-exit (sentinel reached at instr 155)
 mode:          final_state
+recapture:     slice-2 audit bounce, GD SPL oracle rebuilt with arm-gcc 15.2.Rel1
+               (header above) and compared against the runtime-hal snippet built
+               with the pinned rustc 1.96.0. Re-captured after readiness delta 7
+               (commit 4a37265) made Adc::configure_injected set CTL0 SM (scan)
+               for a multi-rank inserted group: the prior golden (captured
+               2026-06-17) predated it and pinned CTL0 = 0x00000080, so the
+               harness workflow went red at 0x00000180. The SPL snippet body now
+               calls adc_special_function_config(ADC0, ADC_SCAN_MODE, ENABLE),
+               the oracle truth both sources agree on (BalanceAgain
+               findings/register_contracts: stock adc_dma_init sets scan mode /
+               CTL0.SM; RoboDurden Src/setup.c calls the same SPL function;
+               ADC_SCAN_MODE == ADC_CTL0_SM == BIT(8) in the SPL headers). Delta
+               vs the old golden: one new CTL0 read-modify-write pair setting SM
+               (0x00000000 -> 0x00000100) and the trailing EOICIE RMW now reading
+               0x00000100 and writing 0x00000180. Nothing else moved.
