@@ -7,13 +7,26 @@ description: |
   SPL programming the same tree.
 
   runtime-hal: clock::configure_tree(&chip, &ClockConfig::REFERENCE_72M_IRC8M).
-    REFERENCE_72M_IRC8M = sysclk 72 MHz, wait 2, IRC8M, pll_mul 18, AHB /1, APB1 /2, APB2 /1.
+    REFERENCE_72M_IRC8M = sysclk 72 MHz, IRC8M, pll_mul 18, AHB /1, APB1 /2, APB2 /1. The
+    flash wait states are not a config field: the model derives them per family
+    (clock::wait_states_for), which is 1 on this path (see the second reconciliation note).
   GD SPL: the equivalent of system_gd32f1x0.c system_clock_72m_irc8m, written with
     the same target tree (fmc_wscnt_set first; RCU_CTL0 IRC8MEN + stable; RCU_CFG0
     AHB/APB prescalers; PLLSRC_IRC8M_DIV2 + PLL_MUL18; PLLEN + PLLSTB; SCS = PLL +
     SCSS confirm).
 
-  Reconciliation note: the vendor system_clock_72m_irc8m sets APB1 = AHB/1 (F1x0
+  Reconciliation note (wait states): this vector's SPL snippet programs WSCNT = 1, not
+  the vendor recipe's 2, because 1 is the wait-state count this project's F1x0 tree
+  targets. Measured on a GD32F130 at 72 MHz (2026-07-26): WSCNT = 1 gives exact GD32F103
+  parity on a straight-line instruction benchmark, while WSCNT = 2 exposes an
+  alignment-dependent cliff on the same binary (80 cycles for 64 nops at one link address,
+  4,247 at another). The same session refutes the F1x0 manual's claim that WSCNT is valid
+  only when WSEN is set: FMC_WSEN reads 0 on this part and WSCNT is not inert. As with the
+  APB1 ratio below, the SPL snippet is written to the SAME target tree runtime-hal
+  configures, so the comparison stays a like-for-like end-state diff rather than a copy of
+  the vendor function.
+
+  Reconciliation note (APB1): the vendor system_clock_72m_irc8m sets APB1 = AHB/1 (F1x0
   permits APB1 up to 72 MHz). runtime-hal's portable DEFAULT profile uses
   APB1 = AHB/2 (36 MHz), the standard "APB1 max 36 MHz" arrangement that usart.rs
   already assumes for the BAUD divisor and that both families share. So this
@@ -36,7 +49,7 @@ description: |
 # the write COUNT and ORDER differ (a coding-style difference, not a register
 # difference). The correctness criterion is the END STATE of each register, which
 # final_state checks directly:
-#   FMC_WS  = 0x00000002  (WSCNT = 2 wait states)                      <FMC_BASE>+0x00
+#   FMC_WS  = 0x00000001  (WSCNT = 1 wait state, the F1x0 value)        <FMC_BASE>+0x00
 #   RCU_CTL0 final carries IRC8MEN(0)|PLLEN(24) set over the scripted status bits.
 #   RCU_CFG0 = APB1PSC /2 (0x400) | PLLMF mul18 (0x08040000) | SCS PLL (0x2)
 #             over the scripted SCSS bits.
@@ -67,7 +80,7 @@ implementations:
     includes: [gd32f1x0.h, gd32f1x0_rcu.h, gd32f1x0_fmc.h]
     body: |
       /* flash wait states first (before raising the clock) */
-      fmc_wscnt_set(WS_WSCNT_2);
+      fmc_wscnt_set(WS_WSCNT_1);
       /* enable IRC8M, wait until stable */
       RCU_CTL0 |= RCU_CTL0_IRC8MEN;
       while(0U == (RCU_CTL0 & RCU_CTL0_IRC8MSTB)){}

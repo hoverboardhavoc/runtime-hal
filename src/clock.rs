@@ -76,12 +76,16 @@ pub enum ClockSource {
 /// The prescalers are stored as their integer DIVISORS (1, 2, 4, 8, 16, ...) rather than
 /// register-bit codes; [`configure_tree`] maps a divisor to the family's `RCU_CFG0` prescaler bits.
 /// `pll_mul` is the integer multiply factor (e.g. 18 for the IRC8M/2 -> 72 MHz recipe).
+///
+/// **The flash wait-state count is NOT a field here.** It is a per-family silicon fact, not an
+/// application choice, so the model derives it from the clock path and the target clock
+/// ([`wait_states_for`]) and [`configure_tree`] programs that. An application cannot supply a wrong
+/// one, and the two families cannot silently share one literal, which is exactly what they did
+/// before (one `wait_states: 2` for both, correct only on the F10x).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockConfig {
     /// Target system clock in Hz.
     pub sysclk_hz: u32,
-    /// Flash access wait states for that sysclk.
-    pub wait_states: u8,
     /// PLL / system clock source.
     pub source: ClockSource,
     /// PLL multiply factor (integer, e.g. 18). The path maps it to the family's PLLMF bits.
@@ -95,12 +99,13 @@ pub struct ClockConfig {
 }
 
 impl ClockConfig {
-    /// The 72 MHz reference tree (source IRC8M, `pll_mul = 18`, AHB/APB2 = /1, APB1 = /2 = 36 MHz,
-    /// 2 wait states). A named convenience the firmware opts into by name, NOT a hidden HAL default:
-    /// it reproduces the proven reference arrangement (AHB = sysclk, APB1 = sysclk/2).
+    /// The 72 MHz reference tree (source IRC8M, `pll_mul = 18`, AHB/APB2 = /1, APB1 = /2 = 36 MHz).
+    /// A named convenience the firmware opts into by name, NOT a hidden HAL default: it reproduces
+    /// the proven reference arrangement (AHB = sysclk, APB1 = sysclk/2). The flash wait states this
+    /// tree needs are the family's, derived at bring-up ([`wait_states_for`]): 2 on the F10x, 1 on
+    /// the F1x0.
     pub const REFERENCE_72M_IRC8M: ClockConfig = ClockConfig {
         sysclk_hz: 72_000_000,
-        wait_states: 2,
         source: ClockSource::Irc8m,
         pll_mul: 18,
         ahb_psc: 1,
@@ -117,7 +122,6 @@ impl ClockConfig {
     /// prescalers /1 describe the reset state.
     pub const RESET_8M: ClockConfig = ClockConfig {
         sysclk_hz: 8_000_000,
-        wait_states: 0,
         source: ClockSource::Irc8m,
         pll_mul: 2,
         ahb_psc: 1,
@@ -129,22 +133,19 @@ impl ClockConfig {
     /// #10 / DR-1 mitigation). The selector owns the register model AND the legal-range table; this
     /// keeps the chip-bound FACTS in the HAL and the application's CHOICE in code.
     ///
-    /// Range-checks. The RCU register MODEL is shared between the families, but the MAX SYSCLK and
-    /// the FLASH wait-state timing are per-part FACTS, so those bounds are selected off `path`:
+    /// Range-checks. The RCU register MODEL is shared between the families, but the MAX SYSCLK is a
+    /// per-part FACT, so that bound is selected off `path`:
     /// - the PLL multiplier must be in `2..=32` (the PLLMF field range);
     /// - each prescaler divisor must be a legal value (AHB: 1,2,4,..512; APB: 1,2,4,8,16);
-    /// - the wait-states must fit the 3-bit WSCNT field AND be at least the per-family flash minimum;
     /// - the resulting sysclk must not exceed the per-family ceiling.
     ///
-    /// Per-family limits (GD datasheets, `reference/manuals/`):
-    /// - **F10x** (GD32F103): CK_SYS <= 108 MHz, and the flash runs **zero wait state at the full
-    ///   108 MHz** (GD32F103xx Datasheet Rev2.14: "at 108 MHz frequency with Flash accesses zero wait
-    ///   states"), so the minimum wait-state is 0 across the whole range.
+    /// The flash wait states are NOT validated here because they are not supplied here: the model
+    /// derives them per family in [`wait_states_for`], so there is no wrong value to reject.
+    ///
+    /// Per-family sysclk ceilings (GD datasheets, `reference/manuals/`):
+    /// - **F10x** (GD32F103): CK_SYS <= 108 MHz.
     /// - **F1x0**: CK_SYS <= 72 MHz (the F1x0 family max; GD32F130xx is a 48 MHz part, a per-part
-    ///   sub-limit the family probe cannot distinguish, so the board owns staying within it). The
-    ///   flash is zero-wait confirmed at 48 MHz (GD32F130xx Datasheet Rev3.7); above 48 MHz the
-    ///   minimum wait-state is 1 (a conservative floor: the >48 MHz region is the overclock / larger
-    ///   F1x0 parts, not confirmed zero-wait here, and under-setting wait states faults the core).
+    ///   sub-limit the family probe cannot distinguish, so the board owns staying within it).
     pub fn validate_for(&self, path: ClockPath) -> Result<(), ClockError> {
         if self.pll_mul < 2 || self.pll_mul > 32 {
             return Err(ClockError::InvalidPll);
@@ -158,21 +159,51 @@ impl ClockConfig {
         if !is_legal_apb_psc(self.apb2_psc) {
             return Err(ClockError::InvalidPrescaler);
         }
-        // Per-family ceiling + flash-timing minimum wait-state (the only chip-bound facts here).
-        let (max_sysclk, min_ws): (u32, u8) = match path {
-            ClockPath::F10xRcc => (108_000_000, 0),
-            ClockPath::F1x0Rcu => (72_000_000, if self.sysclk_hz <= 48_000_000 { 0 } else { 1 }),
+        // The per-family sysclk ceiling (the one chip-bound fact left here; the wait states are
+        // derived, not supplied).
+        let max_sysclk: u32 = match path {
+            ClockPath::F10xRcc => 108_000_000,
+            ClockPath::F1x0Rcu => 72_000_000,
         };
         if self.sysclk_hz > max_sysclk {
             return Err(ClockError::InvalidWaitStates);
         }
-        if self.wait_states > FMC_WS_WSCNT as u8 {
-            return Err(ClockError::InvalidWaitStates);
-        }
-        if self.wait_states < min_ws {
-            return Err(ClockError::InvalidWaitStates);
-        }
         Ok(())
+    }
+}
+
+/// The flash wait states (`FMC_WS` WSCNT) a given family needs at a given system clock. The single
+/// owner of that fact: [`configure_tree`] programs exactly this, and no caller supplies it.
+///
+/// **It is per FAMILY, and the two families differ at 72 MHz.** Before this was derived, both ran
+/// the one `wait_states: 2` literal that lived in [`ClockConfig::REFERENCE_72M_IRC8M`], which is
+/// right on the F10x and wrong on the F1x0:
+///
+/// - **F10x (GD32F103) at 72 MHz: 2.** The value the fleet's image has always run, with the
+///   family's flash prefetch buffer enabled out of reset. It is also the value the GD SPL's own
+///   72 MHz recipe programs.
+/// - **F1x0 (GD32F130) at 72 MHz: 1.** Silicon, 2026-07-26: WSCNT = 1 gives EXACT F103 parity on a
+///   straight-line instruction benchmark (80 cycles for 64 nops on both parts), while WSCNT = 2
+///   exposes an alignment-dependent cliff on the same binary (80 cycles at one link address,
+///   4,247 at another, a 53x straight-line penalty that any rebuild can re-trigger). The F1x0 has
+///   no prefetch buffer to absorb the extra wait state. The same session refutes the F1x0 manual's
+///   claim that WSCNT is "valid only when WSEN is set": FMC_WSEN reads 0 on this part and WSCNT is
+///   emphatically not inert (4,247 cycles with WSEN clear vs 4,280 with it set).
+///
+/// At or below the 8 MHz reset clock both families run 0, the value the part boots with.
+///
+/// Between 8 MHz and each family's ceiling the derivation stays at the family's high-clock value
+/// rather than interpolating a band ladder: over-setting wait states is never a correctness risk
+/// (it costs performance), under-setting them faults the core, and this project programs exactly
+/// two trees, the 8 MHz reset tree (never programmed, it is the boot state) and the 72 MHz
+/// reference. A band that nothing runs would be a number nothing checks.
+pub const fn wait_states_for(path: ClockPath, sysclk_hz: u32) -> u8 {
+    if sysclk_hz <= 8_000_000 {
+        return 0;
+    }
+    match path {
+        ClockPath::F10xRcc => 2,
+        ClockPath::F1x0Rcu => 1,
     }
 }
 
@@ -714,9 +745,10 @@ fn pll_mul_bits(mul: u8) -> u32 {
 /// note), so the family divergence lives in the profile's prescalers and the per-family golden.
 ///
 /// Ordered steps (the gates that POLL are marked):
-/// 1. **Flash wait states FIRST** (before raising the clock): set FMC_WS.WSCNT = `wait_states`.
-///    Done first so the flash can keep up once the core speeds up (a wrong-order setup that raises
-///    the clock before the wait states reads corrupt flash).
+/// 1. **Flash wait states FIRST** (before raising the clock): set FMC_WS.WSCNT to
+///    [`wait_states_for`]`(path, sysclk_hz)`, the per-family value the model owns. Done first so the
+///    flash can keep up once the core speeds up (a wrong-order setup that raises the clock before
+///    the wait states reads corrupt flash).
 /// 2. Enable the selected source and **POLL for it to stabilise** (IRC8M: IRC8MEN -> IRC8MSTB;
 ///    HXTAL: HXTALEN -> HXTALSTB).
 /// 3. Program AHB / APB2 / APB1 prescalers (RMW the three CFG0 fields).
@@ -816,13 +848,13 @@ fn configure_tree_inner(
     profile: &ClockConfig,
     budget: Option<u32>,
 ) -> Result<(), ClockError> {
-    let _ = path; // shared register model; the family divergence is in the profile + golden.
-
     let ctl = Reg32::new(rcu_base, CTL);
     let cfg0 = Reg32::new(rcu_base, CFG0);
 
-    // 1. Flash wait states first.
-    Reg32::new(FMC_WS_ADDR, 0).modify(FMC_WS_WSCNT, profile.wait_states as u32 & FMC_WS_WSCNT);
+    // 1. Flash wait states first, derived from the FAMILY and the target clock (the RCU register
+    //    model below is shared, but this one is not: 2 on the F10x at 72 MHz, 1 on the F1x0).
+    let ws = wait_states_for(path, profile.sysclk_hz) as u32;
+    Reg32::new(FMC_WS_ADDR, 0).modify(FMC_WS_WSCNT, ws & FMC_WS_WSCNT);
 
     // 2. Enable + stabilise the source.
     match profile.source {

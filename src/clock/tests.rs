@@ -473,8 +473,9 @@ mod tree_tests {
         let _g = seed(ClockSource::Irc8m);
         configure_tree(&chip(ClockPath::F1x0Rcu), &default_72m()).expect("valid 72M config");
 
-        // Flash wait states = 2.
-        assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 2);
+        // Flash wait states = 1: the F1x0's derived value at 72 MHz (the F10x test above is the
+        // same tree at 2, which is the whole point of deriving it per family).
+        assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 1);
 
         // CFG0 end state: APB1PSC = /2 (code 4 << 8 = 0x400), AHBPSC = /1 (0), APB2PSC = /1 (0),
         // PLLSEL = IRC8M (0), PLLMF = mul18 (BIT(27)|BIT(18) = 0x0804_0000), SCS = PLL (0x2). The
@@ -509,17 +510,56 @@ mod tree_tests {
         assert_ne!(cfg0 & (1 << 16), 0, "PLLSEL must be set for HXTAL");
     }
 
+    /// The wait-state count is DERIVED PER FAMILY, and the two families differ on the SAME tree:
+    /// the 72 MHz reference programs WSCNT 2 on the F10x and 1 on the F1x0. That difference is the
+    /// whole point of the derivation (before it, one shared literal programmed 2 on both, and 2 on
+    /// the F1x0 exposes an alignment-dependent straight-line cliff on silicon).
     #[test]
-    fn wait_states_programmed_first_and_match_profile() {
+    fn wait_states_are_derived_per_family_on_the_same_tree() {
+        for (path, want) in [(ClockPath::F10xRcc, 2u32), (ClockPath::F1x0Rcu, 1)] {
+            let _g = seed(ClockSource::Irc8m);
+            configure_tree(&chip(path), &ClockConfig::REFERENCE_72M_IRC8M)
+                .expect("the 72 MHz reference tree is valid on both families");
+            assert_eq!(
+                Reg32::new(FMC_WS, 0).read() & 0b111,
+                want,
+                "FMC WSCNT at 72 MHz on {path:?}"
+            );
+        }
+    }
+
+    /// The derivation itself, as a pure function: 0 at the reset clock on both families, and the
+    /// family's own value above it. `wait_states_for` is the single owner of the fact, so this is
+    /// where the numbers are pinned.
+    #[test]
+    fn wait_states_for_pins_the_per_family_values() {
+        use crate::clock::wait_states_for;
+        // The 8 MHz reset tree: the value the part boots with, both families.
+        assert_eq!(wait_states_for(ClockPath::F10xRcc, 8_000_000), 0);
+        assert_eq!(wait_states_for(ClockPath::F1x0Rcu, 8_000_000), 0);
+        // Anything above the reset clock takes the family's value: F10x 2, F1x0 1.
+        for hz in [8_000_001u32, 48_000_000, 72_000_000] {
+            assert_eq!(wait_states_for(ClockPath::F10xRcc, hz), 2, "F10x at {hz}");
+            assert_eq!(wait_states_for(ClockPath::F1x0Rcu, hz), 1, "F1x0 at {hz}");
+        }
+        // Every derived value fits the 3-bit WSCNT field, so no config can be rejected for it.
+        for path in [ClockPath::F10xRcc, ClockPath::F1x0Rcu] {
+            for hz in [8_000_000u32, 72_000_000, 108_000_000] {
+                assert!(wait_states_for(path, hz) <= 0b111);
+            }
+        }
+    }
+
+    /// The derived value OVERWRITES whatever WSCNT held before (it is a field write, not an OR), so
+    /// a part left at a higher count by a previous image comes down to the family's value. The
+    /// write's POSITION in the sequence (first, before the clock rises) is pinned by the ordered
+    /// golden trace, not here: this flat mock records values, not order.
+    #[test]
+    fn the_derived_wait_states_overwrite_a_stale_wscnt() {
         let _g = seed(ClockSource::Irc8m);
-        // 48 MHz with 1 WS is a valid F1x0 config (>=0 WS minimum at 48 MHz; 1 is allowed). The
-        // intent: configure_tree programs FMC WSCNT to exactly the config's wait-states.
-        let p = ClockConfig {
-            sysclk_hz: 48_000_000,
-            wait_states: 1,
-            ..default_72m()
-        };
-        configure_tree(&chip(ClockPath::F1x0Rcu), &p).expect("valid 48M / 1WS config");
+        Reg32::new(FMC_WS, 0).write(0b111);
+        configure_tree(&chip(ClockPath::F1x0Rcu), &ClockConfig::REFERENCE_72M_IRC8M)
+            .expect("valid reference tree");
         assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 1);
     }
 
@@ -584,7 +624,7 @@ mod tree_tests {
         {
             let _g = seed(ClockSource::Irc8m);
             configure_tree(&chip(ClockPath::F1x0Rcu), &default_72m()).expect("valid 72M config");
-            assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 2);
+            assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 1);
             assert_eq!(Reg32::new(RCU_BASE, CFG0).read() & !SCSS_PLL, expected_cfg0);
         }
 
@@ -593,7 +633,7 @@ mod tree_tests {
             let _g = seed(ClockSource::Irc8m);
             let r = configure_tree_timeout(&chip(ClockPath::F1x0Rcu), &default_72m(), 1_000);
             assert_eq!(r, Ok(()));
-            assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 2);
+            assert_eq!(Reg32::new(FMC_WS, 0).read() & 0b111, 1);
             assert_eq!(Reg32::new(RCU_BASE, CFG0).read() & !SCSS_PLL, expected_cfg0);
         }
     }
@@ -604,7 +644,6 @@ mod tree_tests {
         // A non-default profile: pll_mul 6 (low range, PLLMF4 clear), AHB /2, APB1 /4, APB2 /8.
         let p = ClockConfig {
             sysclk_hz: 48_000_000,
-            wait_states: 1,
             source: ClockSource::Irc8m,
             pll_mul: 6,
             ahb_psc: 2,
@@ -778,10 +817,10 @@ mod tree_tests {
         //   - apb1_psc: EXHAUSTIVE, all 5 legal values {1,2,4,8,16}.
         //   - apb2_psc: EXHAUSTIVE, all 5 legal values {1,2,4,8,16}.
         //   - path:     EXHAUSTIVE, both {F10xRcc, F1x0Rcu}.
-        //   - sysclk/wait_states: held at a fixed in-range pair (72 MHz / 2 WS) so every swept combo
-        //               PASSES validate_for; the register end-state under test does NOT depend on
-        //               sysclk/wait_states beyond the FMC WSCNT field, which the boundary tests
-        //               sweep exhaustively. The full Cartesian product (2*31*5*5*5*2 = 15,500
+        //   - sysclk:   held at 72 MHz so every swept combo PASSES validate_for on both paths; the
+        //               register end-state under test does NOT depend on sysclk beyond the FMC
+        //               WSCNT field, which is asserted per path here (derived: F10x 2, F1x0 1) and
+        //               swept over the clock range by the boundary tests. The full Cartesian product (2*31*5*5*5*2 = 15,500
         //               combos) is enumerated DETERMINISTICALLY below (not proptest-sampled), so the
         //               matrix is truly exhaustive over the chosen axes, not a random subset.
 
@@ -800,7 +839,6 @@ mod tree_tests {
                             for &apb2_psc in &apb {
                                 let cfg = ClockConfig {
                                     sysclk_hz: 72_000_000,
-                                    wait_states: 2,
                                     source,
                                     pll_mul,
                                     ahb_psc,
@@ -830,8 +868,13 @@ mod tree_tests {
                                         want_en,
                                         "CTL source-enable bit missing: {cfg:?} on {path:?}"
                                     );
-                                    // FMC WSCNT = the config's wait_states.
-                                    assert_eq!(got_ws, 2, "FMC WSCNT must equal wait_states");
+                                    // FMC WSCNT = the family's derived value at this sysclk
+                                    // (the sweep holds 72 MHz): F10x 2, F1x0 1.
+                                    assert_eq!(
+                                        got_ws,
+                                        crate::clock::wait_states_for(path, cfg.sysclk_hz) as u32,
+                                        "FMC WSCNT must be the family's derived value on {path:?}"
+                                    );
                                     checked += 1;
                                 }
                             }
@@ -857,7 +900,6 @@ mod tree_tests {
             // valid; min_ws at 8 MHz is 0).
             let cfg = ClockConfig {
                 sysclk_hz: 8_000_000,
-                wait_states: 0,
                 pll_mul: 2,
                 ..base()
             };
@@ -874,7 +916,6 @@ mod tree_tests {
             // on the F10x path (<=108 MHz ceiling; F10x is zero-wait, so any WS 0..=2 is accepted).
             let cfg = ClockConfig {
                 sysclk_hz: 96_000_000,
-                wait_states: 2,
                 pll_mul: 32,
                 ..base()
             };
@@ -896,7 +937,6 @@ mod tree_tests {
             for (mul, want) in [(16u8, 14u32 << 18), (17u8, 1 << 27)] {
                 let cfg = ClockConfig {
                     sysclk_hz: 64_000_000,
-                    wait_states: 2,
                     pll_mul: mul,
                     ..base()
                 };
@@ -955,46 +995,25 @@ mod tree_tests {
         }
 
         #[test]
-        fn boundary_wait_state_thresholds_match_validate_for_bands() {
-            // The F1x0 flash-timing bands: 0 WS up to 48 MHz (GD32F130 zero-wait), 1 WS above 48 MHz
-            // (conservative floor) up to the 72 MHz ceiling. At each band edge the minimum legal WS is
-            // accepted and one fewer is rejected, and the accepted WS reaches the FMC WSCNT field.
-            // This pins where WSCNT changes with sysclk on the F1x0 path.
-            // (sysclk_hz, min_ws_accepted)
-            let bands = [
-                (48_000_000u32, 0u8),
-                (48_000_001u32, 1u8),
-                (72_000_000u32, 1u8),
-            ];
-            for (sysclk, min_ws) in bands {
-                let ok = ClockConfig {
-                    sysclk_hz: sysclk,
-                    wait_states: min_ws,
-                    ..base()
-                };
-                assert_eq!(
-                    ok.validate_for(ClockPath::F1x0Rcu),
-                    Ok(()),
-                    "min WS {min_ws} at {sysclk} Hz should be accepted"
-                );
-                let (_, _, ws) = run_and_read(&ok, ClockPath::F1x0Rcu);
-                assert_eq!(
-                    ws, min_ws as u32,
-                    "FMC WSCNT must equal accepted wait_states"
-                );
-
-                // One fewer wait-state at the same clock is rejected (too few for the flash timing).
-                if min_ws > 0 {
-                    let too_few = ClockConfig {
-                        wait_states: min_ws - 1,
-                        ..ok
+        fn boundary_wait_states_track_the_reset_clock_and_the_family() {
+            // Where WSCNT changes with the target clock, checked through configure_tree on BOTH
+            // families: 0 at the 8 MHz reset clock, the family's own value above it (F10x 2,
+            // F1x0 1). There is no "too few" case to reject any more: the value is derived, so an
+            // application cannot supply one.
+            for (path, above_reset) in [(ClockPath::F10xRcc, 2u32), (ClockPath::F1x0Rcu, 1)] {
+                for (sysclk, want) in [
+                    (8_000_000u32, 0u32),
+                    (8_000_001, above_reset),
+                    (48_000_000, above_reset),
+                    (72_000_000, above_reset),
+                ] {
+                    let cfg = ClockConfig {
+                        sysclk_hz: sysclk,
+                        ..base()
                     };
-                    assert_eq!(
-                        too_few.validate_for(ClockPath::F1x0Rcu),
-                        Err(ClockError::InvalidWaitStates),
-                        "{} WS at {sysclk} Hz is too few",
-                        min_ws - 1
-                    );
+                    assert_eq!(cfg.validate_for(path), Ok(()), "{sysclk} Hz on {path:?}");
+                    let (_, _, ws) = run_and_read(&cfg, path);
+                    assert_eq!(ws, want, "FMC WSCNT at {sysclk} Hz on {path:?}");
                 }
             }
         }
@@ -1047,7 +1066,6 @@ mod tree_tests {
                 let cfg = ClockConfig {
                     // A low sysclk so the divided AHB stays sane; validity does not depend on it.
                     sysclk_hz: 8_000_000,
-                    wait_states: 0,
                     ahb_psc: div,
                     ..base()
                 };
@@ -1110,7 +1128,6 @@ mod tree_tests {
             assert_rejected(
                 &ClockConfig {
                     sysclk_hz: 96_000_000,
-                    wait_states: 2,
                     pll_mul: 33,
                     ..base()
                 },
@@ -1161,45 +1178,32 @@ mod tree_tests {
             );
         }
 
+        /// There is no wait-state rejection any more, by construction: the count is derived from
+        /// the family and the target clock rather than supplied, so the two former rejections (too
+        /// few for the clock, and above the 3-bit WSCNT field) have no input to reject. What
+        /// replaces them is that every derivable value is in range and never under-set, checked
+        /// across both families over the whole legal clock range.
         #[test]
-        fn reject_wait_states_too_few_for_sysclk() {
-            // Too-few-WS is an F1x0-path concern: F10x is zero-wait at the full 108 MHz, so no clock
-            // ever requires a wait state there. On the F1x0 path, above the 48 MHz zero-wait point a
-            // wait state is required, so 0 WS at 60 MHz and at 72 MHz are below the 1-WS minimum.
-            for sysclk in [60_000_000u32, 72_000_000] {
-                assert_eq!(
-                    ClockConfig {
-                        sysclk_hz: sysclk,
-                        wait_states: 0,
-                        ..base()
+        fn every_derived_wait_state_is_in_range_and_never_below_the_flash_minimum() {
+            use crate::clock::wait_states_for;
+            for (path, ceiling) in [
+                (ClockPath::F10xRcc, 108_000_000u32),
+                (ClockPath::F1x0Rcu, 72_000_000),
+            ] {
+                for sysclk in (1_000_000..=ceiling).step_by(1_000_000) {
+                    let ws = wait_states_for(path, sysclk);
+                    assert!(ws <= 0b111, "WSCNT field is 3 bits ({ws} at {sysclk})");
+                    // The flash minimum this project has evidence for: above 48 MHz the F1x0 needs
+                    // at least one wait state, and the F10x's fleet value at 72 MHz is 2.
+                    if sysclk > 48_000_000 {
+                        let min = match path {
+                            ClockPath::F10xRcc => 2,
+                            ClockPath::F1x0Rcu => 1,
+                        };
+                        assert!(ws >= min, "{ws} WS at {sysclk} Hz on {path:?} is too few");
                     }
-                    .validate_for(ClockPath::F1x0Rcu),
-                    Err(ClockError::InvalidWaitStates),
-                    "0 WS at {sysclk} Hz is too few on F1x0 (>48 MHz needs >=1 WS)"
-                );
+                }
             }
-            // The same 0 WS at 48 MHz is now VALID on F1x0 (GD32F130 is zero-wait at 48 MHz), and is
-            // always valid on F10x (zero-wait at any clock).
-            let at_48 = ClockConfig {
-                sysclk_hz: 48_000_000,
-                wait_states: 0,
-                ..base()
-            };
-            assert_eq!(at_48.validate_for(ClockPath::F1x0Rcu), Ok(()));
-            assert_eq!(at_48.validate_for(ClockPath::F10xRcc), Ok(()));
-        }
-
-        #[test]
-        fn reject_wait_states_above_wscnt_field() {
-            // WSCNT is a 3-bit field (0..=7); 8 is out of range.
-            assert_rejected(
-                &ClockConfig {
-                    sysclk_hz: 72_000_000,
-                    wait_states: 8,
-                    ..base()
-                },
-                ClockError::InvalidWaitStates,
-            );
         }
 
         #[test]
@@ -1209,7 +1213,6 @@ mod tree_tests {
             // family, and the family's own ceiling is accepted.
             let just_over = |hz: u32| ClockConfig {
                 sysclk_hz: hz,
-                wait_states: 2,
                 ..base()
             };
             // F10x: 109 MHz rejected, 108 MHz accepted.
@@ -1247,7 +1250,6 @@ mod tree_tests {
         fn f10x_is_zero_wait_at_full_clock() {
             let top = ClockConfig {
                 sysclk_hz: 108_000_000,
-                wait_states: 0,
                 ..base()
             };
             assert_eq!(top.validate_for(ClockPath::F10xRcc), Ok(()));

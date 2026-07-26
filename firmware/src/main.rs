@@ -54,11 +54,10 @@ use runtime_hal::{
 };
 
 /// The code-level clock tree for the M1 bench firmware: the reset-default HSI 8 MHz, AHB/APB /1, no
-/// PLL, 0 flash wait states. The firmware does not run `configure_tree` (it stays at reset), so this
+/// PLL. The firmware does not run `configure_tree` (it stays at reset), so this
 /// only feeds the USART input-clock derivation (8 MHz on APB1 -> BRR = 69 at 115200).
 const M1_CLOCK: ClockConfig = ClockConfig {
     sysclk_hz: 8_000_000,
-    wait_states: 0,
     source: ClockSource::Irc8m,
     pll_mul: 2,
     ahb_psc: 1,

@@ -239,7 +239,6 @@ fn apb1_input_clock_uses_profile_prescaler() {
     // An explicit config with apb1_psc = 4 gives sysclk/4.
     let p = ClockConfig {
         sysclk_hz: 72_000_000,
-        wait_states: 2,
         source: ClockSource::Irc8m,
         pll_mul: 18,
         ahb_psc: 1,
@@ -414,7 +413,6 @@ proptest::proptest! {
         // The M1 default tree shape (ahb /1, apb1 /2, apb2 /1), arbitrary sysclk: APB1 = sysclk/2.
         let clock = ClockConfig {
             sysclk_hz: sysclk,
-            wait_states: 0,
             source: ClockSource::Irc8m,
             pll_mul: 18,
             ahb_psc: 1,

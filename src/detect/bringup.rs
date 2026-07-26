@@ -39,12 +39,11 @@ use {
     crate::usart::Usart,
 };
 
-/// The bare-IRC8M default clock (DF-2): 8 MHz, 0 wait states, no PLL. The fallback stays on the
+/// The bare-IRC8M default clock (DF-2): 8 MHz, no PLL. The fallback stays on the
 /// reset clock rather than bringing up a PLL that could fail. `pll_mul`/prescalers are filled with
 /// legal-but-unused values so [`ClockConfig::validate_for`] passes; `configure_tree` is NOT called.
 pub const FALLBACK_CLOCK: ClockConfig = ClockConfig {
     sysclk_hz: 8_000_000,
-    wait_states: 0,
     source: ClockSource::Irc8m,
     // Unused (we never run the PLL on the fallback), but kept legal so `validate_for` passes: a
     // multiplier of 2 and /1 prescalers are all in-range. The USART input clock derives from
@@ -131,10 +130,24 @@ mod tests {
 
     #[test]
     fn fallback_clock_is_bare_irc8m_8mhz_and_validates() {
-        // DF-2: bare IRC8M, 8 MHz, 0 wait states, no PLL run. The config validates for both families
-        // (the shared RCU register model), so `apply_defaults` would not reject it.
+        // DF-2: bare IRC8M, 8 MHz, no PLL run. The config validates for both families (the shared
+        // RCU register model), so `apply_defaults` would not reject it. The wait states this clock
+        // implies are the model's, and they are 0 on both families at the reset clock.
         assert_eq!(FALLBACK_CLOCK.sysclk_hz, 8_000_000);
-        assert_eq!(FALLBACK_CLOCK.wait_states, 0);
+        assert_eq!(
+            crate::clock::wait_states_for(
+                crate::descriptor::ClockPath::F10xRcc,
+                FALLBACK_CLOCK.sysclk_hz
+            ),
+            0
+        );
+        assert_eq!(
+            crate::clock::wait_states_for(
+                crate::descriptor::ClockPath::F1x0Rcu,
+                FALLBACK_CLOCK.sysclk_hz
+            ),
+            0
+        );
         assert_eq!(FALLBACK_CLOCK.source, ClockSource::Irc8m);
         assert!(FALLBACK_CLOCK
             .validate_for(crate::descriptor::ClockPath::F10xRcc)

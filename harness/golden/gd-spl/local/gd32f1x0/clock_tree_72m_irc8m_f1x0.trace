@@ -1,4 +1,4 @@
-# regcmp v0.1.0 captured 2026-06-17T18:08:50Z
+# regcmp v0.1.0 captured 2026-07-26T14:37:09Z
 # vector:        clock_tree_72m_irc8m_f1x0
 # library:       gd-spl
 # target:        gd32f1x0
@@ -8,7 +8,7 @@
 # emulation:     clean-exit (sentinel reached at instr 62)
 # mode:          final_state
 R4 <FMC_BASE>+0x00 0x00000000   # WS
-W4 <FMC_BASE>+0x00 0x00000002   # WS
+W4 <FMC_BASE>+0x00 0x00000001   # WS
 R4 <RCU_BASE>+0x00 0x02000002   # CTL0
 W4 <RCU_BASE>+0x00 0x02000003   # CTL0
 R4 <RCU_BASE>+0x00 0x02000003   # CTL0

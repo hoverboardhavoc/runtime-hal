@@ -67,10 +67,14 @@
 //!
 //! # Wait states
 //!
-//! None needed on these parts: the GD32 has zero instruction-fetch wait states within the first
-//! 256 KiB even at the 108 MHz max (all fleet flash is inside that), so the bootloader needs no
-//! `FMC_WS` config. This is OPPOSITE STM32, which needs a wait-state ladder. (Moot for the
-//! erase/program code itself, which is RAM-resident.)
+//! Not this module's business, and not zero either. `FMC_WS` WSCNT is owned by
+//! [`crate::clock::wait_states_for`], which derives it per family and programs it in
+//! [`crate::clock::configure_tree`] before the clock rises: 2 on the F10x at 72 MHz, 1 on the F1x0.
+//! The earlier claim here, that these parts need no wait states at all because the GD32 datasheet
+//! advertises zero-wait flash to 108 MHz, does not survive measurement: on the F1x0 at 72 MHz,
+//! WSCNT = 2 costs 4,247 cycles for a straight-line 64-nop block that runs in 80 at WSCNT = 1
+//! (2026-07-26 bench), so the field is emphatically live on this silicon. Moot for the
+//! erase/program code in this module either way, which is RAM-resident.
 
 use crate::chip::Chip;
 use crate::error::FmcError;

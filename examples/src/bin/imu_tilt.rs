@@ -69,7 +69,6 @@ const I2C_SPEED_HZ: u32 = 100_000;
 /// NOT a clock-tree to program, only the source of truth for `I2c::bring_up`'s timing math.
 const RESET_8M: ClockConfig = ClockConfig {
     sysclk_hz: 8_000_000,
-    wait_states: 0,
     source: ClockSource::Irc8m,
     pll_mul: 2, // unused (no PLL brought up); a legal placeholder value.
     ahb_psc: 1,
