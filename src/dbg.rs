@@ -41,16 +41,21 @@ pub fn debug_hold_on_sleep() {
 
 /// Freeze the TIMER0 counter while the core is halted (set `DBG_CTL0` `TIMER0_HOLD`, bit 10): a
 /// set-only RMW that touches nothing else. This is the motor-integration **R6** debug-hold surface
-/// (`specs/motor-integration.md`), EXPOSED here at slice 2.
+/// (`specs/motor-integration.md`).
 ///
-/// **Whether to actually call it is a slice-5 decision, not made here** (the spec's debug-halt open
-/// question): freezing the counter prevents the free-running-with-stale-duties case that cooked a FET,
-/// but a frozen counter holds the compare outputs at their instantaneous levels, so a halt caught with
-/// a high-side on leaves that phase at 100% duty (DC into a winding, no chopping). Neither posture is
-/// safe, so the bench rule "never halt while energized" stands regardless, and no caller sets this bit
-/// this round. Family-shared: `DBG_CTL0` bit 10 is `TIMER0_HOLD` on both F10x and F1x0 (see the
-/// constant's citations), and the register is in the always-present Cortex-M debug region, so no chip
-/// resolution is needed.
+/// **Call it EARLY in boot, before the motor bring-up starts the counter.** `DBG_CTL0` is
+/// power-reset-only, so the firmware must set it on every cold boot; a debugger setting it in-session
+/// is lost at the next power cycle. It is the BACKSTOP half of the adopted halt posture: it covers the
+/// halt nobody initiated (a probe attach that halts, a hardware breakpoint, a debugger reset), where
+/// the alternative is the recorded failure of a free-running counter re-applying stale duties
+/// indefinitely. It is not a silencing act on its own: a frozen counter holds the compare outputs at
+/// their instantaneous levels, so a halt caught with a high-side on leaves that phase at 100% duty. The
+/// deliberate half is disarm-then-halt tooling (MOE cleared over the DAP before the halt), and the
+/// bench rule "never halt while energized" stands under both.
+///
+/// Family-shared: `DBG_CTL0` bit 10 is `TIMER0_HOLD` on both F10x and F1x0 (see the constant's
+/// citations), and the register is in the always-present Cortex-M debug region, so no chip resolution
+/// is needed.
 pub fn debug_hold_timer0() {
     Reg32::new(DBG_BASE, DBG_CTL0).modify(DBG_HOLD_TIMER0, DBG_HOLD_TIMER0);
 }

@@ -96,7 +96,7 @@ pub use detect::{
 // `Family` / `synthesize` are detection internals: the default public API never names a chip family
 // (silicon purity). They are re-exported at the crate root ONLY behind the `detect-internals`
 // feature, for the in-tree detection-acceptance bench firmware that must introspect detection.
-pub use dbg::debug_hold_on_sleep;
+pub use dbg::{debug_hold_on_sleep, debug_hold_timer0};
 #[cfg(feature = "detect-internals")]
 pub use detect::{family_capability, synthesize, Family};
 pub use dma::DmaRxMap;
