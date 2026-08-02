@@ -78,6 +78,7 @@ pub(crate) use synth::{family_capability, synthesize, Family};
 mod synth {
     use super::{family_model, Detected, McuDescriptor, PageSize, PeriphLabel};
     use super::{ADC1_BASE, ADC2_BASE, F10X_K2_THRESHOLD_KIB, TIMER7_BASE};
+    use super::{I2C1_BASE, I2C1_MIN_FLASH_KIB};
 
     /// The MCU family the probe resolves. A single family determination fixes all four
     /// register-model selectors and the base-address table (the constant `family_model` facts).
@@ -106,6 +107,11 @@ mod synth {
     ///   when `adv_timers >= 2`, and a second ADC (`Adc1`) only when `adc_count >= 2`, applied through
     ///   the non-mutating [`crate::addr::AddrTable::with`] builder so a part without them resolves
     ///   the label as [`crate::error::DescriptorError::MissingBase`] rather than a faked base.
+    /// - **the density-conditional base**: the second I2C (`I2c1`) carries its base only at and
+    ///   above `I2C1_MIN_FLASH_KIB` (the datasheet per-part rule is documented there), through the
+    ///   same builder and with the same MissingBase-not-a-faked-base property. Unlike the timer/ADC
+    ///   instances there is no probe COUNT for I2C, so the density read is the input; this is
+    ///   per-PART, not a family constant, which is why it lives here and not in `family_model`.
     ///
     /// The result passes `addrs.check_ranges(gpio, clock)` by construction (the family-correct bases).
     /// Reachable outside the crate ONLY behind the `detect-internals` feature, for the in-tree
@@ -121,7 +127,12 @@ mod synth {
                 .addrs
                 .with(detected.adv_timers >= 2, PeriphLabel::Timer7, TIMER7_BASE)
                 .with(detected.adc_count >= 2, PeriphLabel::Adc1, ADC1_BASE)
-                .with(detected.adc_count >= 3, PeriphLabel::Adc2, ADC2_BASE),
+                .with(detected.adc_count >= 3, PeriphLabel::Adc2, ADC2_BASE)
+                .with(
+                    detected.flash_kib >= I2C1_MIN_FLASH_KIB,
+                    PeriphLabel::I2c1,
+                    I2C1_BASE,
+                ),
             flash_page: flash_page_for(detected.family, detected.flash_kib),
             // Retain the raw density (KiB) as the flash extent the FMC driver bounds writes against
             // (`Chip::flash_size_bytes` = `flash_kib * 1024`); a pure read at detect, never written.
@@ -169,6 +180,35 @@ const ADC1_BASE: u32 = 0x4001_2800;
 /// the 12-FET's GD32F103RC), so every other part resolves `Adc2` as `MissingBase`. Data only; no
 /// driver work rides on it.
 const ADC2_BASE: u32 = 0x4001_3C00;
+
+/// I2C1 base, the SECOND I2C instance: `0x4000_5800` on APB1 on BOTH families (GD32F10x User Manual
+/// Rev2.6 Table 1-2 `0x4000 5800 - 0x4000 5BFF I2C1` / section 17.4; GD32F1x0 User Manual Rev3.6
+/// Table 1-1 same row / section 18.4). Carried by [`synthesize`] only above the density floor below,
+/// so a part without the instance resolves `I2c1` as `MissingBase`.
+const I2C1_BASE: u32 = 0x4000_5800;
+
+/// The flash density (KiB) at and above which a part carries the second I2C instance. This is the
+/// ONE place the presence rule lives; `Chip::has_i2c` and `pincap::i2c_pair` both read the resolved
+/// base rather than re-deriving it.
+///
+/// Both families' datasheet device-summary tables put the second I2C exactly at the 64 KiB step:
+/// - GD32F103xx Datasheet Rev2.14 Table 2-1: C4/C6 (16/32 KiB) = 1 I2C, C8/CB (64/128 KiB) = 2;
+///   R4/R6 = 1, R8/RB = 2; V8/VB = 2. Table 2-2: every 256 KiB-and-up part = 2. Corroborated by the
+///   pin tables' own gating notes (Table 2-8 LQFP48 note (4): the PB10/PB11 I2C1 functions are
+///   "available in GD32F103C8/B devices").
+/// - GD32F130xx Datasheet Rev3.7 Table 2-1 plus the family-wide alternate-function notes, which are
+///   the self-consistent authority: Table 2-10 note (3) "Functions are available on GD32F130x8
+///   devices" gates I2C1 on PB10/PB11/PB12, and every per-package pin table repeats it (LQFP48
+///   note (5) "GD32F130C8 devices", LQFP64 R8 unconditional, ...). So 16/32 KiB = 1 I2C, 64 KiB = 2.
+///
+/// LIMITATION, deliberately conservative in the PERMISSIVE direction and recorded rather than
+/// modelled: on F10x the real rule is density AND package, because the QFN36 "T" parts carry a
+/// single I2C at every density (GD32F103xx Rev2.14 Table 2-1 T4/T6/T8/TB all = 1, and Table 2-9's
+/// QFN36 pinout has no PB10/PB11 rows at all). Package bonding is invisible to the core, so there is
+/// nothing to probe and no descriptor input that separates a T8 from a C8; a QFN36 part would
+/// therefore be told it has I2C1 when it does not. No fleet part is QFN36, and the failure is loud
+/// at bring-up (nothing ACKs on a bus whose pins are not bonded) rather than silent.
+const I2C1_MIN_FLASH_KIB: u16 = 64;
 
 // --- the constant per-family facts (the register-model selectors + base-address table) --------
 //
@@ -399,6 +439,76 @@ mod tests {
             descriptor_f103().addrs.resolve(PeriphLabel::Usart2),
             Ok(0x4000_4800)
         );
+    }
+
+    /// I2C1's base is the SAME `0x4000_5800` on both families, and both bench reference parts
+    /// (F103C8 / F130C8, 64 KiB) are at the density floor, so both carry it. I2C0's base is
+    /// unchanged at `0x4000_5400` on both.
+    #[test]
+    fn both_families_resolve_the_same_i2c_bases_at_the_density_floor() {
+        for (desc, part) in [(descriptor_f103(), "F103C8"), (descriptor_f130(), "F130C8")] {
+            assert_eq!(
+                desc.addrs.resolve(PeriphLabel::I2c0),
+                Ok(0x4000_5400),
+                "{part} I2C0 base"
+            );
+            assert_eq!(
+                desc.addrs.resolve(PeriphLabel::I2c1),
+                Ok(0x4000_5800),
+                "{part} I2C1 base"
+            );
+            // And each sits in its own instance slot (the per-instance window check).
+            assert_eq!(desc.addrs.check_i2c_base(PeriphLabel::I2c0), Ok(()));
+            assert_eq!(desc.addrs.check_i2c_base(PeriphLabel::I2c1), Ok(()));
+        }
+    }
+
+    /// Per-PART presence, not a global family fact: the second I2C appears exactly at the 64 KiB
+    /// step on both families (GD32F103xx Rev2.14 Table 2-1 C4/C6 = 1 I2C vs C8/CB = 2; GD32F130xx
+    /// Rev3.7 Table 2-10 note (3), I2C1 on "GD32F130x8 devices" only). Below the floor the label
+    /// resolves MissingBase rather than a faked base; the counts do not enter the gate.
+    #[test]
+    fn i2c1_presence_follows_the_density_floor_on_both_families() {
+        for family in [Family::F10x, Family::F1x0] {
+            // A single-advanced-timer, low-count part at each density, so only flash_kib varies.
+            let adcs = if matches!(family, Family::F10x) { 2 } else { 1 };
+            for kib in [16u16, 32] {
+                assert_eq!(
+                    synthesize(&detected(family, kib, 1, adcs))
+                        .addrs
+                        .resolve(PeriphLabel::I2c1),
+                    Err(crate::error::DescriptorError::MissingBase(
+                        PeriphLabel::I2c1
+                    )),
+                    "{family:?} {kib} KiB is below the second-I2C floor"
+                );
+                // I2C0 is on every part regardless of density.
+                assert_eq!(
+                    synthesize(&detected(family, kib, 1, adcs))
+                        .addrs
+                        .resolve(PeriphLabel::I2c0),
+                    Ok(0x4000_5400)
+                );
+            }
+            for kib in [64u16, 128, 256] {
+                assert_eq!(
+                    synthesize(&detected(family, kib, 1, adcs))
+                        .addrs
+                        .resolve(PeriphLabel::I2c1),
+                    Ok(0x4000_5800),
+                    "{family:?} {kib} KiB carries the second I2C"
+                );
+            }
+        }
+    }
+
+    /// The 12-FET GD32F103RC shape (256 KiB, two advanced timers, three ADCs) carries I2C1 too:
+    /// GD32F103xx Rev2.14 Table 2-2 lists 2 I2Cs for every 256 KiB-and-up part.
+    #[test]
+    fn the_high_density_f10x_part_carries_i2c1() {
+        let rc = synthesize(&detected(Family::F10x, 256, 2, 3));
+        assert_eq!(rc.addrs.resolve(PeriphLabel::I2c1), Ok(0x4000_5800));
+        assert_eq!(rc.addrs.check_i2c_base(PeriphLabel::I2c1), Ok(()));
     }
 
     #[test]

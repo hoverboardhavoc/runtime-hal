@@ -33,6 +33,10 @@ use std::sync::MutexGuard;
 
 /// The bench I2C0 base (the mock window wraps modulo its size; only the offsets matter).
 const I2C_BASE: u32 = 0x4000_5400;
+/// The I2C1 base, the second instance's own APB1 slot (both families). The mock register space is
+/// keyed by absolute address, so this is genuinely distinct from `I2C_BASE`: a bring-up on the
+/// wrong instance writes a different set of words and the assertions catch it.
+const I2C1_BASE: u32 = 0x4000_5800;
 /// The GPIOB base the SCL/SDA pins resolve to (PB6/PB7); distinct from `I2C_BASE` so the AF writes
 /// land in their own window in the mock space.
 const GPIOB_BASE: u32 = 0x4001_0C00;
@@ -41,11 +45,12 @@ const RCU_BASE: u32 = 0x4002_1000;
 /// The IMU 7-bit address.
 const IMU: u8 = 0x68;
 
-/// Build a `Chip` for a given GPIO register-model path, mapping I2C0, GPIOB, and the RCU. `I2c::new`
-/// does not range-check the I2C base, so any base the chip resolves works.
+/// Build a `Chip` for a given GPIO register-model path, mapping BOTH I2C instances, GPIOB, and the
+/// RCU. `I2c::new` does not range-check the I2C base, so any base the chip resolves works.
 fn chip_for(gpio: GpioPath) -> Chip {
     let mut addrs = AddrTable::new();
     addrs.set(PeriphLabel::I2c0, I2C_BASE);
+    addrs.set(PeriphLabel::I2c1, I2C1_BASE);
     addrs.set(PeriphLabel::Gpiob, GPIOB_BASE);
     addrs.set(PeriphLabel::Rcu, RCU_BASE);
     let clock = match gpio {
@@ -228,6 +233,143 @@ fn bring_up_fast_400k_sets_fast_bit() {
         r(CKCFG) & CKCFG_FAST,
         CKCFG_FAST,
         "fast mode bit set at 400 kHz"
+    );
+}
+
+// --- instance selection (I2C0 vs I2C1) --------------------------------------------------------
+//
+// The driver logic is instance-agnostic: `new` takes the `PeriphLabel` and everything downstream
+// (base, clock enable, timing, transfers) follows from it. These cases pin that the SELECTION is
+// what varies, and that nothing about the second instance forks the driver.
+
+/// PB10 (SCL) / PB11 (SDA) handles, the classywalk offroad IMU pair = I2C1.
+fn pb10_pb11(
+    chip: &Chip,
+) -> (
+    crate::gpio::Pin<crate::gpio::Input<crate::gpio::Floating>>,
+    crate::gpio::Pin<crate::gpio::Input<crate::gpio::Floating>>,
+) {
+    let gpiob = chip.gpiob().unwrap().split();
+    (gpiob.pb10, gpiob.pb11)
+}
+
+/// Read an I2C1 register at `off`.
+fn r1(off: u32) -> u32 {
+    Reg32::new(I2C1_BASE, off).read()
+}
+
+#[test]
+fn bring_up_on_instance_1_programs_the_second_instances_registers() {
+    // The same bring-up as `bring_up_programs_timing_mode_and_enable`, selected onto I2C1: the
+    // identical end state, at the OTHER base, with I2C0's window left untouched.
+    let _g = seed_reset();
+    let chip = chip();
+    let pins = pb10_pb11(&chip);
+    let _dev = I2c::new(
+        &chip,
+        &ref_72m(),
+        PeriphLabel::I2c1,
+        pins,
+        I2cMode::standard(100_000),
+    )
+    .unwrap();
+
+    assert_eq!(r1(CTL1) & CTL1_I2CCLK, 0x24, "CTL1 I2CCLK = 36 MHz");
+    assert_eq!(r1(RT) & 0x7F, 0x25, "RT = 37");
+    assert_eq!(r1(CKCFG), 0xB4, "CKCFG = 180 (100 kHz, standard)");
+    let ctl0 = r1(CTL0);
+    assert_eq!(ctl0 & CTL0_I2CEN, CTL0_I2CEN, "I2CEN set");
+    assert_eq!(ctl0 & CTL0_ACKEN, CTL0_ACKEN, "ACKEN set");
+    // I2C0's registers were never written: the instance label alone steered every access.
+    assert_eq!(r(CTL0), 0, "I2C0 CTL0 untouched");
+    assert_eq!(r(CKCFG), 0, "I2C0 CKCFG untouched");
+    assert_eq!(r(CTL1), 0, "I2C0 CTL1 untouched");
+}
+
+#[test]
+fn bring_up_on_instance_1_enables_only_its_own_clock_bit() {
+    // I2C1EN = APB1EN bit 22 (bit 21 is I2C0EN); APB1EN is at RCU offset 0x1C.
+    let _g = seed_reset();
+    let chip = chip();
+    let pins = pb10_pb11(&chip);
+    let _dev = I2c::new(
+        &chip,
+        &ref_72m(),
+        PeriphLabel::I2c1,
+        pins,
+        I2cMode::standard(100_000),
+    )
+    .unwrap();
+    let apb1en = Reg32::new(RCU_BASE, 0x1C).read();
+    assert_eq!(apb1en & (1 << 22), 1 << 22, "I2C1EN set");
+    assert_eq!(apb1en & (1 << 21), 0, "I2C0EN not set");
+}
+
+#[test]
+fn bring_up_on_instance_1_transfers_on_the_second_instance() {
+    // The `embedded-hal` surface is not forked: a write on the I2C1 handle drives I2C1's data
+    // register, proving the driver carries the resolved base through the transfer path too.
+    let _g = seed_reset();
+    let chip = chip();
+    let pins = pb10_pb11(&chip);
+    let mut dev = I2c::new(
+        &chip,
+        &ref_72m(),
+        PeriphLabel::I2c1,
+        pins,
+        I2cMode::standard(100_000),
+    )
+    .unwrap();
+    // Seed I2C1's STAT0 with every polled flag set at once (the module docs' flat-mock
+    // convention); `seed_stat0_all_ready` seeds I2C0's, which must NOT satisfy this transfer.
+    Reg32::new(I2C1_BASE, STAT0)
+        .write(STAT0_SBSEND | STAT0_ADDSEND | STAT0_BTC | STAT0_RBNE | STAT0_TBE);
+    dev.write(IMU, &[0x75]).unwrap();
+    assert_eq!(r1(DATA) & 0xFF, 0x75, "the byte went out on I2C1");
+    assert_eq!(r(DATA) & 0xFF, 0, "nothing went out on I2C0");
+}
+
+#[test]
+fn new_fails_loud_on_a_part_without_the_second_instance() {
+    // The fail-loud seam `pincap::i2c_pair` documents: a part below the density floor carries no
+    // I2C1 base, so bring-up on that label errors MissingBase rather than poking a peripheral that
+    // is not there, and the pins are left untouched.
+    let _g = seed_reset();
+    let mut addrs = AddrTable::new();
+    addrs.set(PeriphLabel::I2c0, I2C_BASE);
+    addrs.set(PeriphLabel::Gpiob, GPIOB_BASE);
+    addrs.set(PeriphLabel::Rcu, RCU_BASE);
+    let chip = Chip::from_descriptor(McuDescriptor {
+        gpio: GpioPath::ApbCrlCrh,
+        clock: ClockPath::F10xRcc,
+        adc: AdcPath::Single,
+        irq: IrqLayout::F1x0Grouped,
+        addrs,
+        flash_page: PageSize::K1,
+        flash_kib: 32,
+        adv_timers: 1,
+        adc_count: 1,
+    });
+    assert!(!chip.has_i2c(PeriphLabel::I2c1));
+    let pins = pb10_pb11(&chip);
+    let before = Reg32::new(GPIOB_BASE, 0x04).read();
+    assert_eq!(
+        I2c::new(
+            &chip,
+            &ref_72m(),
+            PeriphLabel::I2c1,
+            pins,
+            I2cMode::standard(100_000),
+        )
+        .err(),
+        Some(crate::error::DescriptorError::MissingBase(
+            PeriphLabel::I2c1
+        ))
+    );
+    assert_eq!(
+        Reg32::new(GPIOB_BASE, 0x04).read(),
+        before,
+        "a refused instance never configures its pins"
     );
 }
 

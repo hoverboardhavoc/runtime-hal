@@ -310,6 +310,20 @@ impl Chip {
         self.desc.addrs.check_adc_base(label).is_ok()
     }
 
+    /// Whether this part HAS the given I2C instance (presence resolution): true iff `label` is an
+    /// I2C label whose base resolved into the descriptor in that instance's APB1 slot. `I2c0` is
+    /// present on every part of both families; `I2c1` only above the descriptor's density floor
+    /// (`crate::detect`'s `I2C1_MIN_FLASH_KIB`, with the datasheet citations). Same shape as
+    /// [`Self::has_adc`]: presence without handing out a base.
+    ///
+    /// This is the single presence answer for the second I2C. [`crate::pincap::i2c_pair`] asks it
+    /// rather than re-deriving the rule from `flash_kib`, so the capability query and the resolvable
+    /// label cannot disagree about whether instance 1 exists.
+    #[inline]
+    pub fn has_i2c(&self, label: PeriphLabel) -> bool {
+        self.desc.addrs.check_i2c_base(label).is_ok()
+    }
+
     /// The chip's ADC sampling capability as a "fruit" (silicon shape, never a family flag): one ADC,
     /// or two (the F10x dual-ADC parts). The ADC base(s) are resolved INTERNALLY and handed back as
     /// [`crate::adc::Adc`] handle(s); the caller never sees a base, and matches the returned

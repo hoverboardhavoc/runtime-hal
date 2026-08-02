@@ -517,16 +517,21 @@ fn gpio_enable_bit(path: ClockPath, port: PeriphLabel) -> Result<EnableBit, Desc
     }
 }
 
-/// The enable register + bit for an I2C instance (both families: I2C0 = APB1EN bit 21; the crate
-/// carries no second I2C label).
+/// The enable register + bit for an I2C instance. Identical on BOTH families: `RCU_APB1EN` (offset
+/// `0x1C`), I2C0EN = bit 21, I2C1EN = bit 22. (GD32F10x User Manual Rev2.6 section 5.3.8 RCU_APB1EN:
+/// "22 I2C1EN I2C1 clock enable" / "21 I2C0EN I2C0 clock enable"; GD32F1x0 User Manual Rev3.6
+/// section 4.3.8 RCU_APB1EN: the same two bit positions. Cross-checked against ST RM0008 section
+/// 6.3.8 RCC_APB1ENR, where bit 22 is I2C2EN and bit 21 I2C1EN in the 1-based ST numbering.)
+///
+/// Whether a given part HAS instance 1 is not this function's question: an absent instance has no
+/// base in the descriptor, so `Chip::base` already refuses before the clock is ever touched.
 fn i2c_enable_bit(i2c: PeriphLabel) -> Result<EnableBit, DescriptorError> {
-    match i2c {
-        PeriphLabel::I2c0 => Ok(EnableBit {
-            reg: APB1EN,
-            bit: 21,
-        }),
-        _ => Err(DescriptorError::UnknownSelector),
-    }
+    let bit = match i2c {
+        PeriphLabel::I2c0 => 21,
+        PeriphLabel::I2c1 => 22,
+        _ => return Err(DescriptorError::UnknownSelector),
+    };
+    Ok(EnableBit { reg: APB1EN, bit })
 }
 
 /// The enable register + bit for a SPI instance. NOTE the F10x/F1x0 divergence the `Spi0` label
