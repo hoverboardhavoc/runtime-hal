@@ -402,14 +402,18 @@ impl Usart {
     /// reconfigures them and so takes them by value.
     ///
     /// Steps, in order (mirroring `I2c::new`):
-    /// 1. Resolve the USART `instance` to its base and pick the register model from the chip's clock
-    ///    path; the instance fixes the APB bus (so the BAUD input clock is correct).
+    /// 1. Ask the ownership backstop about both pins, then resolve the (TX, RX) pair through
+    ///    [`crate::pincap::usart_pins`]: it names the instance the pair actually drives and the AF
+    ///    the mapping routes through, and must agree with `instance`. Then resolve `instance` to its
+    ///    base and pick the register model from the chip's clock path; the instance fixes the APB
+    ///    bus (so the BAUD input clock is correct).
     /// 2. Enable the USART peripheral clock. The TX/RX **GPIO port** clock was already enabled when
     ///    the chip handed back the [`crate::gpio::GpioPort`] the pins were split from, so it is not
     ///    re-enabled here.
     /// 3. Configure TX as AF push-pull ([`PinRole::Tx`]) and RX as AF input ([`PinRole::Rx`]) via
     ///    `configure_af`, taking each consumed pin's resolved port base / register-model path /
-    ///    logical pin byte (the application never built them).
+    ///    logical pin byte (the application never built them) and the AF-mux number the pin mapping
+    ///    resolved to (step 1b), NOT one baked into the role.
     /// 4. Program BRR from `clock` + `baud`, the 8N1 /16 frame, and enable TX + RX + the peripheral.
     pub fn new<TX, RX>(
         chip: &Chip,
@@ -427,6 +431,17 @@ impl Usart {
         crate::pincap::check_pin_ownership(chip, tx.pin(), crate::pincap::PinClaim::NonGate)?;
         crate::pincap::check_pin_ownership(chip, rx.pin(), crate::pincap::PinClaim::NonGate)?;
 
+        // 1b. Resolve the (TX, RX) pair in the pin model. This is what makes the AF write correct
+        //     per MAPPING rather than per role: `USART0_TX` is AF1 at PA9 but AF0 at PB6. A pair
+        //     that is no USART mapping on this family is `Unsupported`; a pair that drives a
+        //     DIFFERENT instance than the caller asked for is a caller bug, refused rather than
+        //     silently routed (it would enable one peripheral's clock and mux the other's pins).
+        let mapping = crate::pincap::usart_pins(chip, tx.pin(), rx.pin())
+            .ok_or(DescriptorError::Unsupported)?;
+        if mapping.usart != instance {
+            return Err(DescriptorError::SelectorAddrMismatch);
+        }
+
         let base = chip.base(instance)?;
         let path = chip.clock();
         let bus = UsartBus::of(instance).ok_or(DescriptorError::UnknownSelector)?;
@@ -437,8 +452,8 @@ impl Usart {
 
         // 3. TX as AF push-pull, RX as AF input. Take the resolved port base + register-model path +
         //    logical pin byte straight from each consumed Pin; the application never built them.
-        configure_af(tx.port_base(), tx.path(), tx.pin(), PinRole::Tx);
-        configure_af(rx.port_base(), rx.path(), rx.pin(), PinRole::Rx);
+        configure_af(tx.port_base(), tx.path(), tx.pin(), PinRole::Tx(mapping.af));
+        configure_af(rx.port_base(), rx.path(), rx.pin(), PinRole::Rx(mapping.af));
 
         // 4. BRR + 8N1 /16 frame + enable. The default M1 settings (the link-validated frame).
         Ok(Usart::program(

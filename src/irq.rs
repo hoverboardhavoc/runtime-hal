@@ -111,6 +111,12 @@ pub const F1X0_USART1_IRQ: usize = 28;
 /// F10x `USART1_IRQn` (`gd32f10x.h:159`). Note the SAME logical USART1 sits on a DIFFERENT vector
 /// number per family (28 vs 38), so the layout-specific `build_table` arm picks the right slot.
 pub const F10X_USART1_IRQ: usize = 38;
+/// F1x0 `USART0_IRQn` (`gd32f1x0.h:158`): USART0 on its PB6/PB7 mapping (`pincap::usart_pins`),
+/// the offroad chassis's onboard CC2541 BLE port. The interrupt-buffered RX's THIRD instance routes
+/// through this vector. **F1x0-only**: on F10x those pins reach USART0 only through the AFIO
+/// `USART0_REMAP` field the HAL does not implement, so `resolve_instance` refuses `Usart0` there and
+/// no F10x USART0 vector const exists.
+pub const F1X0_USART0_IRQ: usize = 27;
 /// F10x `USART2_IRQn` (`gd32f10x.h:160`): the BLE-module USART (HAL [`crate::addr::PeriphLabel::Usart2`]
 /// = GD USART2 register block at 0x4000_4800, PB10/PB11) on the F10x master. The interrupt-buffered RX's
 /// SECOND instance routes through this vector. **F10x-only**: the module USART does not exist on F1x0
@@ -131,6 +137,14 @@ pub const F10X_DMA0_CH5_IRQ: usize = 16;
 /// unrelated grouped `TIMER0_BRK_UP_TRG_COM` vector; the layout-specific `build_table` arms keep them
 /// distinct.
 pub const F10X_DMA0_CH2_IRQ: usize = 13;
+/// F1x0 `DMA_Channel1_2_IRQn` (`gd32f1x0.h:142`): channels 1 and 2 SHARE one vector (grouped layout).
+/// GD32F1x0 User Manual Rev3.6 (the `DMA_RMP` `USART0_RX_DMA_RMP` field, bit 10) maps **`USART0_RX` to
+/// DMA channel 2** when not remapped (the reset state; remap would move it to channel 4), so USART0's
+/// DMA-ring RX arrives here alongside Ch1 and the handler demuxes by reading DMA `INTF`. Independently
+/// corroborated by the offroad stock image, whose CH2 is USART0's RX channel
+/// (`hoverboard-firmware/specs/offroad-pinmap.md` section 4.3). **F1x0-only**, like
+/// [`F1X0_USART0_IRQ`].
+pub const F1X0_DMA_CH1_2_IRQ: usize = 10;
 /// F1x0 `DMA_Channel3_4_IRQn` (`gd32f1x0.h:143`): channels 3 and 4 SHARE one vector (grouped layout),
 /// so `USART1_RX` (Ch4 on F1x0) arrives here alongside Ch3 and the handler demuxes by reading DMA
 /// `INTF` (the DMA twin of the grouped advanced-timer vector).
@@ -350,6 +364,45 @@ pub(crate) fn call_usart_rx_handler2() {
     f();
 }
 
+// --- Static USART RX handler registration: the THIRD instance (USART0 on PB6/PB7) --------------
+//
+// USART0's RX vector (F1x0 `USART0_IRQn` = 27, `usart0_rx_isr`) routes through this THIRD, fully
+// independent handler pair, so a third interrupt-buffered receiver can be live alongside USART1 and
+// the module USART with no vector collision. Same shape as the two pairs above; the body (its own
+// static RX slot) lives in [`crate::usart_rx`]. **F1x0-only** (see [`F1X0_USART0_IRQ`]).
+
+/// The no-op default that guards the USART0 RX vector before its handler is registered (mirrors
+/// [`default_usart_rx_handler`]).
+pub extern "C" fn default_usart_rx_handler3() {}
+
+/// The registered USART0 RX handler pointer. `AtomicPtr`, starts at the no-op default.
+static USART_RX_HANDLER3: AtomicPtr<()> = AtomicPtr::new(default_usart_rx_handler3 as *mut ());
+
+/// Register the USART0 interrupt-buffered RX `'static` ISR body. Called by
+/// [`crate::usart_rx::BufferedRx::new`] when the USART0 instance is brought up, before it unmasks the
+/// USART0 IRQ. Symmetric with [`register_usart_rx_handler`].
+#[inline]
+pub fn register_usart_rx_handler3(handler: ControlHandler) {
+    USART_RX_HANDLER3.store(handler as *mut (), Ordering::Release);
+}
+
+/// Reset the USART0 RX handler back to the no-op default (host tests / clean teardown).
+#[inline]
+pub fn clear_usart_rx_handler3() {
+    USART_RX_HANDLER3.store(default_usart_rx_handler3 as *mut (), Ordering::Release);
+}
+
+/// Call the registered USART0 RX handler (or the no-op default). The `usart0_rx_isr` slot calls
+/// through this.
+#[inline]
+pub(crate) fn call_usart_rx_handler3() {
+    let p = USART_RX_HANDLER3.load(Ordering::Acquire);
+    // SAFETY: `p` is always either `default_usart_rx_handler3` or a `'static` fn the RX bring-up
+    // registered via `register_usart_rx_handler3`; both are valid `extern "C" fn()` pointers.
+    let f: ControlHandler = unsafe { core::mem::transmute::<*mut (), ControlHandler>(p) };
+    f();
+}
+
 // --- Static DMA-RX handler registration (G-DMA-UART Gate B) ------------------------------------
 //
 // The DMA-channel vector that carries USART1_RX (its own vector on F10x, the grouped Ch3/4 vector on
@@ -423,6 +476,45 @@ pub fn call_dma_rx_handler2() {
     let p = DMA_RX_HANDLER2.load(Ordering::Acquire);
     // SAFETY: `p` is always either `default_dma_rx_handler2` or a `'static` fn the RX bring-up
     // registered via `register_dma_rx_handler2`; both are valid `extern "C" fn()` pointers.
+    let f: ControlHandler = unsafe { core::mem::transmute::<*mut (), ControlHandler>(p) };
+    f();
+}
+
+// --- Static DMA-RX handler registration: the THIRD instance (USART0's channel) ----------------
+//
+// USART0's DMA channel (`USART0_RX` = DMA Ch2 unremapped, on the grouped F1x0 vector
+// `DMA_Channel1_2_IRQn` = 10, `usart0_dma_rx_isr`) routes through this THIRD, fully-independent
+// DMA-RX handler pair, so a third `RingBufferedRx` can be live with no DMA-channel/context collision.
+// Same shape as the two pairs above; the body (its own wrap-counter context, servicing ONLY Ch2's
+// `INTF` bits) lives in [`crate::dma`]. **F1x0-only** (see [`F1X0_DMA_CH1_2_IRQ`]).
+
+/// The no-op default that guards the USART0 DMA-RX vector before its handler is registered.
+pub extern "C" fn default_dma_rx_handler3() {}
+
+/// The registered USART0 DMA-RX handler pointer. `AtomicPtr`, starts at the no-op default.
+static DMA_RX_HANDLER3: AtomicPtr<()> = AtomicPtr::new(default_dma_rx_handler3 as *mut ());
+
+/// Register the USART0 DMA-ring RX `'static` ISR body. Called by
+/// [`crate::usart_rx::RingBufferedRx::new`] when the USART0 instance is brought up, before it unmasks
+/// the grouped Ch1/2 DMA IRQ. Symmetric with [`register_dma_rx_handler`].
+#[inline]
+pub fn register_dma_rx_handler3(handler: ControlHandler) {
+    DMA_RX_HANDLER3.store(handler as *mut (), Ordering::Release);
+}
+
+/// Reset the USART0 DMA-RX handler back to the no-op default (host tests / clean teardown).
+#[inline]
+pub fn clear_dma_rx_handler3() {
+    DMA_RX_HANDLER3.store(default_dma_rx_handler3 as *mut (), Ordering::Release);
+}
+
+/// Call the registered USART0 DMA-RX handler (or the no-op default). The `usart0_dma_rx_isr` slot
+/// calls through this.
+#[inline]
+pub fn call_dma_rx_handler3() {
+    let p = DMA_RX_HANDLER3.load(Ordering::Acquire);
+    // SAFETY: `p` is always either `default_dma_rx_handler3` or a `'static` fn the RX bring-up
+    // registered via `register_dma_rx_handler3`; both are valid `extern "C" fn()` pointers.
     let f: ControlHandler = unsafe { core::mem::transmute::<*mut (), ControlHandler>(p) };
     f();
 }
@@ -733,6 +825,11 @@ pub fn build_table(layout: IrqLayout) -> [usize; MAX_VECTORS] {
             t[SYSTEM_VECTORS + F1X0_USART1_IRQ] = handler_addr(usart1_rx_isr);
             // The DMA-ring RX vector: grouped DMA Ch3/4 = IRQ 11 on F1x0 (the handler demuxes Ch4).
             t[SYSTEM_VECTORS + F1X0_DMA_CH3_4_IRQ] = handler_addr(dma_rx_isr);
+            // The THIRD interrupt-buffered RX vector: USART0 on its PB6/PB7 mapping (IRQ 27),
+            // F1x0-only (the F10x arm installs no USART0 slot: that mapping needs an AFIO remap).
+            t[SYSTEM_VECTORS + F1X0_USART0_IRQ] = handler_addr(usart0_rx_isr);
+            // The THIRD DMA-ring RX vector: USART0_RX on grouped DMA Ch1/2 = IRQ 10, F1x0-only.
+            t[SYSTEM_VECTORS + F1X0_DMA_CH1_2_IRQ] = handler_addr(usart0_dma_rx_isr);
         }
         IrqLayout::F10xSeparate => {
             t[SYSTEM_VECTORS + F10X_ADC0_1_IRQ] = handler_addr(adc_isr);
@@ -827,6 +924,23 @@ extern "C" fn usart1_rx_isr() {
 /// Until the handler is registered this is a safe no-op.
 extern "C" fn module_usart_rx_isr() {
     call_usart_rx_handler2();
+}
+
+/// The USART0 RX vector body (F1x0 `USART0_IRQn` = 27): route to the registered third-instance
+/// interrupt-buffered RX handler, mirroring [`usart1_rx_isr`]. **F1x0-only** (on F10x, USART0's
+/// PB6/PB7 mapping needs an AFIO remap the HAL does not implement), so this slot is installed by
+/// [`build_table`]'s F1x0 arm and never its F10x arm. Until the handler is registered this is a
+/// safe no-op.
+extern "C" fn usart0_rx_isr() {
+    call_usart_rx_handler3();
+}
+
+/// The USART0 DMA-RX vector body (F1x0 grouped `DMA_Channel1_2_IRQn` = 10): route to the registered
+/// third DMA-ring RX handler ([`crate::dma`]), which services ONLY Ch2's `INTF` bits and bumps its own
+/// wrap counter (the demux that ignores Ch1 on this grouped vector), mirroring [`dma_rx_isr`].
+/// **F1x0-only**, installed by [`build_table`]'s F1x0 arm alone. A no-op until registered.
+extern "C" fn usart0_dma_rx_isr() {
+    call_dma_rx_handler3();
 }
 
 /// The DMA-RX vector body (F10x `DMA0_Channel5` IRQ 16 / F1x0 grouped `DMA_Channel3_4` IRQ 11): route

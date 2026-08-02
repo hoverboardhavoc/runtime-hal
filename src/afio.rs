@@ -15,9 +15,13 @@
 //! 2. Preserve `SWJ_CFG[26:24]` (only [`set_swj_sw_only`] touches it, and only to SW-only).
 //! 3. Enable the AFIO clock (`RCU_APB2EN.AFIOEN`, idempotent RMW) before the first `PCF0` write.
 //!
-//! Per-field helpers exist ONLY for fields with a real writer today (`SWJ_CFG`, `TIMER1_REMAP`);
-//! `USART0_REMAP` is added when `specs/usart-pin-remap.md` lands (out of scope: its default mapping
-//! is the PA9/PA10 gate pins, so its bring-up is gate-pin-adjacent). **F10x-only**: the F1x0 has no
+//! Per-field helpers exist ONLY for fields with a real writer today (`SWJ_CFG`, `TIMER1_REMAP`).
+//! **`USART0_REMAP` (UM 7.5.9 bit 2) deliberately has none.** It is the only way to reach USART0 on
+//! PB6/PB7 on F10x, but no F10x board needs it: the chassis that puts its BLE module there is F1x0,
+//! where the same mapping is a per-pin `AFSEL` = AF0 selection and needs no AFIO at all
+//! ([`crate::pincap::usart_pins`]). Adding the field helper with no writer would be exactly the
+//! speculative primitive this module's one-writer-per-field rule exists to avoid, so the F10x
+//! answer stays an honest "not expressible" until a board exercises it. **F10x-only**: the F1x0 has no
 //! AFIO at all (per-pin `GPIOx_AFSEL` routing; the AFIO address region is reserved and must not be
 //! written), so nothing here is reachable from an F1x0 code path.
 

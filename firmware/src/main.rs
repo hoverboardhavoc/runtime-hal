@@ -48,7 +48,7 @@ use runtime_hal::{
     clock::{ClockConfig, ClockSource},
     config::{Oversampling, UsartConfig, UsartFrame},
     detect_chip,
-    gpio::PinRole,
+    gpio::{PinRole, UsartAf},
     usart::Usart,
     Chip, ClockPath, GpioOutput, PeriphLabel,
 };
@@ -101,9 +101,11 @@ fn main() -> ! {
 
     // 4. Configure TX/RX alternate-function through runtime-hal's public USART routing (the chip
     //    resolves the pin's port + family AF mux internally). The pin bytes are `(port << 4) | pin`.
-    chip.route_usart_pin(TX_PIN, PinRole::Tx)
+    //    PA2/PA3 is USART1's mapping, which is AF1 on F1x0 (GD32F130xx Datasheet Rev3.7 Table 2-9);
+    //    the AF travels with the role because it is a per-mapping fact (`UsartAf`).
+    chip.route_usart_pin(TX_PIN, PinRole::Tx(UsartAf::Af1))
         .unwrap_or_else(|_| halt());
-    chip.route_usart_pin(RX_PIN, PinRole::Rx)
+    chip.route_usart_pin(RX_PIN, PinRole::Rx(UsartAf::Af1))
         .unwrap_or_else(|_| halt());
 
     // Configure PB9 as a plain push-pull output indicator through runtime-hal's gpio output API.

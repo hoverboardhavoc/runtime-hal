@@ -449,13 +449,14 @@ impl Chip {
     /// registers and does NOT touch GPIO, so this is the public path an application calls per USART pin
     /// to set the AF mux (the USART analogue of [`Chip::route_spi_pin`]).
     ///
-    /// Does the per-family AF write (F1x0: per-pin AFSEL = AF1; F10x: CRL/CRH nibble) plus the pin's
+    /// Does the per-family AF write (F1x0: per-pin AFSEL = the role's [`gpio::UsartAf`]; F10x:
+    /// CRL/CRH nibble) plus the pin's
     /// port-clock enable. Rejects any non-USART [`gpio::PinRole`] with
     /// [`DescriptorError::UnsupportedRole`] so the USART routing path only ever drives USART pin
     /// config. Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU) is not in the
     /// descriptor.
     pub fn route_usart_pin(&self, pin: u8, role: gpio::PinRole) -> Result<(), DescriptorError> {
-        if !matches!(role, gpio::PinRole::Tx | gpio::PinRole::Rx) {
+        if !matches!(role, gpio::PinRole::Tx(_) | gpio::PinRole::Rx(_)) {
             return Err(DescriptorError::UnsupportedRole);
         }
         crate::pincap::check_pin_ownership(self, pin, PinClaim::NonGate)?;
@@ -804,7 +805,7 @@ mod tests {
             Err(DescriptorError::PinOwnership)
         );
         assert_eq!(
-            chip.route_usart_pin(PA8, gpio::PinRole::Tx),
+            chip.route_usart_pin(PA8, gpio::PinRole::Tx(gpio::UsartAf::Af1)),
             Err(DescriptorError::PinOwnership)
         );
         assert_eq!(
@@ -841,7 +842,7 @@ mod tests {
             Err(DescriptorError::UnsupportedRole)
         );
         assert_eq!(
-            chip.route_spi_pin(PA5, gpio::PinRole::Tx),
+            chip.route_spi_pin(PA5, gpio::PinRole::Tx(gpio::UsartAf::Af1)),
             Err(DescriptorError::UnsupportedRole)
         );
     }

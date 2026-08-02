@@ -110,8 +110,12 @@ pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, Descr
     // convention). GPIOA's base comes from the synthesized descriptor.
     let gpioa = chip.base(PeriphLabel::Gpioa)?;
     let (tx_pin, rx_pin) = (CONSOLE_TX & 0x0F, CONSOLE_RX & 0x0F);
-    gpio::configure_af(gpioa, chip.gpio(), tx_pin, PinRole::Tx);
-    gpio::configure_af(gpioa, chip.gpio(), rx_pin, PinRole::Rx);
+    // PA9/PA10 is USART0's DEFAULT mapping: AF1 on F1x0 (GD32F130xx Datasheet Rev3.7 Table 2-9).
+    // Written directly rather than through `pincap::usart_pins`, which deliberately does not carry
+    // this pair (it is the TIMER0 gate set; see `USART_PIN_MAPPINGS`). That is exactly why this
+    // whole function is compiled out of real builds behind `yes-console-on-pa9-pa10`.
+    gpio::configure_af(gpioa, chip.gpio(), tx_pin, PinRole::Tx(gpio::UsartAf::Af1));
+    gpio::configure_af(gpioa, chip.gpio(), rx_pin, PinRole::Rx(gpio::UsartAf::Af1));
 
     // Bring up USART0 at 8 MHz / 115200 8N1 /16. The family models carry the USART0 base directly
     // (promoted per todo A1), so the detected chip resolves it like any other peripheral.
