@@ -19,8 +19,8 @@ use crate::descriptor::{
 use crate::error::DescriptorError;
 use crate::gpio::gpio_in::INPUT_GROUP_LINES;
 use crate::gpio::{
-    self, GpioOutput, GpioPort, InputGroup, PortAPins, PortBPins, PortCPins, PortDPins, PortFPins,
-    PortPins,
+    self, Floating, GpioOutput, GpioPort, Input, InputGroup, Pin, PortAPins, PortBPins, PortCPins,
+    PortDPins, PortFPins, PortPins,
 };
 use crate::pincap::PinClaim;
 
@@ -182,6 +182,30 @@ impl Chip {
     #[inline]
     pub fn gpiof(&self) -> Result<GpioPort<PortFPins>, DescriptorError> {
         self.gpio_port(PeriphLabel::Gpiof)
+    }
+
+    /// Resolve a PACKED logical pin byte (`port << 4 | pin`) into a reset-state pin handle, enabling
+    /// that pin's port clock.
+    ///
+    /// The by-name pin bags ([`Chip::gpioa`]`.split().pa2`) answer "which handle is PA2?" only when
+    /// the pin is a COMPILED choice. A caller whose pin arrives as DATA (a persisted board-layout
+    /// field, the packed byte [`crate::pincap`] states every one of its queries in) cannot use them
+    /// without re-encoding the byte -> name mapping on its own side, which is the same fact this
+    /// module already owns in the pin bags. So the model answers it directly: one packed byte in,
+    /// the same [`Pin`] the bag would have handed out.
+    ///
+    /// Port presence is a runtime `Result` exactly as it is for the named getters, and a port index
+    /// this crate does not model reports [`DescriptorError::MissingBase`] rather than resolving to a
+    /// wrong port. The pin comes back in the reset [`Input<Floating>`] state, like
+    /// [`GpioPort::split`]'s: this resolves and clocks a pin, it does not configure one. Whether the
+    /// pin may be claimed for the caller's function is still the ownership backstop's answer, asked
+    /// by whichever configure seam consumes the handle.
+    pub fn pin(&self, packed: u8) -> Result<Pin<Input<Floating>>, DescriptorError> {
+        let port = gpio_port_label(packed)?;
+        let base = self.base(port)?;
+        let rcu = self.rcu_base()?;
+        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
+        Ok(Pin::new(base, self.desc.gpio, packed))
     }
 
     /// Make the JTAG-overlay pins (PA15 / PB3 / PB4) usable as GPIO while keeping SWD live.

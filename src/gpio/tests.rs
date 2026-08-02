@@ -951,3 +951,80 @@ mod input_group {
         assert_eq!(reader.read(), 0b001);
     }
 }
+
+// --- Chip::pin: the by-BYTE door onto the same pin the by-NAME bags hand out --------------------
+//
+// The pin bags answer "which handle is PB6?" for a COMPILED choice; `Chip::pin` answers it for a
+// pin that arrives as DATA (a persisted board-layout field, in the packed `port << 4 | pin`
+// encoding every `pincap` query is stated in). Both doors go through the one `Pin::new`, and these
+// cases are what holds them to that: a bag pin and a packed-byte pin naming the same physical pin
+// must be the SAME value, or a data-driven bring-up would configure a different pin than the
+// layout named.
+
+use crate::chip::Chip;
+use crate::detect::{descriptor_f103, descriptor_f130};
+use crate::error::DescriptorError;
+
+#[test]
+fn chip_pin_resolves_the_same_handle_the_named_bag_does() {
+    for chip in [
+        Chip::from_descriptor(descriptor_f103()),
+        Chip::from_descriptor(descriptor_f130()),
+    ] {
+        let _g = seed();
+        let a = chip.gpioa().unwrap().split();
+        let b = chip.gpiob().unwrap().split();
+        let c = chip.gpioc().unwrap().split();
+        // The four pins this fleet's plan-resolved ports actually pick between (the two I2C pairs
+        // = the two USART pairs), plus one pin on each of two other ports so the port-nibble
+        // decode is exercised beyond port B.
+        for (packed, from_bag) in [
+            (0x16u8, b.pb6),
+            (0x17, b.pb7),
+            (0x1A, b.pb10),
+            (0x1B, b.pb11),
+            (0x02, a.pa2),
+            (0x03, a.pa3),
+            (0x2D, c.pc13),
+        ] {
+            assert_eq!(
+                chip.pin(packed).unwrap(),
+                from_bag,
+                "chip.pin({packed:#04x}) is not the pin the bag names"
+            );
+            // The packed byte survives the round trip: it is what the ownership backstop and every
+            // `pincap` query are asked in.
+            assert_eq!(chip.pin(packed).unwrap().pin(), packed);
+        }
+    }
+}
+
+#[test]
+fn chip_pin_reports_a_base_miss_for_a_port_this_part_lacks() {
+    let _g = seed();
+    // Port E (nibble 4) has no label in this crate's catalog, and nibbles above F are not ports at
+    // all. Neither may resolve to some other port's base: a wrong base would configure a real pin
+    // on a real port that the layout never named. (Like the named bags, this door resolves and
+    // clocks a port; whether the pin is BONDED on this package is `pincap::pin_exists`, which the
+    // board validator asks of every staged field before a pin ever reaches here.)
+    let f130 = Chip::from_descriptor(descriptor_f130());
+    for absent in [0x40u8, 0x60, 0xF0] {
+        assert!(
+            matches!(f130.pin(absent), Err(DescriptorError::MissingBase(_))),
+            "port nibble of {absent:#04x} resolved to a base"
+        );
+    }
+}
+
+#[test]
+fn chip_pin_enables_the_ports_clock_like_the_named_getter() {
+    let _g = seed();
+    // The bags' contract is that the getter has already enabled the port clock, so the by-byte
+    // door owes the same: resolve PB6 by byte on a zeroed register space and the F1x0 AHBEN
+    // GPIOB bit (RCU 0x14, bit 18) must be set, exactly as `chip.gpiob()` sets it.
+    let chip = Chip::from_descriptor(descriptor_f130());
+    let rcu = chip.rcu_base().unwrap();
+    assert_eq!(Reg32::new(rcu, 0x14).read() & (1 << 18), 0);
+    let _pin = chip.pin(0x16).unwrap();
+    assert_ne!(Reg32::new(rcu, 0x14).read() & (1 << 18), 0);
+}

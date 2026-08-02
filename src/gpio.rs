@@ -781,9 +781,16 @@ pub struct Pin<MODE> {
 }
 
 impl<MODE> Pin<MODE> {
-    /// Construct a pin handle in a given mode (internal; the typed constructors below are the API).
+    /// Construct a pin handle in a given mode from a resolved port base + register-model path and
+    /// the PACKED logical pin byte (`port << 4 | pin`), the encoding the pin bags store and
+    /// [`crate::pincap`] states every one of its queries in.
+    ///
+    /// Crate-internal: the by-name bags ([`PortPins::from_port`]) and the by-byte resolver
+    /// ([`crate::Chip::pin`]) are the two public doors, and both come through here, so a bag pin
+    /// and a packed-byte pin naming the same physical pin are the same value. Neither door
+    /// configures anything; the typed `into_*` transitions below are the configure API.
     #[inline]
-    const fn new(port_base: u32, path: GpioPath, pin: u8) -> Self {
+    pub(crate) const fn new(port_base: u32, path: GpioPath, pin: u8) -> Self {
         Self {
             port_base,
             path,

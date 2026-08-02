@@ -240,12 +240,33 @@ pub fn adc_channel(chip: &Chip, pin: u8) -> Option<u8> {
 /// [`PeriphLabel::I2c1`] label cannot drift: whenever this answers `Some(1)`, `I2c::new` on that
 /// label resolves, and whenever it answers `None` the label is `MissingBase` and bring-up fails
 /// loud at the seam.
+///
+/// The index is the form a HAL-free consumer can carry (the hoverboard board validator states its
+/// `Capabilities` seam in plain integers); a consumer that goes on to CALL [`crate::i2c::I2c::new`]
+/// wants the label instead and should ask [`i2c_instance`] directly rather than mapping the index
+/// back itself.
 pub fn i2c_pair(chip: &Chip, scl: u8, sda: u8) -> Option<u8> {
+    i2c_instance(chip, scl, sda).map(|label| match label {
+        PeriphLabel::I2c1 => 1,
+        _ => 0,
+    })
+}
+
+/// The I2C instance a (SCL, SDA) pair drives on this chip, as the [`PeriphLabel`]
+/// [`crate::i2c::I2c::new`] takes. The label form of [`i2c_pair`], and its single source of truth:
+/// the index answer is derived from this one, so an index and the label a bring-up is handed for
+/// the same pin pair cannot disagree.
+///
+/// This exists because the pair -> instance fact belongs here, in the pin model, and nowhere else.
+/// Without it a caller that resolved a bus INDEX from a persisted board layout has to turn that
+/// index back into a label with a local `0 => I2c0, 1 => I2c1` match, i.e. a second copy of this
+/// table living in the consumer, free to drift the moment a part maps a third instance.
+pub fn i2c_instance(chip: &Chip, scl: u8, sda: u8) -> Option<PeriphLabel> {
     if (scl, sda) == I2C0_PAIR {
-        return Some(0);
+        return Some(PeriphLabel::I2c0);
     }
     if (scl, sda) == I2C1_PAIR && chip.has_i2c(PeriphLabel::I2c1) {
-        return Some(1);
+        return Some(PeriphLabel::I2c1);
     }
     None
 }
@@ -509,6 +530,42 @@ mod tests {
                 None,
                 "PB8/PB9 remap: not expressible"
             );
+        }
+    }
+
+    /// The label answer is the index answer's source, so the two can never disagree, and the
+    /// label it hands a bring-up is the one `I2c::new` takes. Checked over the same vectors the
+    /// index test uses plus the sub-floor part where instance 1 is absent.
+    #[test]
+    fn i2c_instance_is_the_label_form_of_the_same_answer() {
+        let below = Chip::from_descriptor(synthesize(&Detected {
+            family: Family::F10x,
+            flash_kib: 32,
+            adv_timers: 1,
+            adc_count: 2,
+        }));
+        for chip in [f103c8(), f130c8(), f103rc(), below] {
+            for (scl, sda) in [
+                I2C0_PAIR,
+                I2C1_PAIR,
+                (0x17, 0x16), // reversed
+                (0x05, 0x06), // not an I2C pair
+                (0x18, 0x19), // PB8/PB9 remap: not expressible
+            ] {
+                let label = i2c_instance(&chip, scl, sda);
+                let index = i2c_pair(&chip, scl, sda);
+                // Same verdict, and where there IS one the two forms name the same instance.
+                assert_eq!(label.is_some(), index.is_some());
+                match (label, index) {
+                    (Some(PeriphLabel::I2c0), Some(0)) | (Some(PeriphLabel::I2c1), Some(1)) => {}
+                    (None, None) => {}
+                    other => panic!("index/label disagree for ({scl:#04x},{sda:#04x}): {other:?}"),
+                }
+                // And a named label is one `I2c::new` can actually resolve a base for.
+                if let Some(l) = label {
+                    assert!(chip.base(l).is_ok(), "{l:?} named but its base is absent");
+                }
+            }
         }
     }
 
