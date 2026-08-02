@@ -17,9 +17,10 @@ use crate::error::DescriptorError;
 /// [`AddrTable`]'s backing array. The old cross-build index-stability invariant died with the CBOR
 /// descriptor (the table is built and consumed inside one binary now), so the numbering is simply
 /// kept contiguous. One label = one resolvable base (debt-paydown slice 10): every variant here
-/// has a base populated in a family model (or count-conditionally by `synthesize`); speculative
-/// labels with no populatable base (the old `Gpioe`/`I2c1`/`Spi1`) were deleted rather than left
-/// dead-ending in `MissingBase`.
+/// has a base populated in a family model (or count/density-conditionally by `synthesize`);
+/// speculative labels with no populatable base (the old `Gpioe`/`Spi1`) were deleted rather than
+/// left dead-ending in `MissingBase`. `I2c1` earned its label back when the classywalk offroad IMU
+/// (PB10/PB11 = instance 1) became a real consumer.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriphLabel {
@@ -44,42 +45,55 @@ pub enum PeriphLabel {
     /// Reset & clock unit base (GD `RCU` / ST `RCC`); one base, the clock path owns the offsets.
     Rcu = 8,
     /// I2C0 (the on-board IMU link on the bench F130; classic event-based block on both families).
-    /// (No `I2c1`: no consumer exists or is planned for a second I2C; the label was speculative.)
+    /// On APB1 at `0x4000_5400` on every part of both families.
     I2c0 = 9,
+    /// I2C1, the SECOND I2C instance: APB1 at `0x4000_5800` on BOTH families (GD32F10x User Manual
+    /// Rev2.6 Table 1-2 memory map, and section 17.4 "I2C1 base address: 0x4000 5800"; GD32F1x0 User
+    /// Manual Rev3.6 Table 1-1 memory map, and section 18.4 "I2C1 base address: 0x4000 5800").
+    ///
+    /// NOT present on every part, so it is carried **density-conditionally** by `synthesize` (like
+    /// [`Self::Adc1`]/[`Self::Timer7`] are carried count-conditionally): both families' datasheet
+    /// device-summary tables list the second I2C only from the 64 KiB variants up (GD32F103xx
+    /// Datasheet Rev2.14 Table 2-1: C4/C6 = 1 I2C, C8/CB = 2; Table 2-2: every 256 KiB-and-up part =
+    /// 2. GD32F130xx Datasheet Rev3.7 Table 2-1 plus the per-package pin-table notes, e.g. Table 2-10
+    /// note (3) "Functions are available on GD32F130x8 devices": 16/32 KiB = 1 I2C, 64 KiB = 2). A
+    /// part below that floor resolves this label as [`DescriptorError::MissingBase`], never a faked
+    /// base. The consumer is the classywalk offroad IMU, wired to PB10/PB11 = I2C1.
+    I2c1 = 10,
     /// SPI0 (on APB2 on F10x; F1x0's single SPI block is mapped as `Spi0`).
-    /// (No `Spi1`: as `I2c1`, speculative with no consumer.)
-    Spi0 = 10,
+    /// (No `Spi1`: speculative, with no consumer.)
+    Spi0 = 11,
     /// ADC0 (both families; F1x0's single ADC is `Adc0`).
-    Adc0 = 11,
+    Adc0 = 12,
     /// ADC1 (F10x second ADC; carried count-conditionally: `synthesize` populates it iff the probe
     /// measured `adc_count >= 2`).
-    Adc1 = 12,
+    Adc1 = 13,
     /// ADC2 (the F10x high-density third ADC, e.g. the 12-FET's GD32F103RC; SPL `gd32f10x_adc.h:46`
     /// `ADC2 = ADC_BASE + 0x1800` = `0x4001_3C00`). Carried count-conditionally like [`Self::Adc1`]:
     /// populated iff the probe measured `adc_count >= 3`, so the measured third ADC is resolvable
     /// in the model instead of a count with no label (debt-paydown slice 10).
-    Adc2 = 13,
+    Adc2 = 14,
     /// TIMER0 (the advanced timer driving the complementary PWM bridge; ST `TIM1`). On APB2 at
     /// `0x4001_2C00` on both families. The motor hot path's PWM timer.
-    Timer0 = 14,
+    Timer0 = 15,
     /// TIMER7 (the second advanced timer on parts that declare `adv_timers == 2`; ST `TIM8`).
     /// Populated count-conditionally by `synthesize` (`adv_timers >= 2`).
-    Timer7 = 15,
+    Timer7 = 16,
     /// FWDGT (the free / independent watchdog; ST `IWDG`). On APB1 at `0x4000_3000` on BOTH families.
     /// The register block is identical on both, so one model parameterised by this base drives it.
-    Fwdgt = 16,
+    Fwdgt = 17,
     /// TIMER1 (a GENERAL-purpose level-0 timer, NOT the advanced bridge; ST `TIM2`). On APB1 at
     /// `0x4000_0000` on BOTH families (`GD32F10x_User_Manual` memory map line 1853:
     /// `0x4000 0000 - 0x4000 03FF TIMER1`; `GD32F1x0_User_Manual` 15.2 "General level0 timer
     /// (TIMERx, x=1, 2)"). Its PWM register block (CTL0/CHCTL0/CHCTL2/PSC/CAR/CHxCV) has the same
     /// offsets as the advanced TIMER0 in [`crate::timer`], MINUS the bridge-only fields. The
     /// cold-path general-PWM target ([`crate::pwm`]).
-    Timer1 = 17,
+    Timer1 = 18,
 }
 
 impl PeriphLabel {
     /// Number of labels; the [`AddrTable`] capacity.
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 19;
 
     /// Index of this label into the address-table backing array.
     #[inline]
@@ -100,10 +114,10 @@ impl PeriphLabel {
         )
     }
 
-    /// True for an `I2Cx` label (M2 T1).
+    /// True for an `I2Cx` label (M2 T1): `I2c0` / `I2c1`.
     #[inline]
     pub const fn is_i2c(self) -> bool {
-        matches!(self, PeriphLabel::I2c0)
+        matches!(self, PeriphLabel::I2c0 | PeriphLabel::I2c1)
     }
 
     /// True for a `SPIx` label (M2 T1).
@@ -183,9 +197,17 @@ pub(crate) mod ranges {
     //   ADC block  : APB2 + 0x2400 = 0x4001_2400 (ADC0), ADC1 at +0x400 = 0x4001_2800 (F10x).
     // The APB bus bases are identical across both families, so these windows are family-independent.
 
-    /// (inclusive_lo, exclusive_hi) for an I2C base on **APB1**. I2C0 = `0x4000_5400`, I2C1 =
-    /// `0x4000_5800` (F10x); the window spans both instances.
-    pub const I2C_APB1: (u32, u32) = (0x4000_5400, 0x4000_5C00);
+    /// (inclusive_lo, exclusive_hi) for the **I2C0** base on APB1: `0x4000_5400`, a single 0x400
+    /// peripheral slot. Both families place it here (GD32F10x UM Rev2.6 section 17.4 / GD32F1x0 UM
+    /// Rev3.6 section 18.4: "I2C0 base address: 0x4000 5400").
+    pub const I2C0_APB1: (u32, u32) = (0x4000_5400, 0x4000_5800);
+    /// (inclusive_lo, exclusive_hi) for the **I2C1** base on APB1: `0x4000_5800`, the next 0x400
+    /// slot, identical on both families (GD32F10x UM Rev2.6 Table 1-2 `0x4000 5800 - 0x4000 5BFF
+    /// I2C1` and section 17.4; GD32F1x0 UM Rev3.6 Table 1-1 same row and section 18.4). Kept as its
+    /// OWN window rather than one span covering both instances, so a descriptor that hands `I2c0`
+    /// the second instance's base (or vice-versa) is caught, the same per-instance shape
+    /// [`AddrTable::check_usart_base`] uses.
+    pub const I2C1_APB1: (u32, u32) = (0x4000_5800, 0x4000_5C00);
     /// (inclusive_lo, exclusive_hi) for SPI0 on **APB2** (F10x SPI0 = `0x4001_3000`). The F1x0
     /// single SPI block sits on APB1 (mapped as `Spi0` there), so a `Spi0` base in the APB1 SPI
     /// window is also accepted; see [`AddrTable::check_spi_base`].
@@ -345,16 +367,21 @@ impl AddrTable {
         }
     }
 
-    /// Validate that an I2C label's base sits in the APB1 I2C window (M2 T1).
+    /// Validate that an I2C label's base sits in the APB1 slot that instance belongs to (M2 T1).
     ///
-    /// `I2c0` is on APB1 on both families (the F1x0 single I2C block is `I2c0`; there is no second
-    /// I2C label). A base outside the window is [`DescriptorError::SelectorAddrMismatch`]; a
-    /// non-I2C label is [`DescriptorError::UnknownSelector`].
+    /// Both instances are on APB1 on both families, in adjacent 0x400 slots: `I2c0` = `0x4000_5400`,
+    /// `I2c1` = `0x4000_5800`. Each label is checked against its OWN slot, so swapping the two bases
+    /// in a descriptor is [`DescriptorError::SelectorAddrMismatch`] rather than silently accepted.
+    /// A base outside its slot is the same error; a non-I2C label is
+    /// [`DescriptorError::UnknownSelector`]; an absent base (a part below the density floor that
+    /// carries no `I2c1`) is [`DescriptorError::MissingBase`], which is what makes this the
+    /// presence query behind [`crate::Chip::has_i2c`].
     pub fn check_i2c_base(&self, i2c: PeriphLabel) -> Result<(), DescriptorError> {
-        if !i2c.is_i2c() {
-            return Err(DescriptorError::UnknownSelector);
-        }
-        let (lo, hi) = ranges::I2C_APB1;
+        let (lo, hi) = match i2c {
+            PeriphLabel::I2c0 => ranges::I2C0_APB1,
+            PeriphLabel::I2c1 => ranges::I2C1_APB1,
+            _ => return Err(DescriptorError::UnknownSelector),
+        };
         match self.get(i2c) {
             Some(base) if base >= lo && base < hi => Ok(()),
             Some(_) => Err(DescriptorError::SelectorAddrMismatch),
@@ -475,23 +502,30 @@ mod tests {
         assert_eq!(PeriphLabel::Gpiof as u8, 7);
         assert_eq!(PeriphLabel::Rcu as u8, 8);
         assert_eq!(PeriphLabel::I2c0 as u8, 9);
-        assert_eq!(PeriphLabel::Spi0 as u8, 10);
-        assert_eq!(PeriphLabel::Adc0 as u8, 11);
-        assert_eq!(PeriphLabel::Adc1 as u8, 12);
-        assert_eq!(PeriphLabel::Adc2 as u8, 13);
-        assert_eq!(PeriphLabel::Timer0 as u8, 14);
-        assert_eq!(PeriphLabel::Timer7 as u8, 15);
-        assert_eq!(PeriphLabel::Fwdgt as u8, 16);
-        assert_eq!(PeriphLabel::Timer1 as u8, 17);
+        assert_eq!(PeriphLabel::I2c1 as u8, 10);
+        assert_eq!(PeriphLabel::Spi0 as u8, 11);
+        assert_eq!(PeriphLabel::Adc0 as u8, 12);
+        assert_eq!(PeriphLabel::Adc1 as u8, 13);
+        assert_eq!(PeriphLabel::Adc2 as u8, 14);
+        assert_eq!(PeriphLabel::Timer0 as u8, 15);
+        assert_eq!(PeriphLabel::Timer7 as u8, 16);
+        assert_eq!(PeriphLabel::Fwdgt as u8, 17);
+        assert_eq!(PeriphLabel::Timer1 as u8, 18);
         assert_eq!(PeriphLabel::Rcu.index(), 8);
-        assert_eq!(PeriphLabel::Timer1.index(), 17);
-        assert_eq!(PeriphLabel::COUNT, 18);
+        assert_eq!(PeriphLabel::I2c1.index(), 10);
+        assert_eq!(PeriphLabel::Timer1.index(), 18);
+        assert_eq!(PeriphLabel::COUNT, 19);
     }
 
     #[test]
     fn class_helpers() {
-        assert!(PeriphLabel::I2c0.is_i2c());
+        assert!(PeriphLabel::I2c0.is_i2c() && PeriphLabel::I2c1.is_i2c());
         assert!(PeriphLabel::Spi0.is_spi());
+        // The second I2C is an I2C and nothing else (it must not leak into another class's guard).
+        assert!(!PeriphLabel::I2c1.is_spi());
+        assert!(!PeriphLabel::I2c1.is_adc());
+        assert!(!PeriphLabel::I2c1.is_gpio());
+        assert!(!PeriphLabel::I2c1.is_timer() && !PeriphLabel::I2c1.is_general_timer());
         assert!(
             PeriphLabel::Adc0.is_adc() && PeriphLabel::Adc1.is_adc() && PeriphLabel::Adc2.is_adc()
         );
@@ -584,28 +618,60 @@ mod tests {
     }
 
     #[test]
-    fn check_i2c_base_accepts_apb1_window() {
+    fn check_i2c_base_accepts_each_instances_own_apb1_slot() {
         let mut t = AddrTable::new();
-        t.set(PeriphLabel::I2c0, 0x4000_5400); // I2C0
+        // The two adjacent APB1 slots, identical on both families.
+        t.set(PeriphLabel::I2c0, 0x4000_5400);
+        t.set(PeriphLabel::I2c1, 0x4000_5800);
         assert_eq!(t.check_i2c_base(PeriphLabel::I2c0), Ok(()));
+        assert_eq!(t.check_i2c_base(PeriphLabel::I2c1), Ok(()));
+    }
+
+    #[test]
+    fn check_i2c_base_rejects_swapped_instance_bases() {
+        // The reason each instance gets its OWN window rather than one span covering both: a
+        // descriptor that hands each label the other instance's base is a wiring mistake that a
+        // both-instances span would accept silently.
+        let mut t = AddrTable::new();
+        t.set(PeriphLabel::I2c0, 0x4000_5800); // I2C1's slot
+        t.set(PeriphLabel::I2c1, 0x4000_5400); // I2C0's slot
+        assert_eq!(
+            t.check_i2c_base(PeriphLabel::I2c0),
+            Err(DescriptorError::SelectorAddrMismatch)
+        );
+        assert_eq!(
+            t.check_i2c_base(PeriphLabel::I2c1),
+            Err(DescriptorError::SelectorAddrMismatch)
+        );
     }
 
     #[test]
     fn check_i2c_base_rejects_out_of_window_missing_and_non_i2c() {
         let mut t = AddrTable::new();
         t.set(PeriphLabel::I2c0, 0x4001_3000); // a SPI0 base, wrong window
+        t.set(PeriphLabel::I2c1, 0x4000_5C00); // one slot past I2C1: out of window
         assert_eq!(
             t.check_i2c_base(PeriphLabel::I2c0),
+            Err(DescriptorError::SelectorAddrMismatch)
+        );
+        assert_eq!(
+            t.check_i2c_base(PeriphLabel::I2c1),
             Err(DescriptorError::SelectorAddrMismatch)
         );
         assert_eq!(
             t.check_i2c_base(PeriphLabel::Rcu),
             Err(DescriptorError::UnknownSelector)
         );
+        // An absent instance resolves MissingBase, never a faked base: this is the presence
+        // answer `Chip::has_i2c` (and through it `pincap::i2c_pair`) is built on.
         let empty = AddrTable::new();
         assert_eq!(
             empty.check_i2c_base(PeriphLabel::I2c0),
             Err(DescriptorError::MissingBase(PeriphLabel::I2c0))
+        );
+        assert_eq!(
+            empty.check_i2c_base(PeriphLabel::I2c1),
+            Err(DescriptorError::MissingBase(PeriphLabel::I2c1))
         );
     }
 

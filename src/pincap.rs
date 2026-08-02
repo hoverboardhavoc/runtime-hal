@@ -45,14 +45,13 @@ const TIMER7_CHN: [u8; 3] = [0x07, 0x10, 0x11];
 
 /// I2C0 default pair: PB6 (SCL) / PB7 (SDA), every part of both families.
 const I2C0_PAIR: (u8, u8) = (0x16, 0x17);
-/// I2C1 default pair: PB10 (SCL) / PB11 (SDA), on the parts that carry a second I2C (see
-/// [`i2c_pair`]'s flash gate).
+/// I2C1 default pair: PB10 (SCL) / PB11 (SDA), on the parts that carry a second I2C. The default
+/// mapping on BOTH families (GD32F103xx Datasheet Rev2.14 Table 2-7/2-8: PB10 = `I2C1_SCL`,
+/// PB11 = `I2C1_SDA`, no remap field exists for I2C1 on F10x; GD32F130xx Datasheet Rev3.7
+/// Table 2-10: PB10 `AF1` = `I2C1_SCL`, PB11 `AF1` = `I2C1_SDA`). The F1x0 AF number is the SAME
+/// `AF1` its I2C0 pair PB6/PB7 uses, which is why [`crate::gpio::PinRole::I2cAfOpenDrain`] routes
+/// both instances without an instance-dependent branch.
 const I2C1_PAIR: (u8, u8) = (0x1A, 0x1B);
-
-/// Both datasheets' feature tables carry a second I2C exactly on the >= 64 KiB flash variants
-/// (GD32F103xx Rev2.14 Tables 2-1/2-2; GD32F130xx Rev3.7 Table 2-1), so I2C1 presence is gated
-/// on the descriptor's measured density.
-const I2C1_MIN_FLASH_KIB: u16 = 64;
 
 /// Whether this F10x part gets the LQFP64 bonding: a measured second advanced timer means a
 /// high-density part, and GD32F103 high density starts at LQFP64 (the spec's package story).
@@ -150,19 +149,21 @@ pub fn adc_channel(chip: &Chip, pin: u8) -> Option<u8> {
 ///
 /// Returns the instance index in the **GD zero-based numbering** (never the ST 1-based names):
 /// PB6/PB7 = I2C0 = 0 on every part of both families; PB10/PB11 = I2C1 = 1 on the parts that
-/// carry a second I2C (the >= 64 KiB flash variants of both families, read from the
-/// descriptor's measured density - every fleet part qualifies). Direction matters (SCL, SDA):
-/// a reversed pair is no instance. Remapped pairs (F10x I2C0_REMAP PB8/PB9, the F1x0 PF6/PF7
-/// alternates) answer `None` until a remap primitive exists.
+/// carry a second I2C. Direction matters (SCL, SDA): a reversed pair is no instance. Remapped
+/// pairs (F10x I2C0_REMAP PB8/PB9, the F1x0 PA0/PA1 and PF6/PF7 alternates) answer `None` until
+/// a remap primitive exists.
 ///
-/// The index is DATA: no `PeriphLabel::I2c1` label exists (one label = one resolvable base,
-/// DECISIONS #14) until an I2C1 bring-up consumer arrives; a plan naming instance 1 fails loud
-/// at the bring-up seam, never silently.
+/// Presence of instance 1 is asked of the chip ([`Chip::has_i2c`]), not re-derived here: the
+/// density rule and its datasheet citations live once, at the descriptor that resolves the base
+/// (`crate::detect`'s `I2C1_MIN_FLASH_KIB`). So this query and the resolvable
+/// [`PeriphLabel::I2c1`] label cannot drift: whenever this answers `Some(1)`, `I2c::new` on that
+/// label resolves, and whenever it answers `None` the label is `MissingBase` and bring-up fails
+/// loud at the seam.
 pub fn i2c_pair(chip: &Chip, scl: u8, sda: u8) -> Option<u8> {
     if (scl, sda) == I2C0_PAIR {
         return Some(0);
     }
-    if (scl, sda) == I2C1_PAIR && chip.descriptor().flash_kib >= I2C1_MIN_FLASH_KIB {
+    if (scl, sda) == I2C1_PAIR && chip.has_i2c(PeriphLabel::I2c1) {
         return Some(1);
     }
     None
@@ -414,5 +415,70 @@ mod tests {
         }));
         assert_eq!(i2c_pair(&c6, 0x16, 0x17), Some(0));
         assert_eq!(i2c_pair(&c6, 0x1A, 0x1B), None);
+    }
+
+    /// The capability query and the resolvable label must agree on EVERY part: whenever
+    /// `i2c_pair` names an instance, that instance's `PeriphLabel` resolves to a base (so
+    /// `I2c::new` on it can succeed), and whenever it declines, the label is `MissingBase` (so
+    /// bring-up fails loud at the seam instead of driving a peripheral that is not there).
+    #[test]
+    fn i2c_pair_and_the_resolvable_label_agree_on_every_part() {
+        // A 32 KiB F10x and a 32 KiB F1x0 sit below the floor; the three fleet parts sit above it.
+        let below_f10x = Chip::from_descriptor(synthesize(&Detected {
+            family: Family::F10x,
+            flash_kib: 32,
+            adv_timers: 1,
+            adc_count: 2,
+        }));
+        let below_f1x0 = Chip::from_descriptor(synthesize(&Detected {
+            family: Family::F1x0,
+            flash_kib: 32,
+            adv_timers: 1,
+            adc_count: 1,
+        }));
+        for chip in [f103c8(), f130c8(), f103rc(), below_f10x, below_f1x0] {
+            for (pair, label) in [
+                (I2C0_PAIR, PeriphLabel::I2c0),
+                (I2C1_PAIR, PeriphLabel::I2c1),
+            ] {
+                let named = i2c_pair(&chip, pair.0, pair.1).is_some();
+                assert_eq!(
+                    named,
+                    chip.has_i2c(label),
+                    "pincap vs the chip capability query for {label:?}"
+                );
+                assert_eq!(
+                    named,
+                    chip.base(label).is_ok(),
+                    "pincap named {label:?} but its base does not resolve (or vice-versa)"
+                );
+            }
+        }
+    }
+
+    /// The pin-ownership backstop still governs the second instance's pins: PB10/PB11 are not
+    /// gate-capable on any part, so they are accepted as a non-gate claim (what `I2c::new` makes)
+    /// and refused as a gate claim. The gate pins are unaffected by the new instance.
+    #[test]
+    fn the_ownership_backstop_still_governs_the_i2c1_pins() {
+        const PB10: u8 = 0x1A;
+        const PB11: u8 = 0x1B;
+        for chip in [f103c8(), f130c8(), f103rc()] {
+            for pin in [PB10, PB11] {
+                assert!(pin_exists(&chip, pin));
+                assert!(!gate_capable(&chip, pin));
+                assert_eq!(check_pin_ownership(&chip, pin, PinClaim::NonGate), Ok(()));
+                assert_eq!(
+                    check_pin_ownership(&chip, pin, PinClaim::Gate),
+                    Err(DescriptorError::PinOwnership)
+                );
+            }
+            // And a gate pin is still refused for I2C's non-gate claim, on every part: PB13 is
+            // TIMER0_CH0N, adjacent to the I2C1 pair on the same port.
+            assert_eq!(
+                check_pin_ownership(&chip, 0x1D, PinClaim::NonGate),
+                Err(DescriptorError::PinOwnership)
+            );
+        }
     }
 }

@@ -194,6 +194,45 @@ fn enable_i2c0_plus_gpiob_clock_f10x() {
 }
 
 #[test]
+fn enable_i2c1_sets_apb1en_bit22_both_families() {
+    // I2C1EN = BIT(22) on APB1EN, the SAME register and bit on both families (GD32F10x UM Rev2.6
+    // section 5.3.8 "22 I2C1EN"; GD32F1x0 UM Rev3.6 section 4.3.8, same position). The clock path
+    // is passed but must not change the write.
+    for path in [ClockPath::F1x0Rcu, ClockPath::F10xRcc] {
+        let _g = seed_reset();
+        enable_i2c(RCU_BASE, path, PeriphLabel::I2c1).unwrap();
+        assert_eq!(read(APB1EN), 1 << 22, "{path:?}");
+        assert_eq!(read(APB2EN), 0);
+        assert_eq!(read(AHBEN), 0);
+    }
+}
+
+#[test]
+fn enable_i2c1_plus_gpiob_clock_is_the_offroad_imu_sequence() {
+    // The classywalk offroad IMU bring-up: GPIOB (PB10/PB11) clock, then the I2C1 clock. The two
+    // instances take ADJACENT bits, so this also pins that enabling one never touches the other.
+    for (path, gpiob_reg, gpiob_bit) in [
+        (ClockPath::F1x0Rcu, AHBEN, 18u32),
+        (ClockPath::F10xRcc, APB2EN, 3),
+    ] {
+        let _g = seed_reset();
+        enable_gpio_port(RCU_BASE, path, PeriphLabel::Gpiob).unwrap();
+        enable_i2c(RCU_BASE, path, PeriphLabel::I2c1).unwrap();
+        assert_eq!(read(gpiob_reg), 1 << gpiob_bit, "{path:?} GPIOB");
+        assert_eq!(read(APB1EN), 1 << 22, "{path:?} I2C1 only, not I2C0");
+    }
+}
+
+#[test]
+fn enabling_both_i2c_instances_sets_both_adjacent_bits() {
+    let _g = seed_reset();
+    enable_i2c(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::I2c0).unwrap();
+    enable_i2c(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::I2c1).unwrap();
+    // Read-modify-write, so the second enable preserves the first (bits 21 and 22 together).
+    assert_eq!(read(APB1EN), (1 << 21) | (1 << 22));
+}
+
+#[test]
 fn enable_spi0_sets_apb2en_bit12() {
     let _g = seed_reset();
     enable_spi(RCU_BASE, ClockPath::F10xRcc, PeriphLabel::Spi0).unwrap();
