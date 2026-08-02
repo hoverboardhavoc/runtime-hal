@@ -109,6 +109,38 @@ const F1X0_OTYPE_OD: bool = true;
 const F1X0_AF_1: u32 = 1;
 /// AF0 = SPI0 on F1x0 (`gd32f1x0_gpio.c` AF table: SPI0 is on AF0).
 const F1X0_AF_0: u32 = 0;
+
+/// The F1x0 per-pin AF-mux number a USART pin MAPPING routes through.
+///
+/// The AF number is not a property of the FUNCTION, it is a property of the (pin, function) pair:
+/// the GD32F130xx Datasheet Rev3.7 port AF tables put `USART0_TX` on **AF1** at PA9 (Table 2-9) but
+/// on **AF0** at PB6 (Table 2-10). So a USART role cannot bake one number the way the SPI and timer
+/// roles can; it carries the number its mapping resolved to. [`crate::pincap::usart_pins`] owns the
+/// pin -> mapping table that answers it (the module that owns the crate's AF/bonding data), and
+/// this enum is the two values that table can yield, so a caller cannot pass an arbitrary nibble.
+///
+/// **F10x-inert:** the F10x has no per-pin AF mux at all (the CRL/CRH mode/cnf nibble is the whole
+/// routing), so [`configure_f10x`] ignores this exactly as it already ignores [`PinConfig::af`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsartAf {
+    /// `AF0`: USART0 on PB6/PB7 (GD32F130xx Datasheet Rev3.7 Table 2-10: PB6 AF0 = `USART0_TX`,
+    /// PB7 AF0 = `USART0_RX`).
+    Af0,
+    /// `AF1`: the default USART mappings (GD32F130xx Datasheet Rev3.7 Table 2-9: PA2 AF1 =
+    /// `USART1_TX`, PA3 AF1 = `USART1_RX`; PA9/PA10 AF1 = `USART0_TX`/`_RX`).
+    Af1,
+}
+
+impl UsartAf {
+    /// The raw F1x0 `GPIOx_AFSEL` nibble this AF selects.
+    #[inline]
+    const fn nibble(self) -> u32 {
+        match self {
+            UsartAf::Af0 => F1X0_AF_0,
+            UsartAf::Af1 => F1X0_AF_1,
+        }
+    }
+}
 /// AF2 = TIMER0 (and TIMER1/15/16) on F1x0 (`gd32f1x0_gpio.c:322` AF table: `GPIO_AF_2: TIMER0,
 /// TIMER1, TIMER15, TIMER16, EVENTOUT`). The advanced-timer complementary-PWM gate pins
 /// (high CH0/1/2 on PA8/9/10, low CH0N/1N/2N on PB13/14/15) route to TIMER0 through AF2.
@@ -120,8 +152,9 @@ const F1X0_AF_2: u32 = 2;
 /// M2 grows the set so I2C can express **open-drain + pull-up** and SPI its **AF push-pull** on a
 /// different AF number (see the module docs):
 ///
-/// - [`PinRole::Tx`]: USART transmit, AF push-pull 50 MHz, AF1.
-/// - [`PinRole::Rx`]: USART receive, input (F10x floating / F1x0 AF input), AF1.
+/// - [`PinRole::Tx`]: USART transmit, AF push-pull 50 MHz, on the mapping's [`UsartAf`].
+/// - [`PinRole::Rx`]: USART receive, input (F10x floating / F1x0 AF input), on the mapping's
+///   [`UsartAf`].
 /// - [`PinRole::I2cAfOpenDrain`]: I2C SCL/SDA, AF **open-drain with pull-up**, 50 MHz, AF1.
 /// - [`PinRole::SpiAfPushPull`]: SPI SCK/MOSI, AF push-pull 50 MHz, AF0 (the SPI AF on F1x0).
 /// - [`PinRole::SpiInput`]: SPI MISO, input (same encoding as RX), AF0.
@@ -136,10 +169,11 @@ const F1X0_AF_2: u32 = 2;
 ///   implied by the AF-push-pull nibble (0xB), identical to any other AF-PP output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinRole {
-    /// USART transmit: alternate-function push-pull output, 50 MHz.
-    Tx,
-    /// USART receive: input (F10x floating input; F1x0 AF input).
-    Rx,
+    /// USART transmit: alternate-function push-pull output, 50 MHz, on the pin mapping's
+    /// [`UsartAf`] (AF1 for the default mappings, AF0 for USART0 on PB6/PB7).
+    Tx(UsartAf),
+    /// USART receive: input (F10x floating input; F1x0 AF input), on the pin mapping's [`UsartAf`].
+    Rx(UsartAf),
     /// I2C SCL/SDA: alternate-function open-drain output with pull-up, 50 MHz.
     I2cAfOpenDrain,
     /// SPI SCK/MOSI: alternate-function push-pull output, 50 MHz.
@@ -169,7 +203,8 @@ struct PinConfig {
     open_drain: bool,
     /// True to enable the internal pull-up (I2C). USART/SPI pins float.
     pull_up: bool,
-    /// The F1x0 alternate-function number (AF1 for USART/I2C, AF0 for SPI).
+    /// The F1x0 alternate-function number (the mapping's `UsartAf` for USART, AF1 for I2C, AF0
+    /// for SPI, AF2 for the timer roles).
     af: u32,
 }
 
@@ -177,17 +212,19 @@ impl PinRole {
     /// Resolve this role to its shared, model-independent pin configuration.
     fn config(self) -> PinConfig {
         match self {
-            PinRole::Tx => PinConfig {
+            // The USART roles take their AF from the resolved pin mapping, not from the role: the
+            // same function sits on different AF numbers at different pins (see `UsartAf`).
+            PinRole::Tx(af) => PinConfig {
                 output: true,
                 open_drain: false,
                 pull_up: false,
-                af: F1X0_AF_1,
+                af: af.nibble(),
             },
-            PinRole::Rx => PinConfig {
+            PinRole::Rx(af) => PinConfig {
                 output: false,
                 open_drain: false,
                 pull_up: false,
-                af: F1X0_AF_1,
+                af: af.nibble(),
             },
             PinRole::I2cAfOpenDrain => PinConfig {
                 output: true,
@@ -283,7 +320,8 @@ fn configure_f10x(port_base: u32, n: u32, cfg: &PinConfig) {
 /// Order matches the SPL (`gpio_mode_set` then `gpio_af_set` then `gpio_output_options_set`):
 /// 1. `CTL`: AF mode for every role (the line goes through the AF mux either way).
 /// 2. `PUD`: pull-up for an I2C pin, no pull for USART/SPI.
-/// 3. `AFSEL{0,1}`: the role's AF-mux number (AF1 for USART/I2C, AF0 for SPI).
+/// 3. `AFSEL{0,1}`: the resolved AF-mux number (the mapping's `UsartAf` for USART, AF1 for I2C,
+///    AF0 for SPI, AF2 for the timer roles).
 /// 4. For output roles, the output options: `OMODE` push-pull or open-drain, and `OSPD` 50 MHz.
 fn configure_f1x0(port_base: u32, n: u32, cfg: &PinConfig) {
     // 1. CTL: 2 bits/pin. AF mode for every role: the line goes through the AF mux either way, and

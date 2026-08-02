@@ -7,7 +7,7 @@
 
 use crate::descriptor::GpioPath;
 use crate::gpio::{
-    configure_af, configure_output, configure_output_od, set_pin, GpioOutput, PinRole,
+    configure_af, configure_output, configure_output_od, set_pin, GpioOutput, PinRole, UsartAf,
 };
 use crate::reg::{mock, Reg32};
 use embedded_hal::digital::{OutputPin, StatefulOutputPin};
@@ -48,7 +48,12 @@ const PA3: u8 = 0x03;
 #[test]
 fn f10x_tx_pa2_is_af_pp_50mhz_nibble() {
     let _g = seed();
-    configure_af(PORT_BASE, GpioPath::ApbCrlCrh, PA2, PinRole::Tx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::ApbCrlCrh,
+        PA2,
+        PinRole::Tx(UsartAf::Af1),
+    );
     // PA2 -> CTL0 nibble at bits [11:8]. AF push-pull (0x8) | 50MHz (0x3) = 0xB.
     assert_eq!(read(CTL0), 0xB << 8);
     assert_eq!(read(CTL1), 0);
@@ -57,7 +62,12 @@ fn f10x_tx_pa2_is_af_pp_50mhz_nibble() {
 #[test]
 fn f10x_rx_pa3_is_floating_input_nibble() {
     let _g = seed();
-    configure_af(PORT_BASE, GpioPath::ApbCrlCrh, PA3, PinRole::Rx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::ApbCrlCrh,
+        PA3,
+        PinRole::Rx(UsartAf::Af1),
+    );
     // PA3 -> CTL0 nibble at bits [15:12]. Floating input = 0x4.
     assert_eq!(read(CTL0), 0x4 << 12);
 }
@@ -68,8 +78,18 @@ fn f10x_tx_pa2_plus_rx_pa3_combined() {
     // must leave all the other pins at 0x4 and place TX/RX nibbles correctly.
     let _g = seed();
     Reg32::new(PORT_BASE, CTL0).write(0x4444_4444);
-    configure_af(PORT_BASE, GpioPath::ApbCrlCrh, PA2, PinRole::Tx);
-    configure_af(PORT_BASE, GpioPath::ApbCrlCrh, PA3, PinRole::Rx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::ApbCrlCrh,
+        PA2,
+        PinRole::Tx(UsartAf::Af1),
+    );
+    configure_af(
+        PORT_BASE,
+        GpioPath::ApbCrlCrh,
+        PA3,
+        PinRole::Rx(UsartAf::Af1),
+    );
     // PA2 nibble -> 0xB at [11:8]; PA3 -> 0x4 at [15:12] (which equals the reset nibble). Every
     // other pin keeps its reset nibble 0x4.
     let expected = (0x4444_4444u32 & !(0xFu32 << 8) & !(0xFu32 << 12)) | (0xB << 8) | (0x4 << 12);
@@ -81,7 +101,12 @@ fn f10x_high_pin_uses_ctl1() {
     let _g = seed();
     // PB10 (port irrelevant to mock): pin 10 -> CTL1 nibble at bits [(10-8)*4 = 8].
     let pb10 = (1u8 << 4) | 10;
-    configure_af(PORT_BASE, GpioPath::ApbCrlCrh, pb10, PinRole::Tx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::ApbCrlCrh,
+        pb10,
+        PinRole::Tx(UsartAf::Af1),
+    );
     assert_eq!(read(CTL1), 0xB << 8);
     assert_eq!(read(CTL0), 0);
 }
@@ -91,7 +116,12 @@ fn f10x_high_pin_uses_ctl1() {
 #[test]
 fn f1x0_tx_pa2_sets_ctl_af_afsel_omode_ospd() {
     let _g = seed();
-    configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, PA2, PinRole::Tx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        PA2,
+        PinRole::Tx(UsartAf::Af1),
+    );
     // CTL: pin 2, 2 bits at [5:4], AF = 2.
     assert_eq!(read(CTL), 2 << 4);
     // AFSEL0: pin 2, 4 bits at [11:8], AF1 (USART).
@@ -108,7 +138,12 @@ fn f1x0_tx_pa2_sets_ctl_af_afsel_omode_ospd() {
 #[test]
 fn f1x0_rx_pa3_is_af_input_no_output_options() {
     let _g = seed();
-    configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, PA3, PinRole::Rx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        PA3,
+        PinRole::Rx(UsartAf::Af1),
+    );
     // CTL: pin 3, AF = 2 at bits [7:6].
     assert_eq!(read(CTL), 2 << 6);
     // AFSEL0: pin 3, AF1 at bits [15:12].
@@ -123,8 +158,18 @@ fn f1x0_rx_pa3_is_af_input_no_output_options() {
 #[test]
 fn f1x0_tx_pa2_plus_rx_pa3_combined() {
     let _g = seed();
-    configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, PA2, PinRole::Tx);
-    configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, PA3, PinRole::Rx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        PA2,
+        PinRole::Tx(UsartAf::Af1),
+    );
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        PA3,
+        PinRole::Rx(UsartAf::Af1),
+    );
     // CTL: PA2 AF at [5:4], PA3 AF at [7:6] -> (2<<4) | (2<<6).
     assert_eq!(read(CTL), (2 << 4) | (2 << 6));
     // AFSEL0: PA2 AF1 at [11:8], PA3 AF1 at [15:12].
@@ -134,12 +179,56 @@ fn f1x0_tx_pa2_plus_rx_pa3_combined() {
     assert_eq!(read(OMODE), 0);
 }
 
+/// USART0's PB6/PB7 mapping writes **AF0**, not the AF1 every other USART pin takes: the AF is a
+/// property of the (pin, function) MAPPING, not of the role. GD32F130xx Datasheet Rev3.7 Table 2-10:
+/// PB6 AF0 = `USART0_TX`, PB7 AF0 = `USART0_RX`. Registered at the register level, so a regression
+/// that re-bakes AF1 into the role shows up here as a wrong AFSEL0 nibble.
+#[test]
+fn f1x0_usart0_on_pb6_pb7_writes_af0_not_af1() {
+    let _g = seed();
+    let (pb6, pb7) = (6u8, 7u8);
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        pb6,
+        PinRole::Tx(UsartAf::Af0),
+    );
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        pb7,
+        PinRole::Rx(UsartAf::Af0),
+    );
+    // AFSEL0 nibbles for pins 6 and 7 are at [27:24] and [31:28]; AF0 = 0, so both stay zero.
+    assert_eq!(read(AFSEL0), 0, "AF0 selected on both pins");
+    // CTL still puts both pins in AF mode (2) at [13:12] and [15:14): the mux is engaged, at AF0.
+    assert_eq!(read(CTL), (2 << 12) | (2 << 14));
+    // TX drives the line (50 MHz push-pull); RX does not.
+    assert_eq!(read(OSPD), 3 << 12, "only PB6 (TX) gets output options");
+    assert_eq!(read(OMODE) & (1 << 6), 0, "TX push-pull");
+    // Contrast: the SAME pin at AF1 is I2C0, and that nibble is NOT zero. This is the discrimination
+    // an all-zero AF0 assertion alone could not make.
+    mock::reset();
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        pb6,
+        PinRole::Tx(UsartAf::Af1),
+    );
+    assert_eq!(read(AFSEL0), 1 << 24, "AF1 at PB6 is a different nibble");
+}
+
 #[test]
 fn f1x0_high_pin_uses_afsel1() {
     let _g = seed();
     // Pin 9 -> AFSEL1 nibble at [(9-8)*4 = 4].
     let p9 = 9u8;
-    configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, p9, PinRole::Tx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        p9,
+        PinRole::Tx(UsartAf::Af1),
+    );
     assert_eq!(read(AFSEL1), 1 << 4);
     assert_eq!(read(AFSEL0), 0);
     // CTL: pin 9, AF at [19:18].
@@ -766,7 +855,12 @@ fn width_strict_afsel_is_32_bit() {
     // confirms the full-width write.
     let _g = seed();
     let p7 = 7u8;
-    configure_af(PORT_BASE, GpioPath::AhbCtlAfsel, p7, PinRole::Tx);
+    configure_af(
+        PORT_BASE,
+        GpioPath::AhbCtlAfsel,
+        p7,
+        PinRole::Tx(UsartAf::Af1),
+    );
     assert_eq!(read(AFSEL0), 1u32 << 28);
 }
 

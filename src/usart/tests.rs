@@ -506,6 +506,73 @@ fn rejoin_of_mismatched_halves_panics() {
     let _ = Usart::rejoin(tx1, rx2); // cross-peripheral rejoin: programming error, fail loud
 }
 
+/// `Usart::new` resolves its pins through the pin model and writes the mapping's AF, so bringing
+/// USART0 up on PB6/PB7 (the offroad chassis's CC2541 port) lands **AF0** in `AFSEL0`, while the
+/// USART1 link pair still lands AF1. The register-level end of the mapping-owned-AF change.
+#[test]
+fn new_writes_the_mappings_af_per_pin_pair_on_f1x0() {
+    let _g = seed_reset();
+    let chip = Chip::from_descriptor(crate::detect::descriptor_f130());
+    let gpiob = chip.gpiob().unwrap().split();
+    let gpiob_base = chip.base(PeriphLabel::Gpiob).unwrap();
+
+    Usart::new(
+        &chip,
+        &ClockConfig::REFERENCE_72M_IRC8M,
+        PeriphLabel::Usart0,
+        (gpiob.pb6, gpiob.pb7),
+        9600,
+    )
+    .expect("USART0 on PB6/PB7 is a routable mapping on F1x0");
+
+    // AFSEL0 nibbles for pins 6/7 are at [27:24] and [31:28]; AF0 leaves both zero. Had the role
+    // kept its baked AF1, these would read 1 and the module would be muxed to I2C0 instead.
+    let afsel0 = Reg32::new(gpiob_base, 0x20).read();
+    assert_eq!(afsel0 >> 24, 0, "PB6/PB7 muxed to USART0 at AF0, not I2C0");
+    // Both pins in AF mode, and only TX drives the line.
+    assert_eq!(Reg32::new(gpiob_base, 0x00).read() >> 12 & 0xF, 0b1010);
+}
+
+/// The pins must AGREE with the requested instance: PB6/PB7 drives USART0, so asking for USART1 on
+/// them is refused rather than silently enabling one peripheral's clock and muxing another's pins.
+#[test]
+fn new_refuses_pins_that_drive_a_different_instance() {
+    let _g = seed_reset();
+    let chip = Chip::from_descriptor(crate::detect::descriptor_f130());
+    let gpiob = chip.gpiob().unwrap().split();
+    assert_eq!(
+        Usart::new(
+            &chip,
+            &ClockConfig::REFERENCE_72M_IRC8M,
+            PeriphLabel::Usart1,
+            (gpiob.pb6, gpiob.pb7),
+            9600,
+        )
+        .err(),
+        Some(crate::error::DescriptorError::SelectorAddrMismatch)
+    );
+}
+
+/// A pin pair that is no USART mapping on this family fails loud instead of writing a hopeful AF.
+/// PB10/PB11 is USART2 on F10x but the I2C1 pair on F1x0, so the F1x0 answer is `Unsupported`.
+#[test]
+fn new_refuses_a_pair_that_is_no_usart_mapping_on_this_family() {
+    let _g = seed_reset();
+    let chip = Chip::from_descriptor(crate::detect::descriptor_f130());
+    let gpiob = chip.gpiob().unwrap().split();
+    assert_eq!(
+        Usart::new(
+            &chip,
+            &ClockConfig::REFERENCE_72M_IRC8M,
+            PeriphLabel::Usart2,
+            (gpiob.pb10, gpiob.pb11),
+            115_200,
+        )
+        .err(),
+        Some(crate::error::DescriptorError::Unsupported)
+    );
+}
+
 #[test]
 fn new_refuses_gate_capable_pins_the_layer_7_backstop() {
     // Layer 7 (`hoverboard-firmware/specs/motor-integration.md`): PA9/PA10 are TIMER0 CH1/CH2,

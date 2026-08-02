@@ -1,9 +1,9 @@
 //! Per-chip pin-capability queries (R-CAP; `specs/pin-capability.md`).
 //!
 //! The hoverboard board-layout boot validator (its `specs/board-model.md`) checks a persisted
-//! pin layout against the detected chip through a `Capabilities` trait seam; these five queries
-//! are the REAL implementation behind that seam (a thin firmware adapter maps the trait onto
-//! them). All five are **pure**: no register or GPIO access, nothing configured or routed.
+//! pin layout against the detected chip through a `Capabilities` trait seam; these queries are the
+//! REAL implementation behind that seam (a thin firmware adapter maps the trait onto them). All of
+//! them are **pure**: no register or GPIO access, nothing configured or routed.
 //!
 //! The `supports_rx` precedent applies ([`crate::usart_rx::supports_rx`]): every answer is
 //! derived from the HAL model - the descriptor's register-model selectors, its MEASURED
@@ -30,6 +30,7 @@ use crate::addr::PeriphLabel;
 use crate::chip::Chip;
 use crate::descriptor::GpioPath;
 use crate::error::DescriptorError;
+use crate::gpio::UsartAf;
 
 // --- the owned capability data (packed pin bytes; provenance in specs/pin-capability.md) ------
 
@@ -52,6 +53,86 @@ const I2C0_PAIR: (u8, u8) = (0x16, 0x17);
 /// `AF1` its I2C0 pair PB6/PB7 uses, which is why [`crate::gpio::PinRole::I2cAfOpenDrain`] routes
 /// both instances without an instance-dependent branch.
 const I2C1_PAIR: (u8, u8) = (0x1A, 0x1B);
+
+/// The USART pin mappings this HAL can route, and how each family reaches them.
+///
+/// Provenance (primary sources, per mapping):
+/// - **PA2/PA3 = USART1.** GD32F130xx Datasheet Rev3.7 Table 2-9: PA2 `AF1` = `USART1_TX`, PA3
+///   `AF1` = `USART1_RX`. On F10x it is USART1's default mapping (no AFIO remap). The fleet's
+///   silicon-proven inter-board link pair on both families.
+/// - **PB6/PB7 = USART0.** GD32F130xx Datasheet Rev3.7 Table 2-10: PB6 `AF0` = `USART0_TX`, PB7
+///   `AF0` = `USART0_RX`. **F1x0 only.** On F10x these pins reach USART0 only through the global
+///   `AFIO_PCF0.USART0_REMAP` field (GD32F10x User Manual Rev2.6 §7.5.9 bit 2), a remap primitive
+///   [`crate::afio`] does not implement and no board exercises, so the F10x answer is `None`, not a
+///   hopeful yes.
+/// - **PB10/PB11 = USART2.** F10x's USART2 default mapping (no AFIO remap). **F10x only:** the
+///   F1x0 has no USART2 at all, and Datasheet Rev3.7 Table 2-10 puts `I2C1_SCL`/`I2C1_SDA` on
+///   those pins there instead.
+///
+/// **PA9/PA10 (USART0's DEFAULT mapping, Datasheet Table 2-9 `AF1`) is deliberately absent from
+/// this table on BOTH families.** Those same pins are `TIMER0_CH1`/`TIMER0_CH2` (Table 2-9 `AF2`)
+/// = the fleet's high-side FET gates, so [`gate_capable`] answers true and
+/// [`check_pin_ownership`] refuses them for any non-gate function, permanently. Listing a mapping
+/// that the ownership backstop can never allow to be configured would be a half-state; the pin
+/// model and the backstop agree that this pair is not a USART pair here.
+const USART_PIN_MAPPINGS: [UsartPinMapping; 3] = [
+    UsartPinMapping {
+        tx: 0x02, // PA2
+        rx: 0x03, // PA3
+        usart: PeriphLabel::Usart1,
+        af: UsartAf::Af1,
+        f10x: true,
+        f1x0: true,
+    },
+    UsartPinMapping {
+        tx: 0x16, // PB6
+        rx: 0x17, // PB7
+        usart: PeriphLabel::Usart0,
+        af: UsartAf::Af0,
+        // F10x needs AFIO_PCF0.USART0_REMAP, which the HAL does not implement.
+        f10x: false,
+        f1x0: true,
+    },
+    UsartPinMapping {
+        tx: 0x1A, // PB10
+        rx: 0x1B, // PB11
+        usart: PeriphLabel::Usart2,
+        // Inert: this row is F10x-only and the F10x has no per-pin AF mux, so no AFSEL nibble is
+        // ever written for it. `Af1` matches the other default USART mappings rather than adding a
+        // family-conditional field for a value no F10x register consumes.
+        af: UsartAf::Af1,
+        f10x: true,
+        // No USART2 on F1x0; PB10/PB11 are the I2C1 pair there (see `I2C1_PAIR`).
+        f1x0: false,
+    },
+];
+
+/// One row of [`USART_PIN_MAPPINGS`]: a (TX, RX) pin pair, the USART instance it drives, the F1x0
+/// AF-mux number that routes it, and which families reach it with no remap primitive.
+struct UsartPinMapping {
+    /// Packed TX pin byte.
+    tx: u8,
+    /// Packed RX pin byte.
+    rx: u8,
+    /// The instance this pair drives.
+    usart: PeriphLabel,
+    /// The F1x0 per-pin `GPIOx_AFSEL` number (inert on F10x, which has no per-pin AF mux).
+    af: UsartAf,
+    /// Routable on F10x with no AFIO remap field.
+    f10x: bool,
+    /// Routable on F1x0 through the per-pin AF mux.
+    f1x0: bool,
+}
+
+/// A resolved USART pin mapping ([`usart_pins`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsartMapping {
+    /// The USART instance this (TX, RX) pair drives on the detected chip.
+    pub usart: PeriphLabel,
+    /// The AF-mux number the configure seam writes for this mapping's pins. Meaningful on F1x0;
+    /// inert on F10x, where the CRL/CRH mode/cnf nibble is the whole routing (see [`UsartAf`]).
+    pub af: UsartAf,
+}
 
 /// Whether this F10x part gets the LQFP64 bonding: a measured second advanced timer means a
 /// high-density part, and GD32F103 high density starts at LQFP64 (the spec's package story).
@@ -167,6 +248,33 @@ pub fn i2c_pair(chip: &Chip, scl: u8, sda: u8) -> Option<u8> {
         return Some(1);
     }
     None
+}
+
+/// Does the (TX, RX) pair drive a USART instance on this chip, and which, through which AF?
+/// (R-CAP query e, the USART sibling of [`i2c_pair`].)
+///
+/// The single owner of the crate's pin -> USART routing fact. [`crate::usart::Usart::new`] resolves
+/// every bring-up through it, so the AF written to `GPIOx_AFSEL` is the datasheet's AF for THAT
+/// pin, never a number baked into the pin role: `USART0_TX` is `AF1` at PA9 but `AF0` at PB6
+/// (GD32F130xx Datasheet Rev3.7 Tables 2-9 / 2-10), which is exactly the fact a per-role constant
+/// cannot express.
+///
+/// Direction matters (TX, RX): a reversed pair is no mapping. Family-gated per
+/// [`USART_PIN_MAPPINGS`] (the F1x0-only PB6/PB7 USART0 mapping, the F10x-only PB10/PB11 USART2
+/// one), and the gate-pin pair PA9/PA10 is not a mapping on either family - the module's
+/// not-yet-expressible rule and the gate-pin denial, both visible here.
+///
+/// Answering `Some` is a ROUTING fact, not permission: [`check_pin_ownership`] is still the
+/// backstop every configure call goes through.
+pub fn usart_pins(chip: &Chip, tx: u8, rx: u8) -> Option<UsartMapping> {
+    let f1x0 = matches!(chip.gpio(), GpioPath::AhbCtlAfsel);
+    USART_PIN_MAPPINGS
+        .iter()
+        .find(|m| m.tx == tx && m.rx == rx && if f1x0 { m.f1x0 } else { m.f10x })
+        .map(|m| UsartMapping {
+            usart: m.usart,
+            af: m.af,
+        })
 }
 
 // --- the per-configuration ownership backstop (Layer 7) ---------------------------------------
@@ -401,6 +509,98 @@ mod tests {
                 None,
                 "PB8/PB9 remap: not expressible"
             );
+        }
+    }
+
+    #[test]
+    fn usart_pins_resolve_per_family_with_the_datasheet_af() {
+        // PA2/PA3 = USART1 on BOTH families, at AF1 (GD32F130xx Datasheet Rev3.7 Table 2-9).
+        for chip in [f103c8(), f130c8(), f103rc()] {
+            assert_eq!(
+                usart_pins(&chip, 0x02, 0x03),
+                Some(UsartMapping {
+                    usart: PeriphLabel::Usart1,
+                    af: UsartAf::Af1
+                }),
+                "PA2/PA3 = USART1"
+            );
+            // Direction matters, exactly like `i2c_pair`.
+            assert_eq!(usart_pins(&chip, 0x03, 0x02), None, "reversed pair");
+            assert_eq!(usart_pins(&chip, 0x05, 0x06), None, "not a USART pair");
+        }
+
+        // PB6/PB7 = USART0 at **AF0** on F1x0 (Datasheet Rev3.7 Table 2-10: PB6 AF0 = USART0_TX,
+        // PB7 AF0 = USART0_RX). This is the whole point of the mapping-owned AF: the SAME function
+        // sits on AF1 at PA9 and AF0 at PB6, so no per-role constant can express both.
+        assert_eq!(
+            usart_pins(&f130c8(), 0x16, 0x17),
+            Some(UsartMapping {
+                usart: PeriphLabel::Usart0,
+                af: UsartAf::Af0
+            }),
+            "PB6/PB7 = USART0 at AF0 on F1x0"
+        );
+        // On F10x the same pair needs the AFIO USART0_REMAP field the HAL does not implement.
+        for chip in [f103c8(), f103rc()] {
+            assert_eq!(
+                usart_pins(&chip, 0x16, 0x17),
+                None,
+                "PB6/PB7 USART0 needs an AFIO remap on F10x: not expressible"
+            );
+        }
+
+        // PB10/PB11 = USART2, F10x-only: the F1x0 has no USART2 (those pins are its I2C1 pair).
+        for chip in [f103c8(), f103rc()] {
+            assert_eq!(
+                usart_pins(&chip, 0x1A, 0x1B).map(|m| m.usart),
+                Some(PeriphLabel::Usart2)
+            );
+        }
+        assert_eq!(usart_pins(&f130c8(), 0x1A, 0x1B), None, "no USART2 on F1x0");
+    }
+
+    #[test]
+    fn usart0_default_pa9_pa10_is_no_mapping_and_stays_gate_denied() {
+        // The gate-pin denial, from both layers at once. PA9/PA10 IS USART0's default mapping on
+        // silicon (Datasheet Table 2-9, AF1), but those pins are TIMER0_CH1/CH2 = the fleet's
+        // high-side FET gates, so: the pin model refuses to name them a USART pair at all, AND the
+        // ownership backstop refuses them for any non-gate claim. Neither layer may soften.
+        for chip in [f103c8(), f130c8(), f103rc()] {
+            assert_eq!(
+                usart_pins(&chip, 0x09, 0x0A),
+                None,
+                "PA9/PA10 is never a routable USART pair here"
+            );
+            for gate in [0x09u8, 0x0A] {
+                assert!(gate_capable(&chip, gate));
+                assert_eq!(
+                    check_pin_ownership(&chip, gate, PinClaim::NonGate),
+                    Err(DescriptorError::PinOwnership),
+                    "gate pin {gate:#04x} stays denied for USART use"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pb6_pb7_answers_both_i2c0_and_usart0_because_the_silicon_muxes_both() {
+        // PB6/PB7 is a genuine AF-mux conflict on F1x0: I2C0 at AF1, USART0 at AF0 (Datasheet
+        // Rev3.7 Table 2-10). Both queries answer, on their own AF, and neither invalidates the
+        // other: WHICH function a board uses is the board layout's choice, not the chip's.
+        let f130 = f130c8();
+        assert_eq!(
+            i2c_pair(&f130, 0x16, 0x17),
+            Some(0),
+            "PB6/PB7 = I2C0 at AF1"
+        );
+        assert_eq!(
+            usart_pins(&f130, 0x16, 0x17).map(|m| m.af),
+            Some(UsartAf::Af0),
+            "PB6/PB7 = USART0 at AF0"
+        );
+        // Neither is gate-capable, so the ownership backstop permits either.
+        for p in [0x16u8, 0x17] {
+            assert_eq!(check_pin_ownership(&f130, p, PinClaim::NonGate), Ok(()));
         }
     }
 
