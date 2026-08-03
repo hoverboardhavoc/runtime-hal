@@ -267,6 +267,27 @@ fn write_byte_writes_data_register_when_ready() {
 }
 
 #[test]
+fn try_write_byte_refuses_when_tbe_is_clear_and_takes_the_byte_when_set() {
+    let _g = seed_reset();
+    let u = Usart::bring_up(&chip_for(ClockPath::F10xRcc), &ref_72m(), &bench_cfg()).unwrap();
+    // STAT 0x00, TBE = BIT(7), TC = BIT(6), DATA 0x04.
+    Reg32::new(USART_BASE, 0x04).write(0);
+    Reg32::new(USART_BASE, 0x00).write(0);
+    assert!(!u.try_write_byte(0x5A), "no TBE -> the byte is refused");
+    assert_eq!(
+        Reg32::new(USART_BASE, 0x04).read() & 0xFF,
+        0,
+        "a refused byte must not reach the data register"
+    );
+
+    // TBE alone is the whole condition: TC deliberately left CLEAR (the previous byte is still
+    // shifting out on the wire), which is exactly the state the metered sender writes in.
+    Reg32::new(USART_BASE, 0x00).write(1 << 7);
+    assert!(u.try_write_byte(0x5A), "TBE -> accepted");
+    assert_eq!(Reg32::new(USART_BASE, 0x04).read() & 0xFF, 0x5A);
+}
+
+#[test]
 fn try_read_byte_returns_none_when_not_ready_and_data_when_rbne() {
     let _g = seed_reset();
     let u = Usart::bring_up(&chip_for(ClockPath::F10xRcc), &ref_72m(), &bench_cfg()).unwrap();
