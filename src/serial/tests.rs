@@ -259,6 +259,41 @@ fn polled_write_lands_bytes_in_order_and_flushes() {
     assert_eq!(s.write(&[]), Ok(0), "empty write touches nothing");
 }
 
+/// The BLE-path requirement: a write must cost a register access, not a character time. TC is left
+/// CLEAR (the previous byte is still shifting out at 9600 baud, 1.04 ms of it) and TBE is set, so a
+/// `write` that waited for transmission to complete would never return. It must hand the byte over
+/// and come straight back.
+#[test]
+fn polled_write_does_not_wait_for_transmission_to_complete() {
+    let _g = setup();
+    let mut s = polled();
+    set_stat(STAT_TBE); // TBE only: the register is free, the wire is not
+    assert_eq!(s.write(&[0x5A]), Ok(1));
+    assert_eq!(tx_byte(), 0x5A);
+}
+
+/// The other half: a run of bytes is taken only as far as the transmit register accepts it, and the
+/// count says how far. Modelled by the device rule that a STAT read clears TBE, so the register goes
+/// busy after the first byte exactly as it does on silicon; a `write` that blocked for the register
+/// to free would never return the remaining two.
+#[test]
+fn polled_write_reports_a_partial_take_rather_than_waiting_for_the_register() {
+    let _g = setup();
+    let mut s = polled();
+    mock::read_clears(USART_BASE + STAT_OFF, USART_BASE + STAT_OFF, STAT_TBE);
+    set_stat(STAT_TBE);
+    assert_eq!(
+        s.write(&[b'A', b'C', b'K']),
+        Ok(1),
+        "one byte accepted, two reported unwritten"
+    );
+    assert_eq!(tx_byte(), b'A');
+    // `write_all` is the caller that finishes the run; it loops on this, at the wire's pace.
+    set_stat(STAT_TBE);
+    assert_eq!(s.write(&[b'C', b'K']), Ok(1));
+    assert_eq!(tx_byte(), b'C');
+}
+
 #[test]
 fn polled_write_ready_reflects_tbe() {
     let _g = setup();

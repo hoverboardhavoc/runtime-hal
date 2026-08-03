@@ -19,8 +19,14 @@
 //!   calls `take_idle` and never learns ORE exists.
 //! - **`ReadReady` = "a read will make progress"** (data available, or a pending condition the read
 //!   would clear), answered from real state, consuming nothing.
-//! - **`Write` is polled-blocking per byte** (TBE/TC waits; DMA TX is out of scope), `flush` a
-//!   no-op beyond the per-byte TC wait; **`WriteReady` = TBE**.
+//! - **`Write` is polled, `WriteReady` = TBE**, and DMA TX is out of scope. The two adapters differ
+//!   in what they wait for, because their carriers do: [`SplitSerial`] waits `TBE` then `TC` per
+//!   byte (the inter-board UART at 115200, where a character time is 87 us and the send is the
+//!   whole point of the pass), so its `flush` is a no-op. [`PolledSerial`] waits `TBE` only, taking
+//!   as many bytes as the register accepts and reporting how many, so a caller can meter a frame
+//!   onto a slow wire without blocking (the 9600-baud BLE module: 1.04 ms a byte against a 4 ms
+//!   control tick); its `flush` is the real `TC` wait, and is what a caller owes before
+//!   reconfiguring or tearing down the port.
 //!
 //! The pre-slice-4 BLOCKING `UsartSerial` is superseded by [`PolledSerial`]
 //! (`specs/serial-adapters.md` D6); the [`Serial`] alias and its pin-handle `new` constructor carry
@@ -148,16 +154,41 @@ impl ReadReady for PolledSerial {
 }
 
 impl Write for PolledSerial {
-    /// Blocking polled write: send every byte via [`Usart::write_byte`] (TBE before, TC after).
+    /// Hand the peripheral as many bytes as its transmit register will take, blocking only for the
+    /// FIRST one, and return how many went in. No byte is waited out on the wire: `TBE` (the data
+    /// register is free) is the whole condition, so a caller that already saw
+    /// [`write_ready`](WriteReady::write_ready) pays microseconds per byte instead of a character
+    /// time (1.04 ms at 9600 baud, the BLE module's rate).
+    ///
+    /// The partial return is the `embedded-io` contract, not a deviation: an implementation may
+    /// write fewer bytes than asked while staying ready, and must never answer `Ok(0)` for a
+    /// non-empty buffer, which is why the first byte blocks on `TBE`. `write_all` loops on this and
+    /// so still delivers whole buffers, at the wire's pace.
+    ///
+    /// **On return the last byte is in the peripheral, not yet out on the wire.** A caller that
+    /// then reprograms the baud, splits/rejoins the port, or tears it down must
+    /// [`flush`](Write::flush) first or truncate that byte mid-frame; every AT command in the `ble`
+    /// bring-up and every frame in `link`'s serial transport does exactly that.
     fn write(&mut self, data: &[u8]) -> Result<usize, Self::Error> {
-        for &b in data {
-            self.usart.write_byte(b);
+        let Some((&first, rest)) = data.split_first() else {
+            return Ok(0);
+        };
+        // At least one byte, per the trait: this is the only wait in the whole path, and a caller
+        // that gated on `write_ready` never enters it.
+        while !self.usart.try_write_byte(first) {}
+        let mut n = 1;
+        for &b in rest {
+            if !self.usart.try_write_byte(b) {
+                break;
+            }
+            n += 1;
         }
-        Ok(data.len())
+        Ok(n)
     }
 
-    /// `write_byte` already polled TC per byte, so the line is drained; re-confirm TC so a caller
-    /// that wrote by some other route still gets a real flush.
+    /// Wait for `TC`: the last byte written has fully shifted out and the line is idle. This is
+    /// where the character-time wait lives now that [`write`](Write::write) does not pay it per
+    /// byte, and it is what a caller owes before reconfiguring or tearing down the port.
     fn flush(&mut self) -> Result<(), Self::Error> {
         while !self.usart.read_status().tx_complete {}
         Ok(())

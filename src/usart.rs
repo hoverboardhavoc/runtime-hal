@@ -579,9 +579,19 @@ impl Usart {
     }
 
     /// Write one byte, polling for the transmit buffer to drain then for transmission to complete.
+    /// On return the byte has fully shifted out, so this is the form to use before a baud change,
+    /// a mode switch, or a teardown.
     #[inline]
     pub fn write_byte(&self, byte: u8) {
         self.regs.write_byte(byte);
+    }
+
+    /// Hand one byte to the transmit data register if `TBE` says it is free, without waiting for
+    /// anything; returns whether it was accepted. See [`UsartRegs::try_write_byte`] for the full
+    /// contract, including what a caller owes before reconfiguring the port.
+    #[inline]
+    pub fn try_write_byte(&self, byte: u8) -> bool {
+        self.regs.try_write_byte(byte)
     }
 
     /// Try to read one byte without blocking, self-recovering from a receive overrun. See
@@ -630,15 +640,39 @@ impl UsartRegs {
         }
     }
 
+    /// Hand one byte to the transmit data register IF it is free, without waiting for anything.
+    /// Returns whether the byte was accepted.
+    ///
+    /// `TBE` (transmit buffer empty) is the whole condition: it means the data register has moved
+    /// its previous byte into the shift register and can take the next one. Nothing here waits for
+    /// `TC` (the previous byte finishing on the wire), so an accepted byte costs a status read and
+    /// a register write rather than a character time. The data register is the 9-bit `DATA`/`TDATA`
+    /// field; the high bits are unused at 8 data bits.
+    ///
+    /// This is the primitive a caller uses when a character time is longer than its time budget
+    /// (the 9600-baud BLE module: 1.04 ms a byte against a 4 ms control tick), metering bytes out
+    /// across many passes instead of blocking. The trade is that on return the byte is in the
+    /// peripheral, NOT yet on the wire: a caller that then disables, reconfigures, or tears the
+    /// USART down must wait for `TC` first (`read_status().tx_complete`) or the byte is truncated
+    /// mid-frame. [`write_byte`](UsartRegs::write_byte) is the blocking form that waits for it.
+    #[inline]
+    pub fn try_write_byte(&self, byte: u8) -> bool {
+        if self.stat().read() & STAT_TBE == 0 {
+            return false;
+        }
+        Reg32::new(self.base, self.model.tx_data).write(byte as u32);
+        true
+    }
+
     /// Write one byte, polling for the transmit buffer to drain then for transmission to complete.
     ///
     /// Polls `TBE` (transmit buffer empty) before writing the data register, then `TC`
-    /// (transmission complete) after, the textbook SPL polled-send loop. The data register is the
-    /// 9-bit `DATA`/`TDATA` field; the high bits are unused at 8 data bits.
+    /// (transmission complete) after, the textbook SPL polled-send loop. On return the byte has
+    /// fully shifted out on the wire, which is what makes this the form to use before a baud
+    /// change, a mode switch, or a teardown.
     #[inline]
     pub fn write_byte(&self, byte: u8) {
-        while self.stat().read() & STAT_TBE == 0 {}
-        Reg32::new(self.base, self.model.tx_data).write(byte as u32);
+        while !self.try_write_byte(byte) {}
         while self.stat().read() & STAT_TC == 0 {}
     }
 
