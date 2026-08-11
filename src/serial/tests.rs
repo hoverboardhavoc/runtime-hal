@@ -211,9 +211,10 @@ fn polled_read_absorbs_framing_and_parity_and_counts() {
 }
 
 #[test]
-fn polled_read_self_recovers_from_overrun_invisibly() {
-    // An overrun must neither surface nor count (it is fully recovered inside `try_read_byte`,
-    // D3): with a byte still ready the read returns bytes.
+fn polled_read_self_recovers_from_overrun_without_surfacing_an_error() {
+    // An overrun must never SURFACE (it is fully recovered inside `try_read_byte`, D3): with a
+    // byte still ready the read returns bytes and no `Err`. It is counted, but as an overrun, not
+    // as a line error.
     let _g = setup();
     let mut s = polled();
     seed_rx(0x9A);
@@ -222,6 +223,61 @@ fn polled_read_self_recovers_from_overrun_invisibly() {
     assert_eq!(s.read(&mut buf), Ok(4));
     assert_eq!(buf, [0x9A; 4]);
     assert_eq!(s.line_errors(), 0, "overrun is not a counted line error");
+    // The mock has no UART core, so ORERR stays set across the whole drain (silicon clears it on
+    // the family-correct write/read-pair): each of the four passes therefore observes the
+    // condition. On silicon the same drain scores 1.
+    assert_eq!(
+        s.rx_overruns(),
+        4,
+        "each observed ORE condition counts once"
+    );
+}
+
+#[test]
+fn polled_read_counts_a_recovered_overrun_apart_from_line_errors() {
+    // The BLE port's lost-byte instrument (`specs/ble.md`, the RX-loss counter): a byte lost while
+    // the consumer was away is countable, and it is countable AS AN OVERRUN, so a noisy wire
+    // cannot masquerade as a consumer that stopped reading (the OQ1 split on the polled path).
+    let _g = setup();
+    let mut s = polled();
+    seed_rx(0x9A);
+    set_stat(STAT_ORERR | STAT_RBNE);
+    let mut one = [0u8; 1];
+    assert_eq!(s.read(&mut one), Ok(1), "the surviving byte still arrives");
+    assert_eq!(one[0], 0x9A);
+    assert_eq!(s.rx_overruns(), 1, "the lost byte is counted as an overrun");
+    assert_eq!(
+        s.line_errors(),
+        0,
+        "an overrun is NOT a line error (the OQ1 split)"
+    );
+
+    // And a framing error is the mirror image: it counts as a line error, never as an overrun.
+    set_stat(STAT_FERR | STAT_RBNE);
+    assert_eq!(s.read(&mut one), Ok(0));
+    assert_eq!(s.line_errors(), 1);
+    assert_eq!(s.rx_overruns(), 1, "a wire glitch did not touch the losses");
+}
+
+#[test]
+fn polled_read_leaves_the_overrun_count_at_zero_on_a_clean_stream() {
+    // The negative control, and the half that makes a bench zero mean something: a stream read
+    // without ever falling behind must leave the instrument at zero, so a non-zero reading on
+    // silicon is evidence rather than noise.
+    let _g = setup();
+    let mut s = polled();
+    for &b in b"PING" {
+        seed_rx(b);
+        let mut one = [0u8; 1];
+        assert_eq!(s.read(&mut one), Ok(1));
+        assert_eq!(one[0], b);
+    }
+    // Including the idle poll that finds nothing.
+    set_stat(0);
+    let mut buf = [0u8; 4];
+    assert_eq!(s.read(&mut buf), Ok(0));
+    assert_eq!(s.rx_overruns(), 0, "a clean stream loses nothing");
+    assert_eq!(s.line_errors(), 0);
 }
 
 #[test]
