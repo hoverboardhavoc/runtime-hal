@@ -151,6 +151,30 @@ pub mod backend {
     /// write-back self-check test (host case B11); reset clears it.
     static FROZEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
+    /// A watched half-open address RANGE whose READS are counted, packed `(lo << 32) | hi`.
+    /// `u64::MAX` = none. A polled driver's cost is the number of times it re-reads the peripheral
+    /// while waiting, so counting reads across the whole register window is how a host test
+    /// measures how long its bounded loops spin without needing a clock. A range rather than a
+    /// single word because a driver's waits are spread over several status registers and its
+    /// recovery path polls a different one again; watching only one would under-count. Reset
+    /// clears it.
+    static WATCHED: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Reads observed inside [`WATCHED`] since the last [`mock::reset`].
+    static WATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Count a read if `addr` falls in the watched range.
+    #[inline]
+    fn note_read(addr: u32) {
+        let w = WATCHED.load(Ordering::Relaxed);
+        if w == u64::MAX {
+            return;
+        }
+        let (lo, hi) = ((w >> 32) as u32, w as u32);
+        if addr >= lo && addr < hi {
+            WATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Test-registered read side effects: `(read_addr, clear_addr, mask)` - a read at `read_addr`
     /// clears `mask` at `clear_addr` (e.g. the GD32 USART's data-register read clearing
     /// `STAT.RBNE`). Registered by the test harness that stages the device state; cleared by
@@ -209,6 +233,7 @@ pub mod backend {
     /// Read a 16-bit little-endian value from the mock register backing store.
     #[inline]
     pub fn read16(addr: u32) -> u16 {
+        note_read(addr);
         let rules = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
         let v = u16::from_le_bytes([get(&s, addr), get(&s, addr + 1)]);
@@ -231,6 +256,7 @@ pub mod backend {
     /// Read a 32-bit little-endian value from the mock register backing store.
     #[inline]
     pub fn read32(addr: u32) -> u32 {
+        note_read(addr);
         let rules = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
         let v = u32::from_le_bytes([
@@ -260,9 +286,22 @@ pub mod backend {
 
     /// Test helpers for the backing map.
     pub mod mock {
-        use super::{FROZEN, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS};
+        use super::{FROZEN, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS, WATCHED, WATCH_COUNT};
         use std::sync::atomic::Ordering;
         use std::sync::MutexGuard;
+
+        /// Count reads in `[lo, hi)` from now on, zeroing the running total. One watched range at a
+        /// time. Lets a test measure how many times a polled driver re-read its peripheral, which
+        /// is the whole cost a bounded poll loop incurs. Cleared by [`reset`].
+        pub fn watch_reads(lo: u32, hi: u32) {
+            WATCH_COUNT.store(0, Ordering::Relaxed);
+            WATCHED.store(((lo as u64) << 32) | hi as u64, Ordering::Relaxed);
+        }
+
+        /// Reads observed at the [`watch_reads`] address since it was armed.
+        pub fn read_count() -> u64 {
+            WATCH_COUNT.load(Ordering::Relaxed)
+        }
 
         /// Mark the word at `addr` as non-responsive: subsequent writes to it are dropped (reads see
         /// the prior value, default 0), modelling a register that does not stick. Cleared by
@@ -303,6 +342,8 @@ pub mod backend {
         /// any frozen (non-responsive) word and every registered device rule.
         pub fn reset() {
             FROZEN.store(u64::MAX, Ordering::Relaxed);
+            WATCHED.store(u64::MAX, Ordering::Relaxed);
+            WATCH_COUNT.store(0, Ordering::Relaxed);
             READ_CLEARS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

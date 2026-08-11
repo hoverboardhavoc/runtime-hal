@@ -69,8 +69,11 @@
 //!   SCL stretched); clear ACKEN; read N-2 (the last byte then arrives NACKed); wait BTC again
 //!   (stretched); STOP; read N-1; read N.
 //!
-//! Every poll is bounded ([`I2C_TIMEOUT`]) so a missing/stuck device cannot hang (the F130
-//! hang-if-done-wrong class), and a fresh transfer first waits (bounded) for I2CBSY to clear.
+//! Every poll is bounded so a missing/stuck device cannot hang (the F130 hang-if-done-wrong
+//! class), and a fresh transfer first waits (bounded) for I2CBSY to clear. The bound is scoped to
+//! a whole bus acquisition and derived from the core clock, so it is a WALL-CLOCK guarantee
+//! ([`worst_case_block_us`]) rather than an iteration count whose duration happens to fall out of
+//! codegen; see "the polled-transfer time budget" below for why the caller needs it in those terms.
 //!
 //! **Error recovery (the persistence half of the same silicon finding):** the sticky STAT0 error
 //! flags (BERR/LOSTARB/AERR/OUERR, all rc_w0) are cleared only by software, and a transfer
@@ -84,6 +87,8 @@
 //!
 //! The GD/ST register naming stays on this side of the trait boundary (SPEC.md): what crosses into
 //! `embedded-hal` `i2c::I2c` is bytes, a 7-bit address, and an [`I2cError`].
+
+use core::cell::Cell;
 
 use embedded_hal::i2c::{self, Operation, SevenBitAddress};
 
@@ -151,17 +156,104 @@ const STAT1_I2CBSY: u32 = 1 << 1;
 const I2CCLK_MAX: u32 = 0x48;
 const I2CCLK_MIN: u32 = 0x02;
 
-/// Bounded poll budget for a single status-flag wait. The bench probe used 40000 loops at 8 MHz;
-/// this is the same idea: generous enough never to false-time on a working 100/400 kHz byte
-/// timing, but always escaping a dead bus. It counts loop iterations, not cycles, so it is
-/// clock-independent.
-pub const I2C_TIMEOUT: u32 = 100_000;
+// --- the polled-transfer time budget ----------------------------------------------------------
+//
+// The budget is scoped to a whole BUS ACQUISITION, not to one flag wait, and it is derived from
+// the core clock so it means something in microseconds. Both of those are deliberate.
+//
+// Why microseconds at all: the consumer is a balance control task whose torque word is watched by
+// a commutation ISR that floats all three motor phases if the task goes quiet too long. A polled
+// transfer that spins past that window cuts motor torque on a machine trying to stay upright, so
+// the driver's failure cost is a real-time property, not a stylistic one. A budget counted in raw
+// loop iterations is clock-independent in CYCLES but not in TIME, and time is what the coast is
+// measured in: the previous fixed 100_000-iteration budget worked out at 22 ms at 72 MHz, already
+// past a 16 ms coast, while being only ~2 ms at 8 MHz. Deriving the iteration count from the core
+// clock makes the wall-clock bound the constant and the iteration count the derived quantity,
+// which is the way round the caller can actually reason about.
+//
+// Why per acquisition rather than per wait: a per-wait budget cannot bound a transfer. It detects
+// "no progress", but a slave that clock-stretches each byte to just inside a per-wait limit makes
+// PROGRESS on every byte while the transfer as a whole runs arbitrarily long, and a 14-byte burst
+// has 16 waits in it. One countdown shared by every wait in the transaction bounds the total by
+// construction, with no case analysis about which waits can stack.
+//
+// Why not a DWT cycle-counter deadline, which would be exact: `wait_flag` would then depend on
+// DWT CYCCNT being enabled, and a caller that had not enabled it reads a frozen counter and never
+// times out. A safety bound whose failure mode is "spins forever, silently" is worse than one
+// whose failure mode is a documented conversion constant. The iteration countdown always runs.
 
-/// Bounded poll budget for the fresh-transfer bus-idle wait (I2CBSY clear). Much shorter than
-/// [`I2C_TIMEOUT`]: a healthy bus goes idle within a couple of byte times of the previous STOP
-/// (~200 us at 100 kHz), and a stuck bus should fail fast (~200 us of polling at 72 MHz) rather
-/// than eat a control tick's budget on every call while stuck.
-const BUSY_TIMEOUT: u32 = I2C_TIMEOUT / 10;
+/// Core cycles one [`I2c::wait_flag`] poll iteration costs, as an UPPER bound.
+///
+/// This is the divisor that turns a microsecond target into an iteration count, so the UPPER bound
+/// is the correct end of the range to take: over-stating it under-states the count and the real
+/// block finishes EARLY, while under-stating it would let the real block overrun the target.
+///
+/// Measured, not guessed. Disassembled from the consuming firmware's release image, the loop is an
+/// APB load of `STAT0`, five shift/branch flag tests, a load and store of the budget through
+/// memory, a zero test and a taken back-branch: 21 core cycles on Cortex-M3 before any bus latency.
+/// On top of that sit the AHB-to-APB1 bridge stall on the `STAT0` load (I2C is on APB1, half the
+/// core clock on the reference tree) and flash wait states on the loop fetch, neither of which is
+/// exactly countable from the listing, hence a bound rather than a figure.
+///
+/// The safety argument does NOT rest on 32 being right. What has to hold is that the real block
+/// stays inside the consumer's coast, and with the budget this sizes that survives a real loop of
+/// up to roughly 39 cycles, 1.85x the disassembled core cost. So the bound would have to be wrong
+/// by most of a factor of two before the guarantee it underwrites is affected.
+pub const POLL_CYCLES: u32 = 32;
+
+/// Wall-clock ceiling, in microseconds, on the polling one bus acquisition may do.
+///
+/// Sized between the two things that squeeze it. Below: a healthy 14-byte IMU burst is ~0.4 ms at
+/// 400 kHz and ~1.7 ms at 100 kHz, so 6 ms leaves roughly 15x and 3.5x of headroom against
+/// false-timing a working bus. Above: [`worst_case_block_us`] must stay well inside the consumer's
+/// coast, and at 6 ms it comes out at 6.6 ms against a 16 ms window. Those two pincers are why it
+/// is not simply set lower: a smaller number would fail healthy 100 kHz transfers.
+///
+/// This is a bound for SHORT sensor transactions, which is all this driver has callers for (a
+/// 14-byte burst and a 1-byte `WHO_AM_I`). A caller wanting a long transfer on a slow bus (a 64-byte
+/// read at 100 kHz is already 5.8 ms of legitimate wire time) has to split it across transactions
+/// rather than raise this number, because raising it spends the motor coast.
+pub const TXN_BUDGET_US: u32 = 6_000;
+
+/// Poll iterations that fit in [`TXN_BUDGET_US`] at `core_hz`: the per-acquisition budget.
+///
+/// Saturates at 1 so a nonsensically slow `core_hz` still terminates.
+pub const fn poll_budget(core_hz: u32) -> u32 {
+    let n = (core_hz / 1_000_000) * TXN_BUDGET_US / POLL_CYCLES;
+    if n == 0 {
+        1
+    } else {
+        n
+    }
+}
+
+/// The bus-idle sub-cap: a tenth of [`poll_budget`]. A healthy bus goes idle within a couple of
+/// byte times of the previous STOP, so a fresh transfer that finds the line still held should give
+/// up quickly and recover rather than spend the whole acquisition budget before it has even
+/// started. Also the bound on [`I2c::recover`]'s own STOP wait, which runs AFTER the acquisition
+/// budget may already be exhausted and so cannot draw from it.
+pub const fn idle_budget(core_hz: u32) -> u32 {
+    let n = poll_budget(core_hz) / 10;
+    if n == 0 {
+        1
+    } else {
+        n
+    }
+}
+
+/// Worst-case microseconds a single failing bus acquisition can block the caller.
+///
+/// The acquisition budget, plus the recovery that runs on the way out (recovery has its own budget
+/// because it must work after the acquisition budget is spent). Const so a caller with a real-time
+/// deadline can `const_assert` its own coast against it and fail the BUILD if either moves.
+pub const fn worst_case_block_us(core_hz: u32) -> u32 {
+    let polls = poll_budget(core_hz) + idle_budget(core_hz);
+    // A sub-MHz core divides to zero: report the bound as unbounded rather than dividing by it.
+    match (polls * POLL_CYCLES).checked_div(core_hz / 1_000_000) {
+        Some(us) => us,
+        None => u32::MAX,
+    }
+}
 
 /// Fast-mode duty cycle (open item I2C-1). `Two` (Tlow/Thigh = 2, DTCY = 0) is the default the IMU
 /// reference and the bench probe use; `SixteenNine` (16/9, DTCY = 1) is expressible for callers
@@ -280,11 +372,25 @@ pub fn i2c_input_clock(clock: &ClockConfig) -> u32 {
 /// can reprogram the block without re-deriving the clock tree. The polled transfer primitives and
 /// the `embedded-hal` `i2c::I2c` impl hang off this (DECISIONS.md #4: resolve once into a
 /// concrete handle).
-#[derive(Debug, Clone, Copy)]
+///
+/// NOT `Copy`/`Clone`: the handle now carries the live poll budget of the acquisition in flight, so
+/// a duplicate would be a second handle to the same peripheral with its own idea of how much of the
+/// control loop's time budget had been spent. It was only ever `Copy` because nothing had made it
+/// stateful yet; every caller already moves it or borrows it mutably.
+#[derive(Debug)]
 pub struct I2c {
     base: u32,
     /// The bring-up timing (CTL1 I2CCLK / CKCFG / RT), reused by [`I2c::recover`]'s SRESET reinit.
     timing: I2cTiming,
+    /// Poll iterations one bus acquisition may spend ([`poll_budget`] at the bring-up core clock),
+    /// and a tenth of it for the bus-idle wait and for recovery ([`idle_budget`]). Resolved once at
+    /// bring-up because the clock is known there and nowhere else in this module.
+    poll_budget: u32,
+    idle_budget: u32,
+    /// Budget left in the CURRENT bus acquisition, shared by every wait in it. Reset by the
+    /// transfer that acquires the bus (`fresh`); a repeated-START continuation keeps counting down
+    /// the same one, so a whole `write_read` is bounded, not each of its two halves separately.
+    txn_left: Cell<u32>,
 }
 
 /// The master own-address value programmed into `SADDR0` (the bench probe's `0x24`). As a
@@ -421,7 +527,13 @@ impl I2c {
         // 4. Timing + mode + enable + ACK.
         let pclk1 = i2c_input_clock(clock);
         let timing = timing_for(pclk1, mode.speed_hz, mode.duty);
-        let dev = I2c { base, timing };
+        let dev = I2c {
+            base,
+            timing,
+            poll_budget: poll_budget(clock.sysclk_hz),
+            idle_budget: idle_budget(clock.sysclk_hz),
+            txn_left: Cell::new(0),
+        };
         dev.configure_timing(timing);
         dev.configure_mode_addr(MASTER_OWN_ADDR);
         // i2c_enable: set I2CEN.
@@ -592,7 +704,6 @@ impl I2c {
     /// names whether an AERR seen here is an address NACK or a data NACK (open item I2C-2). Returns
     /// the STAT0 snapshot that satisfied `flag` on success.
     fn wait_flag(&self, flag: u32, nack_src: NackKind) -> Result<u32, I2cError> {
-        let mut budget = I2C_TIMEOUT;
         loop {
             let s = self.stat0().read();
             if s & flag != 0 {
@@ -615,11 +726,28 @@ impl I2c {
             if s & STAT0_OUERR != 0 {
                 return Err(I2cError::Overrun);
             }
-            budget -= 1;
-            if budget == 0 {
+            if !self.spend() {
                 return Err(I2cError::Timeout);
             }
         }
+    }
+
+    /// Charge one poll iteration to the current acquisition's budget. `false` once it is spent.
+    #[inline]
+    fn spend(&self) -> bool {
+        let left = self.txn_left.get();
+        if left == 0 {
+            return false;
+        }
+        self.txn_left.set(left - 1);
+        true
+    }
+
+    /// Start a fresh bus acquisition's budget. Called by the transfer that ACQUIRES the bus; a
+    /// repeated-START continuation deliberately does not call it.
+    #[inline]
+    fn begin_txn(&self) {
+        self.txn_left.set(self.poll_budget);
     }
 
     // --- error recovery (the persistence half of the 2026-07-18 silicon finding) --------------
@@ -629,13 +757,15 @@ impl I2c {
     /// START/STOP-pending deadlock) and re-check; a bus still busy after that is a genuinely
     /// held line, surfaced as [`I2cError::Bus`].
     fn wait_bus_idle(&self) -> Result<(), I2cError> {
-        let mut budget = BUSY_TIMEOUT;
+        let mut budget = self.idle_budget;
         loop {
             if self.stat1().read() & STAT1_I2CBSY == 0 {
                 return Ok(());
             }
             budget -= 1;
-            if budget == 0 {
+            // The sub-cap AND the acquisition budget: whichever runs out first ends the wait, so
+            // this wait can never spend more than a tenth of the acquisition on a held line.
+            if budget == 0 || !self.spend() {
                 self.recover();
                 if self.stat1().read() & STAT1_I2CBSY == 0 {
                     return Ok(());
@@ -663,7 +793,9 @@ impl I2c {
         // 2. Release the bus if this side still drives it.
         if self.stat1().read() & STAT1_MASTER != 0 {
             self.stop_on_bus();
-            let mut budget = BUSY_TIMEOUT;
+            // Recovery's OWN budget, not the acquisition's: recovery runs precisely when that one
+            // is spent, so drawing from it would make recovery a no-op exactly when it is needed.
+            let mut budget = self.idle_budget;
             while self.ctl0().read() & CTL0_STOP != 0 {
                 budget -= 1;
                 if budget == 0 {
@@ -716,6 +848,7 @@ impl I2c {
         stop: bool,
     ) -> Result<(), I2cError> {
         if fresh {
+            self.begin_txn();
             self.wait_bus_idle()?; // recovers internally on exhaustion
         }
         let r = self.write_inner(addr7, bytes, stop);
@@ -762,6 +895,7 @@ impl I2c {
             return Ok(());
         }
         if fresh {
+            self.begin_txn();
             self.wait_bus_idle()?; // recovers internally on exhaustion
         }
         let r = self.read_inner(addr7, buf);

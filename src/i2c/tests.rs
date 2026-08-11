@@ -774,3 +774,240 @@ fn bus_clear_generates_a_trailing_stop_after_recovery() {
         "STOP = SDA low->high while SCL is high: {ev:?}"
     );
 }
+
+// --- the control-loop blocking bound (the 16 ms demand-stale coast) ---------------------------
+//
+// The consumer of this driver is a 250 Hz balance control task whose torque word is watched by a
+// 16 kHz commutation ISR: if the task does not rewrite demand within 256 periods (16 ms) the ISR
+// floats all three motor phases. So a single polled I2C transaction that spins past 16 ms cuts
+// motor torque on a machine that is trying to stay upright. These cases pin that bound against the
+// driver's real polled state machine, driven from the mock register space with a bus that never
+// answers.
+//
+// The cost model, because the poll budget is counted in loop ITERATIONS and the invariant is in
+// MICROSECONDS. One `wait_flag` iteration, disassembled from the consuming firmware's release
+// image, is an APB `ldr` of STAT0, five shift/branch flag tests, a load and store of the budget
+// through memory, a zero test and a taken back-branch: 21 core cycles on Cortex-M3 before the
+// AHB-to-APB1 bridge latency on the STAT0 load and any flash wait states. So 21 is the FLOOR: real
+// silicon is slower, never faster.
+//
+// Converting a measured poll count with the FLOOR under-states the block, and that is deliberate.
+// These cases assert "the block stays below the coast", so under-stating the block makes the
+// assertion EASIER to pass; a case that passes anyway has passed on the driver's behaviour rather
+// than on a flattering constant. The driver itself sizes its budget with the upper bound
+// (`POLL_CYCLES`), the opposite end, for the same reason in reverse.
+
+/// Core cycles per `wait_flag` poll iteration, the FLOOR (see the cost model above).
+const POLL_CYCLES_FLOOR: u64 = 21;
+/// The core clock both boards run (`ClockConfig::REFERENCE_72M_IRC8M`).
+const CORE_MHZ: u64 = 72;
+/// `motor::DEMAND_STALE_PERIODS` (256) at 16 kHz: the window after which the phases float.
+const COAST_US: u64 = 16_000;
+
+/// Microseconds a measured poll count costs at 72 MHz (floor; see the cost model above).
+fn poll_us(polls: u64) -> u64 {
+    polls * POLL_CYCLES_FLOOR / CORE_MHZ
+}
+
+/// Arm the poll counter over the WHOLE I2C register window (CTL0 through RT) and return the
+/// microseconds the closure's polling cost. The window rather than `STAT0` alone because the
+/// transfer waits poll `STAT0` and `STAT1` while the recovery path polls `CTL0`, and recovery is
+/// part of what a failing transfer makes the caller wait for.
+fn measure_block_us(body: impl FnOnce()) -> u64 {
+    mock::watch_reads(I2C_BASE + CTL0, I2C_BASE + RT + 4);
+    body();
+    poll_us(mock::read_count())
+}
+
+/// The hazard, exactly: the 14-byte cyclic IMU burst against a bus that never answers and never
+/// raises an error flag either (SCL held low by a wedged slave, so the peripheral makes no
+/// progress and no AERR/BERR is ever set). A device that is merely ABSENT is the cheap case: it
+/// NACKs and the address-phase poll returns on AERR. This is the expensive one.
+#[test]
+fn a_dead_bus_imu_burst_cannot_block_past_the_motor_coast() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    let mut buf = [0u8; 14];
+    let mut r = Ok(());
+    let us = measure_block_us(|| r = dev.write_read(IMU, &[0x3B], &mut buf));
+    assert_eq!(
+        r,
+        Err(I2cError::Timeout),
+        "a bus that never answers times out"
+    );
+    assert!(
+        us < COAST_US,
+        "one IMU burst on a dead bus blocked {us} us, past the {COAST_US} us demand-stale coast \
+         (all three phases float)"
+    );
+}
+
+/// The same bound for a transaction that NAKs partway through the burst rather than at the
+/// address: the register-pointer write is answered, then the slave stops driving. The read phase's
+/// per-byte poll is the one that has to give up.
+#[test]
+fn a_burst_that_stalls_after_the_address_cannot_block_past_the_motor_coast() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    // The write phase's flags are all present, so the register-pointer write completes; the read
+    // phase then waits on RBNE, which is NOT seeded, and no error flag ever appears.
+    w(STAT0, STAT0_SBSEND | STAT0_ADDSEND | STAT0_BTC | STAT0_TBE);
+    let mut buf = [0u8; 14];
+    let mut r = Ok(());
+    let us = measure_block_us(|| r = dev.write_read(IMU, &[0x3B], &mut buf));
+    assert_eq!(r, Err(I2cError::Timeout), "a stalled burst times out");
+    assert!(
+        us < COAST_US,
+        "an IMU burst stalling mid-read blocked {us} us, past the {COAST_US} us coast"
+    );
+}
+
+/// A bus held busy from the start (I2CBSY set, the wedged-slave case the fresh-transfer idle wait
+/// exists for) must also fail inside the coast, including the recovery it runs on the way out.
+#[test]
+fn a_bus_stuck_busy_cannot_block_past_the_motor_coast() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    w(STAT1, STAT1_I2CBSY);
+    let mut buf = [0u8; 14];
+    let mut r = Ok(());
+    let us = measure_block_us(|| r = dev.write_read(IMU, &[0x3B], &mut buf));
+    assert!(r.is_err(), "a bus stuck busy cannot start a fresh transfer");
+    assert!(
+        us < COAST_US,
+        "a stuck-busy IMU burst blocked {us} us, past the {COAST_US} us coast"
+    );
+}
+
+/// Five consecutive dead-bus reads is what the orchestrator's retry breaker allows before the
+/// `imu_loss` fault latches (`IMU_LOSS_THRESHOLD`), so every one of those passes is a separate
+/// control pass and each must independently stay inside the coast. Pins that the bound is a
+/// property of each pass and does not decay across a run.
+#[test]
+fn every_pass_of_the_pre_breaker_run_stays_inside_the_coast() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    let mut buf = [0u8; 14];
+    for pass in 0..5 {
+        let mut r = Ok(());
+        let us = measure_block_us(|| r = dev.write_read(IMU, &[0x3B], &mut buf));
+        assert!(r.is_err(), "pass {pass} should fail on a dead bus");
+        assert!(
+            us < COAST_US,
+            "pass {pass} blocked {us} us, past the {COAST_US} us coast"
+        );
+    }
+}
+
+/// The trap the metered-TX round hit: a timeout that leaves the peripheral mid-transaction is
+/// WORSE than the block, because the next read then fails too. After a timed-out burst the block
+/// must be left with no pending START/STOP request, no sticky error flag, the peripheral enabled,
+/// its bring-up timing intact, ACK re-armed and POAP clear.
+#[test]
+fn a_timed_out_burst_leaves_the_block_recoverable() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    let timing = dev.timing;
+    let mut buf = [0u8; 14];
+    assert_eq!(
+        dev.write_read(IMU, &[0x3B], &mut buf),
+        Err(I2cError::Timeout)
+    );
+
+    let ctl0 = r(CTL0);
+    assert_eq!(ctl0 & CTL0_START, 0, "no START left pending");
+    assert_eq!(ctl0 & CTL0_STOP, 0, "no STOP left pending");
+    assert_eq!(ctl0 & CTL0_I2CEN, CTL0_I2CEN, "peripheral left enabled");
+    assert_eq!(
+        ctl0 & CTL0_ACKEN,
+        CTL0_ACKEN,
+        "ACK re-armed for the next transfer"
+    );
+    assert_eq!(
+        ctl0 & CTL0_POAP,
+        0,
+        "POAP cleared (the N=2 receive posture)"
+    );
+    assert_eq!(r(STAT0) & STAT0_ERRORS, 0, "sticky error flags cleared");
+    assert_eq!(
+        r(CKCFG),
+        timing.ckcfg,
+        "bring-up timing reprogrammed after SRESET"
+    );
+    assert_eq!(
+        r(CTL1) & 0x7F,
+        timing.i2cclk,
+        "peripheral-clock field reprogrammed"
+    );
+    assert_eq!(r(RT) & 0x7F, timing.rt, "rise time reprogrammed");
+}
+
+/// The other half of recoverability: the NEXT read on a bus that has come back must succeed. A
+/// half-finished timeout would fail this even with the register state looking clean.
+#[test]
+fn a_read_after_a_timed_out_burst_succeeds_once_the_bus_returns() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    let mut buf = [0u8; 14];
+    assert_eq!(
+        dev.write_read(IMU, &[0x3B], &mut buf),
+        Err(I2cError::Timeout)
+    );
+
+    // The slave comes back: every polled flag answers again.
+    seed_stat0_all_ready();
+    w(STAT1, 0);
+    dev.write_read(IMU, &[0x3B], &mut buf)
+        .expect("the burst after a timeout must succeed once the bus answers");
+}
+
+/// The most expensive shape there is: the transfer times out AND the recovery on the way out has
+/// to spin too, because this side is still master and the STOP it requests never completes (SCL
+/// held low). That is the acquisition budget followed by the recovery budget, the two summands of
+/// [`worst_case_block_us`], and it still has to fit inside the coast.
+#[test]
+fn a_timeout_whose_recovery_also_spins_stays_inside_the_coast() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    // Master, and the bus never goes idle: recovery issues a STOP and then waits for the request
+    // to clear, which it never does (the mock keeps whatever CTL0 bits were written).
+    w(STAT1, STAT1_MASTER | STAT1_I2CBSY);
+    let mut buf = [0u8; 14];
+    let mut r = Ok(());
+    let us = measure_block_us(|| r = dev.write_read(IMU, &[0x3B], &mut buf));
+    assert!(r.is_err(), "a wedged bus cannot complete a burst");
+    assert!(
+        us < COAST_US,
+        "a timeout with a spinning recovery blocked {us} us, past the {COAST_US} us coast"
+    );
+}
+
+/// The measured block against the arithmetic a caller const-asserts on. The measurement converts
+/// polls with the 16-cycle FLOOR and [`worst_case_block_us`] uses the 24-cycle upper bound, so the
+/// measured figure must land at or below the published one, and the published one inside the coast.
+/// This is the test that ties what the driver actually does to the number it advertises.
+#[test]
+fn the_measured_dead_bus_block_agrees_with_the_published_bound() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    let mut buf = [0u8; 14];
+    let mut r = Ok(());
+    let measured = measure_block_us(|| r = dev.write_read(IMU, &[0x3B], &mut buf));
+    assert_eq!(r, Err(I2cError::Timeout));
+
+    let published = worst_case_block_us(72_000_000) as u64;
+    assert!(
+        measured <= published,
+        "measured {measured} us exceeds the published worst case {published} us"
+    );
+    assert!(
+        published < COAST_US,
+        "published worst case {published} us is not inside the {COAST_US} us coast"
+    );
+    // The bound is worth having only if it is well clear of the coast rather than just under it:
+    // a failing read must cost at most a couple of missed control ticks, not most of the window.
+    assert!(
+        published * 2 < COAST_US,
+        "published worst case {published} us leaves under 2x margin on the {COAST_US} us coast"
+    );
+}

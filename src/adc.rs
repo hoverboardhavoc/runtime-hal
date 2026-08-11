@@ -178,7 +178,7 @@ const SAMPT_FIELD: u32 = 0x7;
 /// Counts loop iterations, not cycles, so it is clock-independent; generous enough never to
 /// false-time a working calibration / conversion at any representative ADC clock, but always
 /// escaping a stuck bit (the F130 hang-if-done-wrong class, which TESTING.md flags specifically for
-/// the calibration sequence). Mirrors [`crate::i2c::I2C_TIMEOUT`] / [`crate::spi::SPI_TIMEOUT`].
+/// the calibration sequence). Mirrors [`crate::i2c::TXN_BUDGET_US`] / [`crate::spi::SPI_TIMEOUT`].
 pub const ADC_TIMEOUT: u32 = 100_000;
 
 /// True for an internal channel (16 = temperature, 17 = VREFINT): the two channels the `TSVREN`
