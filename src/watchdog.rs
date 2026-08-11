@@ -105,7 +105,7 @@ pub const LSI_HZ: u32 = 40_000;
 /// Bounded poll budget for the PSC/RLD update-busy flags in [`FreeWatchdog::start`]. Counts loop
 /// iterations, not cycles, so it is clock-independent; generous enough never to false-time a working
 /// update at any representative LSI clock, but always escaping a stuck busy bit. Mirrors
-/// [`crate::adc::ADC_TIMEOUT`] / [`crate::i2c::I2C_TIMEOUT`].
+/// [`crate::adc::ADC_TIMEOUT`] / [`crate::i2c::TXN_BUDGET_US`].
 pub const FWDGT_TIMEOUT: u32 = 100_000;
 
 /// Map a prescaler DIVISOR (4, 8, 16, .. 256) to its PSC register code (0..=6). A divisor that is

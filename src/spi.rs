@@ -112,7 +112,7 @@ const STAT_RXORERR: u32 = 1 << 6;
 /// Bounded poll budget for a single status-flag wait (TBE / RBNE). Counts loop iterations, not
 /// cycles, so it is clock-independent; generous enough never to false-time a working byte timing
 /// at any representative SPI clock, but always escaping a dead bus (the F130 hang-if-done-wrong
-/// class). Mirrors [`crate::i2c::I2C_TIMEOUT`].
+/// class). Mirrors [`crate::i2c::TXN_BUDGET_US`].
 pub const SPI_TIMEOUT: u32 = 100_000;
 
 /// SPI frame size: 8 or 16 bit (the SPL `SPI_FRAMESIZE_8BIT` / `SPI_FRAMESIZE_16BIT`).
