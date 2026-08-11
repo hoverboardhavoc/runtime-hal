@@ -14,9 +14,15 @@
 //!   (`link::SerialTransport` and `ble` both do).
 //! - **Errors are owned below the API line; `Error = Infallible`.** The IDLE latch is consumed
 //!   internally (framing is the L2 framer's job; IDLE is never a byte-stream boundary), and line
-//!   errors / overruns are cleared-and-absorbed by the paths underneath (which never latch), with a
-//!   saturating `line_errors` diagnostic counter outside the `embedded-io` traits. A consumer never
-//!   calls `take_idle` and never learns ORE exists.
+//!   errors / overruns are cleared-and-absorbed by the paths underneath (which never latch), with
+//!   saturating diagnostic counters outside the `embedded-io` traits. A consumer never calls
+//!   `take_idle` and never learns ORE exists.
+//! - **Absorbed is not unmeasured, and the two causes stay apart (the OQ1 split).** Both adapters
+//!   count a WIRE disturbance (framing / parity / noise) separately from a LOST-BYTE condition (the
+//!   consumer fell behind): `line_errors` vs [`SplitSerial::lap_overruns`] on the DMA/interrupt
+//!   shape, `line_errors` vs [`PolledSerial::rx_overruns`] on the polled shape. Keeping them apart
+//!   is what lets a bench read attribute a loss: a noisy wire must never be able to masquerade as a
+//!   consumer that stopped reading for too long, which is the whole question on the BLE port.
 //! - **`ReadReady` = "a read will make progress"** (data available, or a pending condition the read
 //!   would clear), answered from real state, consuming nothing.
 //! - **`Write` is polled, `WriteReady` = TBE**, and DMA TX is out of scope. The two adapters differ
@@ -59,6 +65,7 @@ pub type Serial = PolledSerial;
 pub struct PolledSerial {
     usart: Usart,
     line_errors: u16,
+    rx_overruns: u16,
 }
 
 impl PolledSerial {
@@ -92,6 +99,7 @@ impl PolledSerial {
         Self {
             usart,
             line_errors: 0,
+            rx_overruns: 0,
         }
     }
 
@@ -103,15 +111,33 @@ impl PolledSerial {
         self.usart
     }
 
-    /// Diagnostic: line errors (framing / parity) absorbed by `read` so far, saturating. Overrun
-    /// recovery happens inside [`Usart::try_read_byte`] and never surfaces at all (it is not
-    /// separately countable here). Unlike [`SplitSerial`] this needs no line-error / lap split (the
-    /// OQ1 split): the polled path has no DMA ring, so there is no lap/buffer-overrun cause to conflate;
-    /// this counter is already purely line errors. Outside the `embedded-io` traits by design
+    /// Diagnostic: WIRE disturbances (framing / parity) absorbed by `read` so far, saturating.
+    /// Counted SEPARATELY from [`rx_overruns`](Self::rx_overruns) (a lost-byte condition), the OQ1
+    /// split as it applies to the polled path. Outside the `embedded-io` traits by design
     /// (`specs/serial-adapters.md` D3).
     #[inline]
     pub fn line_errors(&self) -> u16 {
         self.line_errors
+    }
+
+    /// Diagnostic: receive OVERRUN conditions absorbed by `read` so far, saturating: the polled
+    /// path's lost-byte counter, and the polled half of the OQ1 split that [`SplitSerial`] answers
+    /// with `lap_overruns`.
+    ///
+    /// A one-byte receive register IS the polled path's buffer, so an overrun means exactly what a
+    /// lap means on the DMA ring: the consumer did not come back in time and at least one inbound
+    /// byte is gone. The recovery itself stays silent and automatic ([`Usart::try_read_byte`]
+    /// clears ORE and keeps reading, so RX can never strand), but silent is not the same as
+    /// unmeasured: this counts the conditions the recovery absorbed.
+    ///
+    /// One condition, not one byte. ORE latches on the first byte lost and stays set until cleared,
+    /// so an overrun observed across a long blind window scores 1 however many characters fell in
+    /// it. It is a yes/no answer about whether the consumer's absence cost bytes, and how often,
+    /// which is the question a control loop that occupies the CPU for longer than a character time
+    /// raises.
+    #[inline]
+    pub fn rx_overruns(&self) -> u16 {
+        self.rx_overruns
     }
 }
 
@@ -124,10 +150,19 @@ impl Read for PolledSerial {
     /// clears an overrun the family-correct way), stopping at the first empty poll; `Ok(0)` when
     /// nothing is available. A line error (framing/parity) is absorbed: the suspect byte is
     /// dropped, the counter ticks, and this read returns what it already has (`try_read_byte`
-    /// cleared the flag, so the next read continues cleanly).
+    /// cleared the flag, so the next read continues cleanly). An overrun is absorbed too, and
+    /// ticks [`rx_overruns`](PolledSerial::rx_overruns) instead: the drain continues either way.
     fn read(&mut self, out: &mut [u8]) -> Result<usize, Self::Error> {
         let mut n = 0;
         while n < out.len() {
+            // Observe ORE BEFORE `try_read_byte` recovers it. The recovery is deliberately
+            // invisible to the caller (it must never surface as `Err` or strand RX), so this
+            // status read is the ONLY point at which the lost byte is still evidence. It costs one
+            // extra register read per drained byte on a polled port, which is the port that runs
+            // at 9600 baud.
+            if self.usart.read_status().overrun {
+                self.rx_overruns = self.rx_overruns.saturating_add(1);
+            }
             match self.usart.try_read_byte() {
                 Ok(Some(b)) => {
                     out[n] = b;
