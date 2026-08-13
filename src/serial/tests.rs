@@ -280,6 +280,126 @@ fn polled_read_leaves_the_overrun_count_at_zero_on_a_clean_stream() {
     assert_eq!(s.line_errors(), 0);
 }
 
+/// How many 9600 8N1 characters land in a caller-away window of `us` microseconds.
+///
+/// The character time is 10 bit-times at 9600 baud = 1,041.7 us. The windows are measured, not
+/// assumed: the 250 Hz control callback is DWT-bracketed at 1,011 us on the F103 and 1,399 us on an
+/// IMU-equipped F130, and the bounded wedged-I2C path at 3,941 us worst case
+/// (`hoverboard-firmware/specs/bench-evidence/2026-08-02/wide-division/RECORD.md`).
+fn chars_in_window(us: u32) -> usize {
+    // Tenths of a microsecond, so the 1,041.7 us character time stays exact in integer math.
+    (us as usize * 10) / 10_417 + 1
+}
+
+/// A polled receiver LOSES characters across a caller-away window: its whole buffer is the one-byte
+/// receive register, so the second character of the window is gone before the caller returns.
+///
+/// This is the defect side of the BLE port's carrier choice, stated as a property rather than as a
+/// register anecdote. The window used is the measured F130 control callback (1,399 us), which is
+/// LONGER than one character time, so the port is structurally deaf once per control tick.
+#[test]
+fn polled_loses_characters_across_a_caller_away_window() {
+    let _g = setup();
+    // The device behaviour the polled reader depends on: reading RX_DATA clears RBNE.
+    mock::read_clears(USART_BASE + DATA_OFF, USART_BASE + STAT_OFF, STAT_RBNE);
+    let mut s = polled();
+
+    let n = chars_in_window(1_399);
+    assert_eq!(n, 2, "a 1,399 us window holds 2 characters at 9600 8N1");
+
+    // The caller is away for the whole window: characters arrive with no intervening read.
+    let sent: Vec<u8> = (0..n).map(|i| b'A' + i as u8).collect();
+    for &b in &sent {
+        s.inject_rx_byte(b);
+    }
+
+    // Drain everything the port has.
+    let mut got = vec![];
+    let mut buf = [0u8; 16];
+    for _ in 0..4 {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(k) => got.extend_from_slice(&buf[..k]),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        got.len() < sent.len(),
+        "the one-byte register cannot hold a whole away window (got {got:?})"
+    );
+    assert_eq!(s.rx_overruns(), 1, "and the loss is counted as an overrun");
+    assert_eq!(s.line_errors(), 0, "a loss is not a wire glitch (OQ1)");
+
+    // On THIS family the window costs both characters, not one. The bench chip here is F10x, whose
+    // overrun clear is the STAT-then-data read PAIR (`UsartRegs::clear_line_errors`): completing the
+    // pair reads the data register and discards the byte, and that same read clears `RBNE`, so the
+    // character that was still sitting in the register goes with the one the wire lost. On F1x0 the
+    // clear is an `INTC` write instead, so the resident character survives and the window costs one.
+    // Either way the caller-away window loses data, which is the property; the family only decides
+    // how much.
+    assert_eq!(
+        got, b"",
+        "F10x: the overrun clear discards the resident byte"
+    );
+}
+
+/// A DMA-ring receiver DELIVERS every character of a caller-away window: the buffer is `len` bytes
+/// of RAM the DMA fills with no CPU involvement, so the caller's absence costs nothing.
+///
+/// The fix side of the same property, over the two measured windows: the 1,399 us control callback
+/// and the 3,941 us worst-case wedged-I2C path (about four characters, which is the run of
+/// consecutive frame losses that zeroes a 20 Hz drive demand).
+#[test]
+fn ring_delivers_every_character_of_a_caller_away_window() {
+    for window_us in [1_399u32, 3_941] {
+        let _g = setup();
+        let (mut s, _ch, _ptr) = split_ring(64);
+
+        let n = chars_in_window(window_us);
+        let sent: Vec<u8> = (0..n).map(|i| b'a' + i as u8).collect();
+        for &b in &sent {
+            s.inject_rx_byte(b);
+        }
+
+        let mut got = vec![];
+        let mut buf = [0u8; 16];
+        for _ in 0..4 {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(k) => got.extend_from_slice(&buf[..k]),
+                Err(e) => panic!("{window_us} us window surfaced {e:?}"),
+            }
+        }
+        assert_eq!(got, sent, "{window_us} us window: every byte, in order");
+        assert_eq!(s.lap_overruns(), 0, "{window_us} us window: nothing lapped");
+        assert_eq!(s.line_errors(), 0, "{window_us} us window: no wire glitch");
+    }
+}
+
+/// The injected characters are the same ones the ordinary read path returns, across the circular
+/// wrap: the injector is the DMA engine's model, not a shortcut past it.
+#[test]
+fn ring_injection_survives_the_circular_wrap() {
+    let _g = setup();
+    let (mut s, _ch, _ptr) = split_ring(8);
+
+    // Two and a half laps of an 8-byte ring, drained every 4 bytes so nothing ever laps.
+    let mut expected = vec![];
+    for chunk in 0..5u8 {
+        let sent: Vec<u8> = (0..4).map(|i| chunk * 4 + i).collect();
+        for &b in &sent {
+            s.inject_rx_byte(b);
+        }
+        let mut buf = [0u8; 8];
+        let k = s.read(&mut buf).expect("no condition");
+        assert_eq!(&buf[..k], &sent[..], "chunk {chunk} read back in order");
+        expected.extend_from_slice(&sent);
+    }
+    assert_eq!(expected.len(), 20, "20 bytes through an 8-byte ring");
+    assert_eq!(s.lap_overruns(), 0);
+    assert_eq!(s.line_errors(), 0);
+}
+
 #[test]
 fn polled_read_ready_reflects_rbne_and_pending_overrun() {
     // D4: ReadReady = "a read makes progress": RBNE, or a pending overrun the read would clear.

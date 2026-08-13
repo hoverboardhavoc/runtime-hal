@@ -903,6 +903,29 @@ impl RingBufferedRx {
         record_line_error(self.slot, UsartError::Overrun);
     }
 
+    /// Model ONE character arriving from the wire (host `mock` only): the DMA engine stores it at the
+    /// live write index and advances the channel ([`crate::dma::DmaRxMap::mock_advance`]).
+    ///
+    /// The counterpart of [`crate::usart::UsartRegs::inject_rx_byte`], and the contrast between them
+    /// IS the property: a polled receiver's buffer is the one-byte data register, so a second
+    /// character with no intervening read is lost; here the buffer is `len` bytes of RAM the DMA
+    /// fills with no CPU involvement, so a caller that is away for many character times still finds
+    /// every byte waiting. Nothing is fabricated that hardware would not do: a store into the
+    /// application's own buffer, `CHxCNT` counting down, and `FTFIF` at the lap.
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn inject_rx_byte(&self, b: u8) {
+        let pos = self.len - self.map.remaining() as usize;
+        // SAFETY: `pos < len` (remaining is in `1..=len`), inside the `'static` buffer this receiver
+        // was armed with, and under `mock` no real DMA engine is writing it concurrently.
+        unsafe { core::ptr::write_volatile(self.buf.add(pos), b) };
+        self.map.mock_advance(self.len as u16);
+        // At a lap `mock_advance` raises `FTFIF`; on silicon the channel's vector then fires and
+        // counts the wrap. Run that same body here so a modelled stream reaches the steady state a
+        // real one does instead of accumulating uncounted laps.
+        crate::dma::mock_service(self.dma_ctx);
+    }
+
     /// True if the next [`read`](RingBufferedRx::read) will make progress: bytes are available
     /// behind the live DMA write position (the same wrap-consistent [`snapshot`](Self::snapshot)
     /// `read` uses, so the B13 pending-wrap case never reads false-negative), or a pending

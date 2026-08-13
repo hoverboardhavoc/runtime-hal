@@ -600,6 +600,21 @@ impl Usart {
     pub fn try_read_byte(&self) -> Result<Option<u8>, UsartError> {
         self.regs.try_read_byte()
     }
+
+    /// Model one character arriving from the wire ([`UsartRegs::inject_rx_byte`]; host `mock` only).
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn inject_rx_byte(&self, b: u8) {
+        self.regs.inject_rx_byte(b);
+    }
+
+    /// Declare this instance's device read side effects to the mock register space
+    /// ([`UsartRegs::mock_declare_device_reads`]; host `mock` only).
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn mock_declare_device_reads(&self) {
+        self.regs.mock_declare_device_reads();
+    }
 }
 
 impl UsartRegs {
@@ -624,6 +639,49 @@ impl UsartRegs {
     #[inline]
     pub fn ctl2(&self) -> Reg32 {
         Reg32::new(self.base, self.model.ctl2)
+    }
+
+    /// Declare this instance's device READ side effect to the mock register space (host `mock` only):
+    /// reading the receive data register clears `RBNE`.
+    ///
+    /// The offsets are this crate's register model, so the declaration belongs here rather than in a
+    /// harness that would have to re-derive them per family. OPT-IN, not automatic in `bring_up`: a
+    /// case that stages STAT directly does not want the side effect firing under it, and the existing
+    /// suite predates this.
+    ///
+    /// Declare it for any case that drives the polled receiver from injected characters rather than
+    /// from hand-set STAT bits, or a drained byte will appear to arrive over and over.
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn mock_declare_device_reads(&self) {
+        crate::reg::mock::read_clears(
+            self.base + self.model.rx_data,
+            self.base + self.model.stat,
+            STAT_RBNE,
+        );
+    }
+
+    /// Model ONE character arriving from the wire into the receive data register (host `mock` only).
+    ///
+    /// This is the hardware's own rule for a polled receiver, not a test convenience: the receive
+    /// data register holds exactly one byte, so a character that lands while `RBNE` is still set
+    /// finds the register occupied. Hardware keeps the byte already there, discards the arriving one
+    /// and latches `ORERR`. Injecting a second character with no intervening read therefore LOSES
+    /// it, which is precisely the property a caller-away window turns on.
+    ///
+    /// It fabricates no state a real character would not: `RX_DATA` plus the two STAT bits the
+    /// receiver sets. The drivers under test read it back through their ordinary paths.
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn inject_rx_byte(&self, b: u8) {
+        let stat = self.stat();
+        if stat.read() & STAT_RBNE != 0 {
+            // Still occupied: the arriving character is lost and ORERR latches.
+            stat.modify(STAT_ORERR, STAT_ORERR);
+            return;
+        }
+        Reg32::new(self.base, self.model.rx_data).write(b as u32);
+        stat.modify(STAT_RBNE, STAT_RBNE);
     }
 
     /// Read the line/transfer status flags.

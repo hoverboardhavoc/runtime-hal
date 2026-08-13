@@ -201,6 +201,27 @@ impl DmaRxMap {
         let intf = Reg32::new(self.base, DMA_INTF).read();
         intf & (1 << (4 * self.ch() + 1)) != 0
     }
+
+    /// Advance the channel by ONE transfer, as the DMA engine does when a character arrives (host
+    /// `mock` only): `CHxCNT` counts down, and at the circular wrap hardware reloads it to `len` and
+    /// raises this channel's `FTFIF` for the wrap-counter ISR to service.
+    ///
+    /// The byte itself is stored by the caller ([`crate::usart_rx::RingBufferedRx::inject_rx_byte`]),
+    /// which owns the buffer; this half is the channel bookkeeping the read path's snapshot reads.
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn mock_advance(&self, len: u16) {
+        let rem = self.remaining();
+        if rem <= 1 {
+            // The lap boundary: CHxCNT reloads to the full length and FTFIF latches (uncounted until
+            // the wrap ISR runs, which is exactly the pending-wrap case the snapshot handles).
+            self.chcnt().write(len as u32);
+            let intf = Reg32::new(self.base, DMA_INTF);
+            intf.modify(1 << (4 * self.ch() + 1), 1 << (4 * self.ch() + 1));
+        } else {
+            self.chcnt().write((rem - 1) as u32);
+        }
+    }
 }
 
 // --- DMA-RX ISR context (wrap counter for lap-overrun detection) -------------------------------
@@ -316,8 +337,22 @@ fn service_dma_rx(ctx: &DmaRxCtx) {
     }
 }
 
-/// Reset every DMA-RX context + both registered handlers (host-test teardown between cases). Both
-/// contexts are reset so a case that installed the module channel cannot leak into the next.
+/// Run the wrap-counter ISR body for context `ctx_index` (host `mock` only), exactly as this
+/// instance's DMA vector would: service its `FTFIF`, bump its wrap counter, clear the flags.
+///
+/// The injector ([`crate::usart_rx::RingBufferedRx::inject_rx_byte`]) calls this after a lap so a
+/// modelled character stream reaches the steady state a real one does, where the vector fires. The
+/// window BEFORE the vector runs (`FTFIF` set, wrap uncounted) is a distinct hazard with its own
+/// coverage, driven by dispatching the vector directly rather than through here.
+#[cfg(feature = "mock")]
+#[inline]
+pub(crate) fn mock_service(ctx_index: usize) {
+    service_dma_rx(&DMA_RX[ctx_index]);
+}
+
+/// Reset every DMA-RX context + every registered handler (host-test teardown between cases). All
+/// three contexts are reset so a case that installed the module or USART0 channel cannot leak into
+/// the next.
 #[cfg(feature = "mock")]
 pub fn reset_for_test() {
     for ctx in &DMA_RX {
@@ -328,4 +363,8 @@ pub fn reset_for_test() {
     }
     irq::clear_dma_rx_handler();
     irq::clear_dma_rx_handler2();
+    // The third slot is USART0's DMA handler (F1x0 PB6/PB7, the offroad BLE wiring). It was omitted
+    // while nothing installed it; the BLE RX ring does, so a case that arms that instance would
+    // otherwise leak its handler into the next case.
+    irq::clear_dma_rx_handler3();
 }

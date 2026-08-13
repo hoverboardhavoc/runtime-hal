@@ -555,6 +555,70 @@ fn r7_apply_motor_era_priorities_both_families() {
     }
 }
 
+/// `module_rx_irqs` resolves the mirrored BLE-module port's `(usart_rx, dma_rx)` vectors: USART2 +
+/// its own DMA0 Ch2 vector on the standard family, USART0 + the grouped Ch1/2 vector on the offroad
+/// one. Distinct from the inter-board triplet on BOTH families, which is what lets the two ports
+/// carry independent receivers.
+#[test]
+fn r7_module_rx_irqs_resolve_per_family_and_never_collide() {
+    use super::{
+        module_rx_irqs, F10X_DMA0_CH2_IRQ, F10X_USART_MODULE_IRQ, F1X0_DMA_CH1_2_IRQ,
+        F1X0_USART0_IRQ,
+    };
+    assert_eq!(
+        module_rx_irqs(IrqLayout::F1x0Grouped),
+        (F1X0_USART0_IRQ, F1X0_DMA_CH1_2_IRQ)
+    );
+    assert_eq!(
+        module_rx_irqs(IrqLayout::F10xSeparate),
+        (F10X_USART_MODULE_IRQ, F10X_DMA0_CH2_IRQ)
+    );
+    for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
+        let (period, usart1, dma) = motor_era_irqs(layout);
+        let (m_usart, m_dma) = module_rx_irqs(layout);
+        let all = [period, usart1, dma, m_usart, m_dma];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "{layout:?}: two policy vectors share a number");
+            }
+        }
+    }
+}
+
+/// The BLE port's vectors are covered by the policy, not left at the reset value.
+///
+/// This is the regression the BLE RX ring turns on. An NVIC priority byte resets to **0**, the most
+/// urgent value there is, so a vector the policy never writes outranks the period ISR. That was
+/// harmless only while nothing unmasked the module port; a `RingBufferedRx` armed there unmasks both
+/// of its vectors, and an un-covered pair would preempt the 16 kHz motor ISR on every inbound BLE
+/// character. Assert they carry the RX priorities and sit strictly BELOW the period ISR.
+#[test]
+fn r7_module_rx_vectors_are_ordered_below_the_period_isr() {
+    use super::module_rx_irqs;
+    for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
+        let _g = mock::lock();
+        mock::reset();
+        // Pre-state: the reset value really is the most-urgent byte, so this is not vacuous.
+        let (m_usart, m_dma) = module_rx_irqs(layout);
+        assert_eq!(irq_priority(m_usart), 0, "{layout:?}: reset byte is 0");
+        assert_eq!(irq_priority(m_dma), 0, "{layout:?}: reset byte is 0");
+
+        apply_motor_era_priorities(layout);
+
+        let (period, ..) = motor_era_irqs(layout);
+        assert_eq!(irq_priority(m_usart), USART1_RX_PRIORITY);
+        assert_eq!(irq_priority(m_dma), DMA_RX_PRIORITY);
+        assert!(
+            irq_priority(period) < irq_priority(m_usart),
+            "{layout:?}: the module USART must not outrank the period ISR"
+        );
+        assert!(
+            irq_priority(period) < irq_priority(m_dma),
+            "{layout:?}: the module DMA must not outrank the period ISR"
+        );
+    }
+}
+
 /// `unmask_irq` is the crate's NVIC set-enable owner and is a no-op under the host `mock` build
 /// (there is no NVIC there), so calling it from host-test code is safe and changes no register.
 /// The hardware body is exercised on silicon by every RX bring-up and by the motor period vector.

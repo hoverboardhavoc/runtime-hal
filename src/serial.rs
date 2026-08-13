@@ -139,6 +139,24 @@ impl PolledSerial {
     pub fn rx_overruns(&self) -> u16 {
         self.rx_overruns
     }
+
+    /// Model ONE character arriving from the wire (host `mock` only): passthrough to
+    /// [`crate::usart::Usart::inject_rx_byte`]. Deliberately the SAME name and shape as
+    /// [`SplitSerial::inject_rx_byte`], so one caller-away property test can be written once and
+    /// compiled against whichever carrier a port actually ships.
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn inject_rx_byte(&self, b: u8) {
+        self.usart.inject_rx_byte(b);
+    }
+
+    /// Declare the wrapped instance's device read side effects to the mock register space
+    /// ([`crate::usart::UsartRegs::mock_declare_device_reads`]; host `mock` only).
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn mock_declare_device_reads(&self) {
+        self.usart.mock_declare_device_reads();
+    }
 }
 
 impl ErrorType for PolledSerial {
@@ -358,6 +376,16 @@ impl SplitSerial<RingBufferedRx> {
     #[inline]
     pub fn inject_line_error(&self) {
         self.rx.inject_line_error();
+    }
+
+    /// Model ONE character arriving from the wire (host `mock` only): passthrough to
+    /// [`RingBufferedRx::inject_rx_byte`]. Deliberately the SAME name and shape as
+    /// [`PolledSerial::inject_rx_byte`], so one caller-away property test can be written once and
+    /// compiled against whichever carrier a port actually ships.
+    #[cfg(feature = "mock")]
+    #[inline]
+    pub fn inject_rx_byte(&self, b: u8) {
+        self.rx.inject_rx_byte(b);
     }
 }
 

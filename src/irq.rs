@@ -706,16 +706,44 @@ pub const fn motor_era_irqs(layout: IrqLayout) -> (usize, usize, usize) {
     }
 }
 
+/// The MODULE-port RX vector pair for `layout`: `(usart_rx, dma_rx)` for the USART carrying the
+/// onboard CC2541 BLE module. Mirrored across the fleet, which is why it is resolved from the layout
+/// rather than named by the caller: the standard family puts the module on USART2 (PB10/PB11, its own
+/// DMA0 Ch2 vector), the classywalk offroad family on USART0 (PB6/PB7, the grouped Ch1/2 vector).
+///
+/// The companion of [`motor_era_irqs`], and the second half of what
+/// [`apply_motor_era_priorities`] must cover: these two vectors are unmasked by a
+/// [`crate::usart_rx::RingBufferedRx`] armed on the module port.
+#[inline]
+pub const fn module_rx_irqs(layout: IrqLayout) -> (usize, usize) {
+    match layout {
+        IrqLayout::F1x0Grouped => (F1X0_USART0_IRQ, F1X0_DMA_CH1_2_IRQ),
+        IrqLayout::F10xSeparate => (F10X_USART_MODULE_IRQ, F10X_DMA0_CH2_IRQ),
+    }
+}
+
 /// Apply the motor-era interrupt-priority ordering for `layout` (R7, the single-owner surface): the
-/// period (ADC injected-EOC) ISR above the USART1 RX vector above the DMA-RX vector above SysTick.
-/// Resolves the per-family vector numbers from [`motor_era_irqs`] and writes the four priorities;
-/// silicon stage 1 reads the IPR + SHPR3 bytes back over SWD to confirm the ordering is real. Call
-/// once at boot, before the vectors are unmasked.
+/// period (ADC injected-EOC) ISR above the USART RX vectors above the DMA-RX vectors above SysTick.
+/// Resolves the per-family vector numbers from [`motor_era_irqs`] + [`module_rx_irqs`] and writes the
+/// priorities; silicon stage 1 reads the IPR + SHPR3 bytes back over SWD to confirm the ordering is
+/// real. Call once at boot, before the vectors are unmasked.
+///
+/// **Both RX ports, not just the inter-board one.** An NVIC priority byte resets to 0, which is the
+/// MOST urgent value there is: any vector left unwritten preempts the period ISR, the tightest budget
+/// on the part. While only the inter-board port carried a receiver that was harmless, because nothing
+/// unmasked the module port's vectors. A BLE RX ring unmasks both of them, so the ordering has to name
+/// them or arming the module port would silently outrank the motor. The policy covers every vector
+/// this HAL's receivers can unmask, on both families, so it does not depend on which wiring a given
+/// board turns out to have; writing a priority enables nothing, so covering a vector that stays masked
+/// costs a register write and nothing else.
 pub fn apply_motor_era_priorities(layout: IrqLayout) {
     let (period, usart1, dma) = motor_era_irqs(layout);
     set_irq_priority(period, MOTOR_ISR_PRIORITY);
     set_irq_priority(usart1, USART1_RX_PRIORITY);
     set_irq_priority(dma, DMA_RX_PRIORITY);
+    let (module_usart, module_dma) = module_rx_irqs(layout);
+    set_irq_priority(module_usart, USART1_RX_PRIORITY);
+    set_irq_priority(module_dma, DMA_RX_PRIORITY);
     set_systick_priority(SYSTICK_PRIORITY);
 }
 
