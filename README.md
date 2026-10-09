@@ -236,4 +236,10 @@ The GD32 Standard Peripheral Library (SPL) is the sole register reference for th
 
 ## License
 
-Licensed under either of Apache-2.0 or MIT at your option.
+Licensed under either of Apache-2.0 or MIT at your option, and deliberately kept permissive: this is
+a general-purpose HAL for these parts rather than an application, so it stays usable by projects
+under any licence.
+
+One consumer worth naming, because the asymmetry surprises people: the hoverboard firmware built on
+this HAL (`hoverboard-firmware`) is **GPL-3.0-or-later**, which it may be while depending on
+permissive code. That choice is the application's, not this crate's, and it does not reach back here.
