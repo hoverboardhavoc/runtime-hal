@@ -181,10 +181,28 @@ pub fn pin_exists(chip: &Chip, pin: u8) -> bool {
 /// tables [`gate_set`] matches, so the two queries cannot drift: the TIMER0 set on every part,
 /// plus the TIMER7 set exactly where the descriptor carries a measured second advanced timer.
 pub fn gate_capable(chip: &Chip, pin: u8) -> bool {
-    TIMER0_CH.contains(&pin)
-        || TIMER0_CHN.contains(&pin)
+    table_has(&TIMER0_CH, pin)
+        || table_has(&TIMER0_CHN, pin)
         || (chip.has_advanced_timer(PeriphLabel::Timer7)
-            && (TIMER7_CH.contains(&pin) || TIMER7_CHN.contains(&pin)))
+            && (table_has(&TIMER7_CH, pin) || table_has(&TIMER7_CHN, pin)))
+}
+
+/// Is `pin` one of the three bytes of a channel table? An open-coded comparison, deliberately,
+/// and it must stay one: do NOT simplify it back to `table.contains(&pin)`.
+///
+/// `contains` on a byte slice is not a loop over three bytes. It dispatches through the
+/// `SliceContains` specialization into `core::slice::memchr`, whose chunked word-at-a-time
+/// search and alignment prologue get inlined at each of the four call sites in
+/// [`gate_capable`]. That is the wrong trade for a table of three bytes on a 64 KiB part: the
+/// whole scan IS three compares. Measured on the hoverboard firmware image (the consumer that
+/// flashes this crate, and the only place the cost is visible, since the HAL alone links
+/// nothing): -28 B of release span and -52 B of dev span against the same tree. The semantics
+/// are identical byte for byte, because `contains` on a `&[u8]` is defined as
+/// `iter().any(|&b| b == pin)`, and [`gate_capable`] is a cold query (board validation and
+/// bring-up, never an ISR), so no hot path wants the chunked form back.
+#[inline]
+fn table_has(table: &[u8; 3], pin: u8) -> bool {
+    table[0] == pin || table[1] == pin || table[2] == pin
 }
 
 /// Do the six pins form a known-valid complementary assignment of ONE advanced timer on this
