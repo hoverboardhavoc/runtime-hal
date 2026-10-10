@@ -162,6 +162,26 @@ pub mod backend {
     /// Reads observed inside [`WATCHED`] since the last [`mock::reset`].
     static WATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
+    /// A single address whose READS hand back a counting ramp instead of the stored value
+    /// (`u64::MAX` = none), with [`RAMP_NEXT`] the value the next read of it yields. A data
+    /// register that returns a constant cannot tell a right store DESTINATION from a wrong one:
+    /// every byte a driver receives is the same byte, so a test can only see how many reads
+    /// happened, not where each landed. Arming the ramp makes each read distinct, which is what
+    /// lets a test pin the order a received burst is stored in. The ramp advances once per read of
+    /// that address at either access width, and wraps within the width. Reset clears it.
+    static RAMP: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The value the next read of the [`RAMP`] address yields.
+    static RAMP_NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// The ramp value for a read at `addr`, advancing it, or `None` if `addr` is not ramped.
+    #[inline]
+    fn ramp_value(addr: u32) -> Option<u32> {
+        if RAMP.load(Ordering::Relaxed) != addr as u64 {
+            return None;
+        }
+        Some(RAMP_NEXT.fetch_add(1, Ordering::Relaxed) as u32)
+    }
+
     /// Count a read if `addr` falls in the watched range.
     #[inline]
     fn note_read(addr: u32) {
@@ -236,7 +256,10 @@ pub mod backend {
         note_read(addr);
         let rules = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
-        let v = u16::from_le_bytes([get(&s, addr), get(&s, addr + 1)]);
+        let v = match ramp_value(addr) {
+            Some(r) => r as u16,
+            None => u16::from_le_bytes([get(&s, addr), get(&s, addr + 1)]),
+        };
         apply_read_rules(&mut s, &rules, addr);
         v
     }
@@ -259,12 +282,15 @@ pub mod backend {
         note_read(addr);
         let rules = READ_CLEARS.lock().unwrap_or_else(|e| e.into_inner());
         let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
-        let v = u32::from_le_bytes([
-            get(&s, addr),
-            get(&s, addr + 1),
-            get(&s, addr + 2),
-            get(&s, addr + 3),
-        ]);
+        let v = match ramp_value(addr) {
+            Some(r) => r,
+            None => u32::from_le_bytes([
+                get(&s, addr),
+                get(&s, addr + 1),
+                get(&s, addr + 2),
+                get(&s, addr + 3),
+            ]),
+        };
         apply_read_rules(&mut s, &rules, addr);
         v
     }
@@ -286,7 +312,10 @@ pub mod backend {
 
     /// Test helpers for the backing map.
     pub mod mock {
-        use super::{FROZEN, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS, WATCHED, WATCH_COUNT};
+        use super::{
+            FROZEN, RAMP, RAMP_NEXT, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS, WATCHED,
+            WATCH_COUNT,
+        };
         use std::sync::atomic::Ordering;
         use std::sync::MutexGuard;
 
@@ -301,6 +330,17 @@ pub mod backend {
         /// Reads observed at the [`watch_reads`] address since it was armed.
         pub fn read_count() -> u64 {
             WATCH_COUNT.load(Ordering::Relaxed)
+        }
+
+        /// Make every READ of `addr` hand back a counting value starting at `start` instead of the
+        /// stored one, so each read is distinguishable. A device data register modelled as a flat
+        /// word returns the same byte to every read, which cannot distinguish a burst stored in
+        /// order from one whose bytes were placed wrongly; with a ramp armed, the received values
+        /// themselves say where each one landed. One ramped address at a time. Cleared by
+        /// [`reset`].
+        pub fn ramp(addr: u32, start: u32) {
+            RAMP_NEXT.store(start as u64, Ordering::Relaxed);
+            RAMP.store(addr as u64, Ordering::Relaxed);
         }
 
         /// Mark the word at `addr` as non-responsive: subsequent writes to it are dropped (reads see
@@ -339,9 +379,12 @@ pub mod backend {
         }
 
         /// Zero the whole simulated register space (call at the start of a test case). Also clears
-        /// any frozen (non-responsive) word and every registered device rule.
+        /// any frozen (non-responsive) word, any armed read ramp, and every registered device
+        /// rule.
         pub fn reset() {
             FROZEN.store(u64::MAX, Ordering::Relaxed);
+            RAMP.store(u64::MAX, Ordering::Relaxed);
+            RAMP_NEXT.store(0, Ordering::Relaxed);
             WATCHED.store(u64::MAX, Ordering::Relaxed);
             WATCH_COUNT.store(0, Ordering::Relaxed);
             READ_CLEARS

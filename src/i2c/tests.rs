@@ -515,7 +515,8 @@ fn zero_length_write_is_a_presence_check() {
     assert_eq!(r(CTL0) & CTL0_STOP, CTL0_STOP);
 }
 
-// --- Solution B receive shapes (flat mock: flow + end state; the sequencing is silicon's) ------
+// --- Solution B receive shapes (flat mock: flow, end state, and under a read ramp the store
+// destinations too; the on-wire sequencing is silicon's) --------------------------------------
 
 #[test]
 fn read_burst_14_solution_b_completes_and_stops() {
@@ -533,6 +534,42 @@ fn read_burst_14_solution_b_completes_and_stops() {
         "ACK re-enabled for next transfer"
     );
     assert_eq!(ctl0 & CTL0_POAP, 0, "POAP not used for N>2");
+}
+
+/// The N>2 arm stores the last three bytes outside its loop, in three separate bindings
+/// (`third_last`, `second_last`, `last`), which is where a destination mistake hides: transpose two
+/// of them and the IMU's burst comes back with two bytes swapped on silicon while every other
+/// assertion in this file still passes, because a flat mock DATA register answers every read with
+/// the same byte. Arming the read ramp makes each received byte distinct, so the buffer's contents
+/// are the proof that each one landed where the sequence says. 14 bytes is the IMU's real burst.
+#[test]
+fn read_burst_14_stores_every_byte_in_order() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    seed_stat0_all_ready();
+    mock::ramp(I2C_BASE + DATA, 0x10);
+    let mut buf = [0u8; 14];
+    dev.read(IMU, &mut buf)
+        .expect("14-byte burst should succeed");
+    let expected: [u8; 14] = std::array::from_fn(|i| 0x10 + i as u8);
+    assert_eq!(buf, expected, "received bytes stored in receive order");
+}
+
+/// The same proof at the smallest length the N>2 arm takes: three bytes, so its loop runs zero
+/// times and the three trailing bindings are the whole transfer.
+#[test]
+fn read_three_bytes_stores_every_byte_in_order() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    seed_stat0_all_ready();
+    mock::ramp(I2C_BASE + DATA, 0x41);
+    let mut buf = [0u8; 3];
+    dev.read(IMU, &mut buf).expect("3-byte read should succeed");
+    assert_eq!(
+        buf,
+        [0x41, 0x42, 0x43],
+        "received bytes stored in receive order"
+    );
 }
 
 #[test]
