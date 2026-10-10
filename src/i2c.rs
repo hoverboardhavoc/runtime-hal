@@ -906,28 +906,39 @@ impl I2c {
     }
 
     fn read_inner(&self, addr7: u8, buf: &mut [u8]) -> Result<(), I2cError> {
-        let n = buf.len();
         self.set_ack(true);
         // Solution B, N=2: POAP before START, so the ACKEN cleared below applies to the SECOND
-        // byte (the one to NACK), not the first.
-        if n == 2 {
+        // byte (the one to NACK), not the first. A two-element pattern rather than a length
+        // compare, for the same reason as the receive match below: the length never becomes a
+        // number this function computes with.
+        if let [_, _] = *buf {
             self.set_poap(true);
         }
         self.start_on_bus();
         self.wait_flag(STAT0_SBSEND, NackKind::Address)?;
         self.send_address(addr7, true);
 
-        match n {
-            1 => {
+        // The receive sequence differs by length, so the length cases are slice patterns and every
+        // byte stored is a binding the pattern proves exists: nothing is indexed and nothing is
+        // subtracted from the length, so the compiler has no bound left to check and the firmware's
+        // 250 Hz IMU read carries no `slice_index_fail` (`specs/panic-free.md` in the firmware
+        // repo, and its `tools/panic-reach.py` gate). The arms are the three hardware cases plus
+        // the empty one, which exists only to make the match total: `read_bytes` refuses an empty
+        // buffer before the bus is touched, and spelling the case out is what lets the compiler USE
+        // the fact that the general arm has at least three bytes. The register writes per arm, and
+        // their order, are the silicon-proven Solution B sequence and must not move.
+        match buf {
+            [] => {}
+            [only] => {
                 // N=1: ACKEN clear BEFORE clearing ADDSEND; STOP after; read on RBNE.
                 self.set_ack(false);
                 self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
                 self.clear_addsend();
                 self.stop_on_bus();
                 self.wait_flag(STAT0_RBNE, NackKind::Data)?;
-                buf[0] = self.receive();
+                *only = self.receive();
             }
-            2 => {
+            [first, second] => {
                 // N=2 (POAP set above): ACKEN clear before clearing ADDSEND (NACKs byte 2); then
                 // both bytes arrive into DR + shift and SCL stretches (BTC); STOP; read twice.
                 self.set_ack(false);
@@ -935,30 +946,31 @@ impl I2c {
                 self.clear_addsend();
                 self.wait_flag(STAT0_BTC, NackKind::Data)?;
                 self.stop_on_bus();
-                buf[0] = self.receive();
+                *first = self.receive();
                 self.wait_flag(STAT0_RBNE, NackKind::Data)?;
-                buf[1] = self.receive();
+                *second = self.receive();
                 self.set_poap(false);
             }
-            _ => {
-                // N>2: RBNE-read the first N-3 bytes; byte N-2 stays in DR until BTC signals
-                // N-1 in the shift register with SCL stretched; ACKEN clear (the LAST byte will
-                // be NACKed); read N-2 (releases the bus for the last byte); BTC again (N-1 in
-                // DR, last in shift, stretched); STOP; read N-1; read the last.
+            [head @ .., third_last, second_last, last] => {
+                // N>2: RBNE-read every byte ahead of the final three; the third-last stays in DR
+                // until BTC signals the second-last in the shift register with SCL stretched;
+                // ACKEN clear (the LAST byte will be NACKed); read the third-last (releases the
+                // bus for the last byte); BTC again (second-last in DR, last in shift, stretched);
+                // STOP; read the second-last; read the last.
                 self.wait_flag(STAT0_ADDSEND, NackKind::Address)?;
                 self.clear_addsend();
-                for b in buf[..n - 3].iter_mut() {
+                for b in head.iter_mut() {
                     self.wait_flag(STAT0_RBNE, NackKind::Data)?;
                     *b = self.receive();
                 }
                 self.wait_flag(STAT0_BTC, NackKind::Data)?;
                 self.set_ack(false);
-                buf[n - 3] = self.receive();
+                *third_last = self.receive();
                 self.wait_flag(STAT0_BTC, NackKind::Data)?;
                 self.stop_on_bus();
-                buf[n - 2] = self.receive();
+                *second_last = self.receive();
                 self.wait_flag(STAT0_RBNE, NackKind::Data)?;
-                buf[n - 1] = self.receive();
+                *last = self.receive();
             }
         }
         // Re-enable ACK for the next transfer.
