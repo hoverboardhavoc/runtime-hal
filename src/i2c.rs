@@ -906,6 +906,14 @@ impl I2c {
     }
 
     fn read_inner(&self, addr7: u8, buf: &mut [u8]) -> Result<(), I2cError> {
+        // An empty buffer never reaches the bus. `read_bytes` already refuses one and is this
+        // function's only caller, but without this the N==0 case would fall out of the match below
+        // having issued a START and an address with ADDSEND uncleared and no STOP, leaving the
+        // peripheral mid-transaction. The local code should be safe on its own terms rather than
+        // on a guard in another function.
+        if buf.is_empty() {
+            return Ok(());
+        }
         self.set_ack(true);
         // Solution B, N=2: POAP before START, so the ACKEN cleared below applies to the SECOND
         // byte (the one to NACK), not the first. A two-element pattern rather than a length
@@ -922,12 +930,13 @@ impl I2c {
         // byte stored is a binding the pattern proves exists: nothing is indexed and nothing is
         // subtracted from the length, so the compiler has no bound left to check and the firmware's
         // 250 Hz IMU read carries no `slice_index_fail` (`specs/panic-free.md` in the firmware
-        // repo, and its `tools/panic-reach.py` gate). The arms are the three hardware cases plus
-        // the empty one, which exists only to make the match total: `read_bytes` refuses an empty
-        // buffer before the bus is touched, and spelling the case out is what lets the compiler USE
-        // the fact that the general arm has at least three bytes. The register writes per arm, and
-        // their order, are the silicon-proven Solution B sequence and must not move.
+        // repo, and its `tools/panic-reach.py` gate). The "at least three bytes" fact the general
+        // arm needs comes from its own pattern test, not from the empty arm: that arm is here to
+        // make the match exhaustive and nothing more (a `_` arm in its place leaves the bounds
+        // check just as gone). The register writes per arm, and their order, are the silicon-proven
+        // Solution B sequence and must not move.
         match buf {
+            // Unreachable: refused above. Exhaustiveness only.
             [] => {}
             [only] => {
                 // N=1: ACKEN clear BEFORE clearing ADDSEND; STOP after; read on RBNE.
