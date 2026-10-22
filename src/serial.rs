@@ -25,14 +25,20 @@
 //!   consumer that stopped reading for too long, which is the whole question on the BLE port.
 //! - **`ReadReady` = "a read will make progress"** (data available, or a pending condition the read
 //!   would clear), answered from real state, consuming nothing.
-//! - **`Write` is polled, `WriteReady` = TBE**, and DMA TX is out of scope. The two adapters differ
-//!   in what they wait for, because their carriers do: [`SplitSerial`] waits `TBE` then `TC` per
-//!   byte (the inter-board UART at 115200, where a character time is 87 us and the send is the
-//!   whole point of the pass), so its `flush` is a no-op. [`PolledSerial`] waits `TBE` only, taking
-//!   as many bytes as the register accepts and reporting how many, so a caller can meter a frame
-//!   onto a slow wire without blocking (the 9600-baud BLE module: 1.04 ms a byte against a 4 ms
-//!   control tick); its `flush` is the real `TC` wait, and is what a caller owes before
-//!   reconfiguring or tearing down the port.
+//! - **`Write` is polled, `WriteReady` = TBE**, and DMA TX is out of scope. BOTH adapters wait
+//!   `TBE` only, take as many bytes as the register accepts and report how many, so a caller can
+//!   meter a frame onto a slow wire without blocking (the 9600-baud BLE module: 1.04 ms a byte
+//!   against a 4 ms control tick). `flush` is the real `TC` wait on both, and is what a caller
+//!   owes before reconfiguring or tearing down the port. [`SplitSerial`] used to wait `TBE` then
+//!   `TC` on every byte and call its `flush` a no-op; that was corrected on 2026-10-22 after the
+//!   measurement, because this adapter carries the metered 9600-baud port as well as the
+//!   inter-board one and the per-byte wait was costing the consumer's main loop a character time
+//!   per metered byte (see [`SplitSerial`]'s `write`).
+//! - **Every wait on the write path is BOUNDED**, by a budget derived from the core clock so the
+//!   bound means something in microseconds ("the polled-write time budget" below). A main loop
+//!   with a motor coast and a watchdog cannot contain an unbounded spin on a hardware flag; a
+//!   timed-out write drops the frame and counts it (`tx_timeouts`), the same way the RX side
+//!   absorbs and counts a line error.
 //!
 //! The pre-slice-4 BLOCKING `UsartSerial` is superseded by [`PolledSerial`]
 //! (`specs/serial-adapters.md` D6); the [`Serial`] alias and its pin-handle `new` constructor carry
@@ -55,6 +61,96 @@ use crate::usart_rx::{BufferedRx, RingBufferedRx};
 /// baud)` (the pin-handle constructor), the [`crate::i2c::I2c`] analogue for the serial port.
 pub type Serial = PolledSerial;
 
+// --- the polled-write time budget ---------------------------------------------------------------
+//
+// Every wait on the write path is bounded, and the bound is derived from the core clock so it
+// means something in microseconds. This is the [`crate::i2c`] acquisition budget applied to the
+// other polled peripheral, for the same reason and in the same shape; read that module's
+// "polled-transfer time budget" for the long form of the argument.
+//
+// Why a bound at all. These adapters are what the consuming firmware's MAIN LOOP writes through,
+// and that loop has two deadlines: the 16 ms motor coast (a commutation ISR floats all three
+// phases if the 250 Hz control task, dispatched from the same pass, goes quiet) and a 500 ms
+// watchdog. An unbounded `while !flag {}` respects neither. It is not a theoretical hazard: on
+// 2026-10-22 the offroad master took eleven independent-watchdog resets in one bench session
+// (`RCU_RSTSCK` bit 29 set on the master, clear on its peer), and the only waits in its loop with
+// no bound were these. A wait whose failure mode is "spin until the watchdog reboots the board"
+// is strictly worse than one whose failure mode is a dropped frame on a best-effort link.
+//
+// Why per WRITE CALL rather than per flag wait: the `i2c` argument transfers verbatim. A per-wait
+// budget detects "no progress" but cannot bound a transfer, because a port that makes progress on
+// every byte to just inside a per-wait limit runs the call arbitrarily long. One countdown shared
+// by every wait in the call bounds the whole of it by construction.
+//
+// What a timed-out write DOES is the TX twin of how this module already handles RX line errors
+// (see the module docs): the condition is absorbed below the `embedded-io` line, the rest of the
+// buffer is dropped, a saturating diagnostic counter records it, and the call reports the buffer
+// as consumed. Reporting it as consumed is deliberate and is not a convenience: `Ok(0)` on a
+// non-empty buffer makes `embedded-io`'s `write_all` PANIC, and the consumer is a panic-free
+// image, so the choice is between a counted drop and a panic. The callers already assume the
+// drop: `link::SerialTransport::send_l2_frame` discards the result because L2 is best-effort and
+// a truncated frame fails its receiver's CRC.
+
+/// Core cycles one write-path poll iteration costs, as an UPPER bound.
+///
+/// The upper bound is the correct end to take, exactly as in [`crate::i2c::POLL_CYCLES`]:
+/// over-stating it under-states the iteration count, so the real block finishes EARLY.
+/// The loop is an APB load of `STAT`, one flag test, a load/store of the countdown and a taken
+/// back-branch; it is shorter than the I2C's five-flag test, and 24 leaves room for the
+/// AHB-to-APB bridge stall and the flash wait states on the fetch.
+pub const WRITE_POLL_CYCLES: u32 = 24;
+
+/// Wall-clock ceiling, in microseconds, on the polling ONE write call may do.
+///
+/// Sized between the same two pincers the I2C budget sits between. Below it has to clear the
+/// legitimate waits: one character time is 1.04 ms at 9600 (the BLE module's rate, where a
+/// metered caller writes one byte per call) and 21.7 us at 460800 (the inter-board link, where a
+/// 24-byte frame is 24 of those), so 4 ms is ~3.8x the slowest single legitimate wait and ~7x a
+/// whole inter-board frame. Above, it must stay well inside the 16 ms motor coast, and at 4 ms it
+/// is a quarter of it.
+///
+/// A caller wanting to push a WHOLE frame at 9600 baud is asking for ~21 ms of wire time and will
+/// time out here, which is correct: that call was already a coast violation before this bound
+/// existed, and it is why the firmware meters that port a byte at a time instead.
+pub const WRITE_BUDGET_US: u32 = 4_000;
+
+/// Poll iterations that fit in [`WRITE_BUDGET_US`] at `core_hz`: the per-call write budget.
+///
+/// Saturates at 1 so a nonsensically slow `core_hz` still terminates.
+pub const fn write_budget(core_hz: u32) -> u32 {
+    let n = (core_hz / 1_000_000) * WRITE_BUDGET_US / WRITE_POLL_CYCLES;
+    if n == 0 {
+        1
+    } else {
+        n
+    }
+}
+
+/// Worst-case microseconds one failing write call can block the caller. Const, so a consumer with
+/// a real-time deadline can `const_assert` its own budget against it and fail the BUILD if either
+/// moves ([`crate::i2c::worst_case_block_us`] is the precedent).
+pub const fn worst_case_write_block_us(core_hz: u32) -> u32 {
+    if core_hz == 0 {
+        return WRITE_BUDGET_US;
+    }
+    let mhz = core_hz / 1_000_000;
+    write_budget(core_hz) * WRITE_POLL_CYCLES / if mhz == 0 { 1 } else { mhz }
+}
+
+/// Spin on `cond` until it holds or `left` runs out. `true` = the flag came up, `false` = the
+/// budget expired. The ONE place a write-path wait is written, so no wait can be added without a
+/// bound.
+#[inline]
+fn wait_bounded(left: &mut u32, mut cond: impl FnMut() -> bool) -> bool {
+    while !cond() {
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+    }
+    true
+}
+
 // --- the polled adapter -------------------------------------------------------------------------
 
 /// Non-blocking `embedded-io` endpoint over a whole (unsplit) [`Usart`]: polled RBNE receive +
@@ -66,6 +162,10 @@ pub struct PolledSerial {
     usart: Usart,
     line_errors: u16,
     rx_overruns: u16,
+    /// Poll iterations ONE write call may spend ([`write_budget`] at the bring-up core clock),
+    /// resolved once where the clock is known. See "the polled-write time budget" above.
+    write_budget: u32,
+    tx_timeouts: u16,
 }
 
 impl PolledSerial {
@@ -87,19 +187,26 @@ impl PolledSerial {
         pins: (Pin<TX>, Pin<RX>),
         baud: u32,
     ) -> Result<Self, DescriptorError> {
-        Ok(Self::from_usart(Usart::new(
-            chip, clock, instance, pins, baud,
-        )?))
+        Ok(Self::from_usart(
+            Usart::new(chip, clock, instance, pins, baud)?,
+            clock.sysclk_hz,
+        ))
     }
 
     /// Wrap an already-configured [`Usart`] handle (the low-level path for code that brought the
     /// USART up itself, e.g. via [`Usart::bring_up`] or after a [`Usart::rejoin`]).
     #[inline]
-    pub const fn from_usart(usart: Usart) -> Self {
+    /// `core_hz` is the system clock the write budget is derived against, and it is a parameter
+    /// rather than a constant because the bound is a WALL-CLOCK one: the same iteration count is
+    /// 4 ms at 72 MHz and 36 ms at 8 MHz, and 36 ms is past the consumer's motor coast. See "the
+    /// polled-write time budget" above.
+    pub const fn from_usart(usart: Usart, core_hz: u32) -> Self {
         Self {
             usart,
             line_errors: 0,
             rx_overruns: 0,
+            write_budget: write_budget(core_hz),
+            tx_timeouts: 0,
         }
     }
 
@@ -138,6 +245,17 @@ impl PolledSerial {
     #[inline]
     pub fn rx_overruns(&self) -> u16 {
         self.rx_overruns
+    }
+
+    /// Diagnostic: write calls abandoned because a transmit flag did not come up inside the
+    /// write budget, saturating. The TX twin of the absorbed RX conditions above: the frame is
+    /// dropped (L2 is best-effort and a truncated frame fails its receiver's CRC), the caller is
+    /// told the buffer was consumed, and this is where the loss is visible. Expected to read ZERO;
+    /// a non-zero count means the port stopped accepting bytes, which on the consuming board used
+    /// to be a watchdog reset instead of a number.
+    #[inline]
+    pub fn tx_timeouts(&self) -> u16 {
+        self.tx_timeouts
     }
 
     /// Model ONE character arriving from the wire (host `mock` only): passthrough to
@@ -227,8 +345,13 @@ impl Write for PolledSerial {
             return Ok(0);
         };
         // At least one byte, per the trait: this is the only wait in the whole path, and a caller
-        // that gated on `write_ready` never enters it.
-        while !self.usart.try_write_byte(first) {}
+        // that gated on `write_ready` never enters it. BOUNDED: see "the polled-write time
+        // budget" above for why, and for why a timeout reports the buffer as consumed.
+        let mut left = self.write_budget;
+        if !wait_bounded(&mut left, || self.usart.try_write_byte(first)) {
+            self.tx_timeouts = self.tx_timeouts.saturating_add(1);
+            return Ok(data.len());
+        }
         let mut n = 1;
         for &b in rest {
             if !self.usart.try_write_byte(b) {
@@ -243,7 +366,10 @@ impl Write for PolledSerial {
     /// where the character-time wait lives now that [`write`](Write::write) does not pay it per
     /// byte, and it is what a caller owes before reconfiguring or tearing down the port.
     fn flush(&mut self) -> Result<(), Self::Error> {
-        while !self.usart.read_status().tx_complete {}
+        let mut left = self.write_budget;
+        if !wait_bounded(&mut left, || self.usart.read_status().tx_complete) {
+            self.tx_timeouts = self.tx_timeouts.saturating_add(1);
+        }
         Ok(())
     }
 }
@@ -317,6 +443,9 @@ pub struct SplitSerial<R: RxBackend> {
     rx: R,
     line_errors: u16,
     lap_overruns: u16,
+    /// Poll iterations ONE write call may spend ([`write_budget`] at the bring-up core clock).
+    write_budget: u32,
+    tx_timeouts: u16,
 }
 
 impl<R: RxBackend> SplitSerial<R> {
@@ -324,12 +453,16 @@ impl<R: RxBackend> SplitSerial<R> {
     /// is explicit from the slice-3 ownership pieces (`specs/serial-adapters.md` D5):
     /// `usart.split()`, arm the backend on the RX half, wrap both here.
     #[inline]
-    pub fn new(tx: UsartTx, rx: R) -> Self {
+    /// `core_hz` is the system clock the write budget is derived against; see
+    /// [`PolledSerial::from_usart`] for why it is a parameter and not a constant.
+    pub fn new(tx: UsartTx, rx: R, core_hz: u32) -> Self {
         SplitSerial {
             tx,
             rx,
             line_errors: 0,
             lap_overruns: 0,
+            write_budget: write_budget(core_hz),
+            tx_timeouts: 0,
         }
     }
 
@@ -360,6 +493,13 @@ impl<R: RxBackend> SplitSerial<R> {
     /// re-arm). Counted SEPARATELY from [`line_errors`](Self::line_errors) (a wire disturbance) so
     /// "the consumer is too slow" is distinguishable from "the line glitched". Outside the
     /// `embedded-io` traits by design.
+    #[inline]
+    pub fn tx_timeouts(&self) -> u16 {
+        self.tx_timeouts
+    }
+
+    /// Diagnostic: **buffer-overrun losses** absorbed by `read` so far, saturating (see
+    /// [`PolledSerial::tx_timeouts`] for the TX-side twin's contract).
     #[inline]
     pub fn lap_overruns(&self) -> u16 {
         self.lap_overruns
@@ -436,16 +576,61 @@ impl<R: RxBackend> ReadReady for SplitSerial<R> {
 }
 
 impl<R: RxBackend> Write for SplitSerial<R> {
-    /// Blocking polled write on the TX half (TBE before, TC after, per byte).
+    /// Hand the peripheral as many bytes as its transmit register will take, blocking only for
+    /// the FIRST one, and return how many went in. Identical in shape to
+    /// [`PolledSerial`]'s, because the two adapters face the same caller.
+    ///
+    /// **It used to wait `TBE` then `TC` on EVERY byte, and that was wrong on both of this
+    /// adapter's ports** (corrected 2026-10-22, measured). `TC` says the byte has finished
+    /// shifting out on the wire, which no caller on this path needs: `TBE` alone is the whole
+    /// condition for not losing data, and the only thing a line going idle is required for is
+    /// reconfiguring or tearing the port down, which is what [`flush`](Write::flush) is for and
+    /// is now where that wait lives.
+    ///
+    /// What the per-byte `TC` wait cost, on the two ports this adapter actually carries:
+    ///
+    /// - The 9600-baud BLE module, where the consuming firmware meters ONE byte per main-loop
+    ///   pass precisely so a frame does not block the pass. Each of those one-byte writes was
+    ///   paying a full 1.04 ms character time in the spin, which is the whole cost the metering
+    ///   exists to avoid, and 32 bytes of one telemetry sample was 33 ms of main loop spent
+    ///   waiting on a wire nothing was waiting for.
+    /// - The 460800 inter-board link at 125 frames a second, where serialising every byte against
+    ///   `TC` gives up the data register's double buffering and spends ~0.5 ms of CPU per frame;
+    ///   PC sampling the consuming board put ~10 percent of its whole CPU inside this function.
+    ///
+    /// The wire behaviour changes: bytes now go out back to back with no inter-byte gap, which is
+    /// ordinary UART operation and is what both receivers (a DMA ring, and a CC2541 bridge that
+    /// re-chunks the stream anyway) are built for.
+    ///
+    /// Bounded, and a timeout reports the buffer as consumed: see "the polled-write time budget".
     fn write(&mut self, data: &[u8]) -> Result<usize, Self::Error> {
-        for &b in data {
-            self.tx.write_byte(b);
+        let Some((&first, rest)) = data.split_first() else {
+            return Ok(0);
+        };
+        let mut left = self.write_budget;
+        if !wait_bounded(&mut left, || self.tx.try_write_byte(first)) {
+            self.tx_timeouts = self.tx_timeouts.saturating_add(1);
+            return Ok(data.len());
         }
-        Ok(data.len())
+        let mut n = 1;
+        for &b in rest {
+            if !self.tx.try_write_byte(b) {
+                break;
+            }
+            n += 1;
+        }
+        Ok(n)
     }
 
+    /// Wait for `TC`: the last byte written has fully shifted out and the line is idle. The real
+    /// wait now that [`write`](Write::write) does not pay it per byte, and what a caller owes
+    /// before a baud change, a rejoin or a teardown. Bounded like every other wait here.
     fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(()) // write_byte already waited for TC per byte
+        let mut left = self.write_budget;
+        if !wait_bounded(&mut left, || self.tx.tx_complete()) {
+            self.tx_timeouts = self.tx_timeouts.saturating_add(1);
+        }
+        Ok(())
     }
 }
 

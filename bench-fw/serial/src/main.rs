@@ -255,7 +255,7 @@ fn main() -> ! {
 /// F10x master: send stages 1-3 through `PolledSerial::write`, then become the stage-4 receiver
 /// through `SplitSerial<RingBufferedRx>` (Ch5).
 fn run_master(chip: &Chip, usart1: Usart) -> ! {
-    let mut serial = PolledSerial::from_usart(usart1);
+    let mut serial = PolledSerial::from_usart(usart1, CLOCK.sysclk_hz);
 
     // Boot settle: the slave is flashed + armed FIRST (it waits unbounded for the first byte), so
     // a fixed delay only has to cover this board's own reset.
@@ -280,7 +280,7 @@ fn run_master(chip: &Chip, usart1: Usart) -> ! {
         Ok(r) => r,
         Err(_) => halt(),
     };
-    let mut serial = SplitSerial::new(tx, ring);
+    let mut serial = SplitSerial::new(tx, ring, CLOCK.sysclk_hz);
     let (recv, loss) = drain_stage(&mut serial, N_STREAM);
     st!(r_recv, recv);
     st!(r_loss, loss);
@@ -305,7 +305,7 @@ fn run_slave(chip: &Chip, usart1: Usart) -> ! {
         Ok(r) => r,
         Err(_) => halt(),
     };
-    let mut s1 = SplitSerial::new(tx, ring);
+    let mut s1 = SplitSerial::new(tx, ring, CLOCK.sysclk_hz);
     let (recv, loss) = drain_stage(&mut s1, N_STREAM);
     st!(p1_recv, recv);
     st!(p1_loss, loss);
@@ -319,7 +319,7 @@ fn run_slave(chip: &Chip, usart1: Usart) -> ! {
         Ok(b) => b,
         Err(_) => halt(),
     };
-    let mut s2 = SplitSerial::new(tx, buffered);
+    let mut s2 = SplitSerial::new(tx, buffered, CLOCK.sysclk_hz);
     let (recv, loss) = drain_stage(&mut s2, N_STREAM);
     st!(p2_recv, recv);
     st!(p2_loss, loss);
@@ -329,7 +329,7 @@ fn run_slave(chip: &Chip, usart1: Usart) -> ! {
     // Stage 3: the polled adapter over the rejoined whole handle.
     let (tx, buffered) = s2.into_parts();
     let rx = buffered.release();
-    let mut s3 = PolledSerial::from_usart(Usart::rejoin(tx, rx));
+    let mut s3 = PolledSerial::from_usart(Usart::rejoin(tx, rx), CLOCK.sysclk_hz);
     let (recv, loss) = drain_stage(&mut s3, N_POLLED);
     st!(p3_recv, recv);
     st!(p3_loss, loss);

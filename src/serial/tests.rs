@@ -12,6 +12,10 @@
 //! makes `read` drain the same data-register byte repeatedly, which several cases exploit).
 #![cfg(feature = "mock")]
 
+/// The reference 72 MHz tree, the clock every adapter in these tests derives its write budget
+/// from (`ClockConfig::reference()`'s `sysclk_hz`).
+const TEST_CORE_HZ: u32 = 72_000_000;
+
 use crate::addr::{AddrTable, PeriphLabel};
 use crate::chip::Chip;
 use crate::clock::ClockConfig;
@@ -21,7 +25,10 @@ use crate::dma::{DmaRxMap, DMA0_BASE};
 use crate::error::UsartError;
 use crate::irq::{install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ};
 use crate::reg::{mock, Reg32};
-use crate::serial::{PolledSerial, SplitSerial};
+use crate::serial::{
+    worst_case_write_block_us, write_budget, PolledSerial, SplitSerial, WRITE_BUDGET_US,
+    WRITE_POLL_CYCLES,
+};
 use crate::usart::Usart;
 use crate::usart_rx::{BufferedRx, RingBufferedRx, RxRing};
 use embedded_io::{Error, ErrorKind, Read, ReadReady, Write, WriteReady};
@@ -102,7 +109,7 @@ fn bring_up() -> Usart {
 
 /// A polled adapter over the bench USART.
 fn polled() -> PolledSerial {
-    PolledSerial::from_usart(bring_up())
+    PolledSerial::from_usart(bring_up(), TEST_CORE_HZ)
 }
 
 #[inline]
@@ -130,7 +137,7 @@ fn split_ring(len: usize) -> (SplitSerial<RingBufferedRx>, u8, *mut u8) {
     let ch = DmaRxMap::usart1_rx(&c).channel;
     let ring = RingBufferedRx::new(&c, rx, PeriphLabel::Usart1, buf).unwrap();
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
-    (SplitSerial::new(tx, ring), ch, ptr)
+    (SplitSerial::new(tx, ring, TEST_CORE_HZ), ch, ptr)
 }
 
 /// Model a DMA store into the ring buffer (host RAM, not the mock register space).
@@ -673,7 +680,7 @@ fn split_dma_into_parts_release_rearm_flows_again() {
     let ptr2 = buf2.as_mut_ptr();
     let ch = DmaRxMap::usart1_rx(&c).channel;
     let ring2 = RingBufferedRx::new(&c, half, PeriphLabel::Usart1, buf2).unwrap();
-    let mut s = SplitSerial::new(tx, ring2);
+    let mut s = SplitSerial::new(tx, ring2, TEST_CORE_HZ);
 
     dma_write(ptr2, 0, 0x77);
     Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 1);
@@ -705,7 +712,7 @@ fn split_buffered<const N: usize>() -> SplitSerial<BufferedRx> {
     let storage: &'static RxRing<N> = Box::leak(Box::new(RxRing::new()));
     let b = BufferedRx::new(&c, rx, PeriphLabel::Usart1, storage).unwrap();
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
-    SplitSerial::new(tx, b)
+    SplitSerial::new(tx, b, TEST_CORE_HZ)
 }
 
 #[test]
@@ -765,4 +772,91 @@ fn split_buffered_consumes_the_idle_latch_invisibly() {
     assert_eq!(s.read(&mut out), Ok(0));
     let (_tx, b) = s.into_parts();
     assert!(!b.take_idle(), "the adapter consumed the latch");
+}
+
+// --- the write path's time bound (`specs/serial-adapters.md`; the i2c acquisition-budget twin) ---
+//
+// The defect these pin: every wait on the write path used to be an unbounded `while !flag {}`, on
+// a path a consuming main loop takes 125 times a second inside a 500 ms watchdog. The offroad
+// master took eleven watchdog resets in one bench session on 2026-10-22 with no other unbounded
+// wait in its loop.
+
+/// A write whose `TBE` never comes RETURNS, counts the timeout, and reports the buffer consumed.
+/// Reporting it consumed is the contract, not a convenience: `Ok(0)` on a non-empty buffer makes
+/// `embedded-io`'s `write_all` panic, and the consumer is a panic-free image.
+#[test]
+fn polled_write_times_out_instead_of_spinning_forever() {
+    let _g = setup();
+    let mut s = polled();
+    set_stat(0); // TBE never comes: the register stays full
+    assert_eq!(
+        s.write(&[1, 2, 3]),
+        Ok(3),
+        "the frame is dropped, not retried"
+    );
+    assert_eq!(s.tx_timeouts(), 1);
+    // The port is still usable the moment the flag returns.
+    set_stat(STAT_TBE);
+    assert_eq!(s.write(&[0x42]), Ok(1));
+    assert_eq!(s.tx_timeouts(), 1, "a healthy write counts nothing");
+}
+
+/// `flush`'s `TC` wait is bounded by the same budget and counted the same way.
+#[test]
+fn polled_flush_times_out_instead_of_spinning_forever() {
+    let _g = setup();
+    let mut s = polled();
+    set_stat(STAT_TBE); // TBE set, TC never
+    assert_eq!(s.flush(), Ok(()));
+    assert_eq!(s.tx_timeouts(), 1);
+}
+
+/// The split adapter no longer waits for transmission to COMPLETE per byte. TC is left clear (the
+/// previous byte is still on the wire) and the write must still land: on the 9600-baud BLE port
+/// that wait was 1.04 ms of main loop per metered byte, and on the inter-board link it was ~10
+/// percent of the consuming board's whole CPU.
+#[test]
+fn split_write_does_not_wait_for_transmission_to_complete() {
+    let _g = setup();
+    let (mut s, _ch, _p) = split_ring(32);
+    set_stat(STAT_TBE); // TBE only: the register is free, the wire is not
+    assert_eq!(s.write(&[0x5A]), Ok(1));
+    assert_eq!(tx_byte(), 0x5A);
+    assert_eq!(s.tx_timeouts(), 0);
+}
+
+/// ...and its waits are bounded, both of them.
+#[test]
+fn split_write_and_flush_are_bounded() {
+    let _g = setup();
+    let (mut s, _ch, _p) = split_ring(32);
+    set_stat(0);
+    assert_eq!(s.write(&[1, 2, 3]), Ok(3));
+    assert_eq!(s.tx_timeouts(), 1);
+    set_stat(STAT_TBE); // TBE back, TC still never: flush is the one that waits for TC now
+    assert_eq!(s.flush(), Ok(()));
+    assert_eq!(s.tx_timeouts(), 2);
+}
+
+/// The budget is a WALL-CLOCK bound, which is the whole reason it is derived from the core clock
+/// rather than being a magic iteration count: the same count is 4 ms at 72 MHz and 36 ms at
+/// 8 MHz, and 36 ms is past the consumer's 16 ms motor coast.
+#[test]
+fn the_write_budget_is_a_wall_clock_bound_at_every_clock() {
+    for &hz in &[8_000_000u32, 48_000_000, 72_000_000] {
+        let us = worst_case_write_block_us(hz);
+        // Within one poll iteration of the target either way: the iteration count is an integer,
+        // so the microseconds it buys truncate.
+        assert!(
+            us.abs_diff(WRITE_BUDGET_US) <= WRITE_POLL_CYCLES,
+            "at {hz} Hz the bound is {us} us, not ~{WRITE_BUDGET_US}"
+        );
+        assert!(
+            us < 16_000,
+            "the bound must stay inside the 16 ms motor coast"
+        );
+    }
+    // Derived, not fixed: a faster clock spends more iterations to buy the same microseconds.
+    assert!(write_budget(72_000_000) > write_budget(8_000_000));
+    assert_eq!(write_budget(0), 1, "a nonsensical clock still terminates");
 }

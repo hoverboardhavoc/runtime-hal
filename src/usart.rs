@@ -340,9 +340,23 @@ pub struct UsartRx {
 
 impl UsartTx {
     /// Write one byte, polling TBE then TC (the same polled-send loop as [`Usart::write_byte`]).
+    ///
+    /// **Both waits are unbounded, so this is a bring-up and teardown primitive, not a steady-state
+    /// one.** The `embedded-io` adapter over this half
+    /// ([`crate::serial::SplitSerial`]) deliberately does not use it: a main loop with a motor
+    /// coast and a watchdog needs every wait bounded, which is what that adapter's write budget is
+    /// for.
     #[inline]
     pub fn write_byte(&self, byte: u8) {
         self.regs.write_byte(byte);
+    }
+
+    /// Hand one byte to the transmit data register if `TBE` says it is free, without waiting for
+    /// anything; returns whether it was accepted. See [`UsartRegs::try_write_byte`] for the full
+    /// contract, including what a caller owes before reconfiguring the port.
+    #[inline]
+    pub fn try_write_byte(&self, byte: u8) -> bool {
+        self.regs.try_write_byte(byte)
     }
 
     /// `TBE`: the transmit data register is empty (the `embedded-io` `WriteReady` shape for the
@@ -350,6 +364,14 @@ impl UsartTx {
     #[inline]
     pub fn tx_empty(&self) -> bool {
         self.regs.read_status().tx_empty
+    }
+
+    /// `TC`: the last byte written has fully shifted out and the line is idle. What
+    /// [`crate::serial::SplitSerial`]'s `flush` waits on, and what a caller owes before a baud
+    /// change, a rejoin or a teardown.
+    #[inline]
+    pub fn tx_complete(&self) -> bool {
+        self.regs.read_status().tx_complete
     }
 }
 
