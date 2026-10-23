@@ -43,6 +43,7 @@ const IDLEF: u32 = 1 << 4;
 const ORERR: u32 = 1 << 3;
 const FERR: u32 = 1 << 1;
 const PERR: u32 = 1 << 0;
+const NERR: u32 = 1 << 2;
 
 /// Per-family register offsets + the matching IRQ layout / dispatch vector.
 struct Fam {
@@ -312,12 +313,16 @@ fn b4_ring_full_overflow_surfaces_overrun() {
     assert_eq!(&buf[..n], &[0xA0, 0xA1, 0xA2]);
 }
 
-// --- B5: line errors (ORERR/FERR/PERR) cleared + surfaced, RX not latched, BOTH layouts --------
+// --- B5: line errors (ORERR/FERR/PERR/NERR) cleared + surfaced, RX not latched, BOTH layouts ----
 //
-// Looped over both families because the clear is family-divergent (F1x0 writes the matching `*CF`
+// Looped over both families because the clear is family-divergent (F1x0 writes the matching clear
 // bit to INTC, F10x uses the STAT-then-data read pair), so the buffered ISR's F1x0 line-error clear
-// is exercised here. The three staged errors map to Overrun / Framing / Parity respectively (the
-// spec's "ORERR/FERR/PERR").
+// is exercised here. The four staged errors map to Overrun / Framing / Parity / Noise respectively.
+//
+// NERR is in the loop because it is an `ERRIE` source like the other two under DMA reception
+// (GD32F1x0 User Manual Rev3.6 section 17.4.3 `USART_CTL2` bit 0) and `NEC` (INTC bit 2) is its
+// only clear on that family. An entry that cleared nothing left the level-sensitive USART line
+// asserted and the vector re-entered until the watchdog fired (bench evidence 2026-10-23).
 
 #[test]
 fn b5_line_error_is_cleared_surfaced_and_rx_recovers() {
@@ -326,6 +331,7 @@ fn b5_line_error_is_cleared_surfaced_and_rx_recovers() {
             (ORERR, UsartError::Overrun),
             (FERR, UsartError::Framing),
             (PERR, UsartError::Parity),
+            (NERR, UsartError::Noise),
         ] {
             let _g = setup();
             let mut rx = install::<8>(&fam);
@@ -334,9 +340,9 @@ fn b5_line_error_is_cleared_surfaced_and_rx_recovers() {
             Reg32::new(USART_BASE, fam.stat).write(err_bit);
             fire(&fam);
 
-            // The family-correct clear ran: on F1x0 the matching `*CF` bit (same position as the
-            // STAT flag: ORECF/FECF/PECF) was written to INTC. F10x clears via the read pair (no
-            // INTC register), so there the surfaced error below is the observable.
+            // The family-correct clear ran: on F1x0 the matching clear bit (same position as the
+            // STAT flag: ORECF/FECF/PECF/NEC) was written to INTC. F10x clears via the read pair
+            // (no INTC register), so there the surfaced error below is the observable.
             if let Some(intc) = fam.intc {
                 assert_eq!(
                     Reg32::new(USART_BASE, intc).read() & err_bit,

@@ -191,6 +191,13 @@ const CTL2_DENR: u32 = 1 << 6;
 // Shared STAT bit positions (identical on both families).
 const STAT_PERR: u32 = 1 << 0;
 const STAT_FERR: u32 = 1 << 1;
+/// STAT noise-error flag `NERR` (bit 2 on BOTH families: GD32F1x0 User Manual Rev3.6 section 17.4.8
+/// `USART_STAT`, "set by hardware when noise error is detected on a received frame"; GD32F10x User
+/// Manual Rev2.6 section 16.4.1 `USART_STAT` bit 2, same position). Set when the three oversamples
+/// of any bit of a frame disagree (F1x0 UM 17.3.4), start bit included, and set at the same time as
+/// `RBNE`: the byte is delivered, it is just suspect. It is an `ERRIE` source under DMA reception,
+/// which is why the RX ISR must be able to see and clear it.
+const STAT_NERR: u32 = 1 << 2;
 const STAT_ORERR: u32 = 1 << 3;
 /// STAT IDLE-line-detected flag `IDLEF` (`USART_STAT_IDLEF`, bit 4; identical on both families,
 /// `gd32f10x_usart.h:65` / `gd32f1x0_usart.h:150`). Set when the line went quiet after at least one
@@ -201,10 +208,15 @@ const STAT_TC: u32 = 1 << 6;
 const STAT_TBE: u32 = 1 << 7;
 
 // F1x0 `INTC` flag-clear bits (`gd32f1x0_usart.h`): writing the bit clears the matching sticky STAT
-// flag. The bit positions mirror the STAT positions for these line errors (PERR/FERR/ORERR at
-// 0/1/3), so PECF/FECF/ORECF reuse the same masks. (F10x has no INTC: see `UsartModel::intc`.)
+// flag. The bit positions mirror the STAT positions for these line errors (PERR/FERR/NERR/ORERR at
+// 0/1/2/3), so PECF/FECF/NEC/ORECF reuse the same masks. (F10x has no INTC: see `UsartModel::intc`.)
 const INTC_PECF: u32 = STAT_PERR;
 const INTC_FECF: u32 = STAT_FERR;
+/// F1x0 `INTC` noise-error clear `NEC` (bit 2, mirroring the STAT `NERR` position; GD32F1x0 User
+/// Manual Rev3.6 section 17.4.9 `USART_INTC`: "Writing 1 to this bit clears the NERR bit in the
+/// USART_STAT register"). It is the ONLY way to clear `NERR` on this family: the F0-style block has
+/// no read-the-data-register clear, and under DMA reception the CPU never reads `RDATA` at all.
+const INTC_NEC: u32 = STAT_NERR;
 const INTC_ORECF: u32 = STAT_ORERR;
 /// F1x0 `INTC` IDLE-line-detected flag clear `IDLEC` (`USART_INTC_IDLEC`, bit 4, mirroring the STAT
 /// IDLEF position; `gd32f1x0_usart.h:174`). On F1x0 the IDLE flag is cleared by writing this bit to
@@ -272,6 +284,13 @@ pub struct Status {
     pub framing: bool,
     /// Parity error (`STAT_PERR`).
     pub parity: bool,
+    /// Noise error (`STAT_NERR`): the oversamples of at least one frame bit disagreed. Carried here
+    /// because it is one of the three conditions `ERRIE` raises the IRQ for under DMA reception
+    /// (GD32F1x0 User Manual Rev3.6 section 17.4.3 `USART_CTL2` bit 0: "an interrupt will occur
+    /// whenever the FERR bit or the ORERR bit or the NERR bit is set"), so a status snapshot that
+    /// could not represent it left the shared RX ISR unable to name, clear, or count the condition
+    /// it had been woken for.
+    pub noise: bool,
     /// Read data buffer not empty (`STAT_RBNE`): a byte is available.
     pub rx_ready: bool,
     /// Transmit data buffer empty (`STAT_TBE`): the next byte can be written.
@@ -282,7 +301,12 @@ pub struct Status {
 
 impl Status {
     /// The first line error present, as a [`UsartError`], if any (overrun, then framing, then
-    /// parity). T7 surfaces this through the `embedded-io` seam.
+    /// parity, then noise). T7 surfaces this through the `embedded-io` seam.
+    ///
+    /// Noise comes last because it is the weakest claim about the frame (the bits were assembled,
+    /// an oversample merely disagreed), but it IS present: a frame whose only defect is noise is a
+    /// line error, and it has to be reported as one or the `ERRIE` ISR that was woken by it finds
+    /// nothing to act on and clears nothing.
     #[inline]
     pub fn line_error(&self) -> Option<UsartError> {
         if self.overrun {
@@ -291,6 +315,8 @@ impl Status {
             Some(UsartError::Framing)
         } else if self.parity {
             Some(UsartError::Parity)
+        } else if self.noise {
+            Some(UsartError::Noise)
         } else {
             None
         }
@@ -714,6 +740,7 @@ impl UsartRegs {
             overrun: s & STAT_ORERR != 0,
             framing: s & STAT_FERR != 0,
             parity: s & STAT_PERR != 0,
+            noise: s & STAT_NERR != 0,
             rx_ready: s & STAT_RBNE != 0,
             tx_empty: s & STAT_TBE != 0,
             tx_complete: s & STAT_TC != 0,
@@ -756,19 +783,19 @@ impl UsartRegs {
         while self.stat().read() & STAT_TC == 0 {}
     }
 
-    /// Clear any sticky line-error flags (overrun / framing / parity) the family-correct way, so a
-    /// polled stream RX self-recovers instead of latching dead.
+    /// Clear any sticky line-error flags (overrun / framing / parity / noise) the family-correct
+    /// way, so a polled stream RX self-recovers instead of latching dead.
     ///
     /// A receive **overrun** (ORERR) is the FIFO-less hazard: the F1/F0 USART has no RX FIFO, so a
     /// byte not taken within one character time overruns, and an uncleared ORERR then blocks all
     /// further RBNE (RX dies). The two families clear it differently, so the [`UsartModel`] owns the
-    /// branch (link_bench's `clear_overrun`, generalised to framing/parity too):
+    /// branch (link_bench's `clear_overrun`, generalised to framing/parity/noise too):
     ///
     /// - **F10x** (F1-style, `model.intc == None`): a STAT-then-data-register read pair clears the
     ///   sticky flags. This reads STAT (already in `status`) then the data register, discarding the
     ///   (possibly stale/overwritten) byte; the clear is the point, not the byte.
-    /// - **F1x0** (F0-style, `model.intc == Some(off)`): write the matching `*CF` bit (ORECF/FECF/
-    ///   PECF) to the `INTC` register at `off`; no data-register read is involved.
+    /// - **F1x0** (F0-style, `model.intc == Some(off)`): write the matching clear bit (ORECF/FECF/
+    ///   PECF/NEC) to the `INTC` register at `off`; no data-register read is involved.
     ///
     /// Only the flags present in `status` are cleared (a single masked INTC write on F1x0; the read
     /// pair on F10x clears all of them at once, which is correct because they are all recoverable).
@@ -789,6 +816,15 @@ impl UsartRegs {
                 }
                 if status.parity {
                     clr |= INTC_PECF;
+                }
+                // NERR is cleared ONLY by writing NEC to INTC (GD32F1x0 User Manual Rev3.6 section
+                // 17.4.9; there is no read-the-data-register clear on this family, and under DMA
+                // reception the CPU never reads RDATA). Omitting it left a noisy frame's NERR set
+                // while ERRIE was enabled, and the USART interrupt line is LEVEL-sensitive into the
+                // NVIC, so the vector re-entered forever at a priority above SysTick until the
+                // watchdog reset the board (bench evidence 2026-10-23).
+                if status.noise {
+                    clr |= INTC_NEC;
                 }
                 if clr != 0 {
                     Reg32::new(self.base, intc_off).write(clr);

@@ -314,6 +314,32 @@ fn try_read_byte_surfaces_framing_and_parity_after_clearing() {
     assert_eq!(u.try_read_byte(), Err(UsartError::Parity));
 }
 
+#[test]
+fn status_carries_noise_and_line_error_names_it() {
+    // NERR (STAT bit 2 on both families) is a line error in its own right: `ERRIE` fires on framing
+    // OR overrun OR noise under DMA reception, so a status snapshot that could not represent it let
+    // the shared RX ISR wake, recognise nothing, clear nothing, and re-enter forever on a
+    // level-sensitive line (the 2026-10-23 reset storm).
+    let _g = seed_reset();
+    let u = Usart::bring_up(&chip_for(ClockPath::F1x0Rcu), &ref_72m(), &bench_cfg()).unwrap();
+
+    // STAT 0x1C on F1x0: NERR alone, which is the case that used to read as "no line error".
+    Reg32::new(USART_BASE, 0x1C).write(1 << 2);
+    let st = u.read_status();
+    assert!(st.noise, "STAT bit 2 reads back as a noise condition");
+    assert_eq!(
+        st.line_error(),
+        Some(UsartError::Noise),
+        "a noise-only frame IS a line error"
+    );
+
+    // Precedence is unchanged: the stronger conditions still win over noise.
+    Reg32::new(USART_BASE, 0x1C).write((1 << 2) | (1 << 3));
+    assert_eq!(u.read_status().line_error(), Some(UsartError::Overrun));
+    Reg32::new(USART_BASE, 0x1C).write((1 << 2) | (1 << 1));
+    assert_eq!(u.read_status().line_error(), Some(UsartError::Framing));
+}
+
 // --- (d) overrun (ORE) self-recovery, both families -------------------------------------------
 
 #[test]

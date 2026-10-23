@@ -101,6 +101,15 @@ pub enum UsartError {
     Framing,
     /// Parity error.
     Parity,
+    /// Noise error (`NERR`): the three oversamples of at least one bit of the received frame
+    /// disagreed, so the frame is suspect but its bits were still assembled and delivered.
+    ///
+    /// A condition in its own right because it is a separate STAT flag with a separate clear, and
+    /// an `ERRIE` interrupt source alongside framing and overrun (GD32F1x0 User Manual Rev3.6
+    /// section 17.4.8 `USART_STAT` bit 2 / 17.4.9 `USART_INTC` bit 2 `NEC`; GD32F10x User Manual
+    /// Rev2.6 section 16.4.1 `USART_STAT` bit 2). Recoverable in place exactly like framing and
+    /// parity: the clear runs before this is surfaced, so it cannot latch.
+    Noise,
     /// An error the kind mapping does not name specifically.
     Other,
 }
@@ -115,6 +124,7 @@ impl embedded_io::Error for UsartError {
             | UsartError::LineError
             | UsartError::Framing
             | UsartError::Parity
+            | UsartError::Noise
             | UsartError::Other => embedded_io::ErrorKind::Other,
         }
     }
