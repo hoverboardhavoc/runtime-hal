@@ -47,6 +47,7 @@ const STAT_OFF: u32 = 0x00;
 const DATA_OFF: u32 = 0x04;
 const STAT_PERR: u32 = 1 << 0;
 const STAT_FERR: u32 = 1 << 1;
+const STAT_NERR: u32 = 1 << 2;
 const STAT_ORERR: u32 = 1 << 3;
 const STAT_IDLEF: u32 = 1 << 4;
 const STAT_RBNE: u32 = 1 << 5;
@@ -665,6 +666,45 @@ fn split_dma_absorbs_a_line_error_and_keeps_reading() {
         "no further counting once the line is clean"
     );
     assert_eq!(s.lap_overruns(), 0, "still no lap");
+}
+
+#[test]
+fn split_dma_counts_a_noise_only_frame_as_a_line_error() {
+    // A frame whose ONLY defect is noise reaches the adapter's `line_errors` counter, which is what
+    // the firmware publishes as the inter-board port's `CTRL_OBS` word 13. Before this it reached
+    // nothing: `Status` could not represent NERR, the ISR recognised no flag, cleared none, and the
+    // counter stayed at 0 while the level-sensitive USART line re-entered the vector until the
+    // watchdog reset the board (bench evidence 2026-10-23, where `link_line_errors` read 0 beside a
+    // lap-overrun of 1 on a line that had plainly been disturbed).
+    let _g = setup();
+    let (mut s, ch, ptr) = split_ring(8);
+
+    dma_write(ptr, 0, 0xAA);
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 1);
+    set_stat(STAT_NERR); // noise alone: no overrun, no framing, no parity
+    fire_usart();
+
+    let mut out = [0u8; 8];
+    assert_eq!(s.read(&mut out), Ok(0), "the disturbed byte is dropped");
+    assert_eq!(
+        s.line_errors(),
+        1,
+        "a noise-only frame is counted as a line error (CTRL_OBS word 13)"
+    );
+    assert_eq!(s.lap_overruns(), 0, "it is a wire glitch, not a lap");
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(ch)).read() & CHEN,
+        CHEN,
+        "channel stays LIVE: noise self-heals like any other line disturbance"
+    );
+
+    // The line is clean again and bytes still flow.
+    set_stat(0);
+    dma_write(ptr, 1, 0xEE);
+    Reg32::new(DMA0_BASE, ch_cnt(ch)).write(8 - 2);
+    assert_eq!(s.read(&mut out), Ok(1));
+    assert_eq!(out[0], 0xEE);
+    assert_eq!(s.line_errors(), 1, "counted once, not per read");
 }
 
 #[test]

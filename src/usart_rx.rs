@@ -46,10 +46,14 @@ use crate::usart::{UsartRegs, UsartRx};
 
 /// Sticky line-error codes stored in [`RxSlot::line_error`] (0 = none). The buffered path surfaces a
 /// line error through the next [`BufferedRx::read`], the way the polled path surfaces it inline.
+/// The DMA-ring path collapses all of them to [`UsartError::LineError`] (any wire disturbance takes
+/// the same cursor-resync recovery), so the code's job there is to make the event COUNTABLE: it is
+/// what carries a noisy frame to the adapter's `line_errors` counter.
 const ERR_NONE: u8 = 0;
 const ERR_FRAMING: u8 = 1;
 const ERR_PARITY: u8 = 2;
 const ERR_OVERRUN: u8 = 3;
+const ERR_NOISE: u8 = 4;
 
 /// One static RX context (the bring-up of a [`BufferedRx`] installs one per instance; see
 /// [`RX_SLOTS`]). Every field is an atomic, so the whole `static` is `Sync` and the ISR reads it
@@ -347,8 +351,14 @@ fn on_usart_rx_irq(slot: &RxSlot) {
         slot.is_f1x0.load(Ordering::Acquire),
     );
 
-    // Line error (overrun / framing / parity): record sticky + clear the family-correct way so it
-    // cannot latch and strand RX (the regression the polled path fixed, carried over).
+    // Line error (overrun / framing / parity / noise): record sticky + clear the family-correct way
+    // so it cannot latch and strand RX (the regression the polled path fixed, carried over).
+    //
+    // Noise is in that list because `ERRIE` fires on framing OR overrun OR noise under DMA
+    // reception (GD32F1x0 User Manual Rev3.6 section 17.4.3 `USART_CTL2` bit 0), and the USART
+    // interrupt line is LEVEL-sensitive into the NVIC: an entry that recognises no flag clears
+    // nothing, the line stays asserted, and this vector re-enters forever at a priority above
+    // SysTick. That is what reset the rover's master twelve times on 2026-10-23.
     let st = u.read_status();
     if let Some(e) = st.line_error() {
         record_line_error(slot, e);
@@ -375,12 +385,13 @@ fn on_usart_rx_irq(slot: &RxSlot) {
 }
 
 /// Record a line error stickily, keeping the FIRST one seen (precedence matches
-/// [`crate::usart::Status::line_error`]: overrun, then framing, then parity).
+/// [`crate::usart::Status::line_error`]: overrun, then framing, then parity, then noise).
 fn record_line_error(slot: &RxSlot, e: UsartError) {
     let code = match e {
         UsartError::Overrun => ERR_OVERRUN,
         UsartError::Framing => ERR_FRAMING,
         UsartError::Parity => ERR_PARITY,
+        UsartError::Noise => ERR_NOISE,
         _ => ERR_NONE,
     };
     if code != ERR_NONE {
@@ -408,6 +419,7 @@ fn decode_error(code: u8) -> UsartError {
     match code {
         ERR_FRAMING => UsartError::Framing,
         ERR_PARITY => UsartError::Parity,
+        ERR_NOISE => UsartError::Noise,
         _ => UsartError::Overrun,
     }
 }
@@ -582,8 +594,8 @@ impl BufferedRx {
     /// non-blocking). A sticky condition is surfaced FIRST as an `Err`, then cleared, so the next
     /// `read` resumes draining:
     /// - [`UsartError::Overrun`]: the ring filled (a byte was dropped) or the USART raised `ORERR`.
-    /// - [`UsartError::Framing`] / [`UsartError::Parity`]: a line error the ISR cleared so it cannot
-    ///   latch.
+    /// - [`UsartError::Framing`] / [`UsartError::Parity`] / [`UsartError::Noise`]: a line error the
+    ///   ISR cleared so it cannot latch.
     ///
     /// `Ok(0)` means "nothing buffered right now", never an error (matching the `try_read_byte`
     /// contract that the empty case is not a failure).
