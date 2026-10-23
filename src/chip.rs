@@ -201,11 +201,24 @@ impl Chip {
     /// pin may be claimed for the caller's function is still the ownership backstop's answer, asked
     /// by whichever configure seam consumes the handle.
     pub fn pin(&self, packed: u8) -> Result<Pin<Input<Floating>>, DescriptorError> {
+        let base = self.clocked_port_base(packed)?;
+        Ok(Pin::new(base, self.desc.gpio, packed))
+    }
+
+    /// Resolve a packed pin byte to its port BASE with that port's clock enabled: the one body
+    /// behind [`Chip::pin`] and [`Chip::input_group`], which both need exactly this and must not
+    /// disagree about it.
+    ///
+    /// `#[inline(never)]` on purpose. The port-label decode and the family's enable-bit selection
+    /// are both switch tables, and [`Chip::input_group`] calls this once per line over a fixed
+    /// three-element array, which the optimiser unrolls: inlined, the two tables are emitted per
+    /// call site and the group builder costs ~520 B of flashed span instead of three branches.
+    #[inline(never)]
+    fn clocked_port_base(&self, packed: u8) -> Result<u32, DescriptorError> {
         let port = gpio_port_label(packed)?;
         let base = self.base(port)?;
-        let rcu = self.rcu_base()?;
-        crate::clock::enable_gpio_port(rcu, self.desc.clock, port)?;
-        Ok(Pin::new(base, self.desc.gpio, packed))
+        crate::clock::enable_gpio_port(self.rcu_base()?, self.desc.clock, port)?;
+        Ok(base)
     }
 
     /// Make the JTAG-overlay pins (PA15 / PB3 / PB4) usable as GPIO while keeping SWD live.
@@ -371,18 +384,28 @@ impl Chip {
     /// layer uses this for its rotor-position lines (read each cycle, decoded outside the HAL); the
     /// reader itself is a neutral GPIO sampler.
     ///
+    /// **Each pin's port CLOCK is enabled here**, as [`Chip::pin`] and the two routing seams
+    /// already do it for the pins they hand out. An unclocked GPIO port reads 0 on every line and
+    /// never faults, so a group built over a port nothing else happened to clock returns a
+    /// constant zero code that looks exactly like a wiring fault. That is not hypothetical: the
+    /// classywalk offroad boards put two of their three hall lines on port C and nothing else on
+    /// the board uses that port, so `RCU_AHBEN.PCEN` stayed clear, `GPIOC_ISTAT` read
+    /// `0x0000_0000`, the hall code was a permanent 0, and the motor's invalid-hall fault vetoed
+    /// every arm (measured over SWD 2026-10-24: setting PCEN by hand turned `ISTAT` into
+    /// `0x0000_5FFF` and the hall code into a valid 4 on the spot). Resolving a pin and leaving it
+    /// unreadable is half a resolution, so the clock belongs to the resolver.
+    ///
     /// Returns [`DescriptorError::MissingBase`] if any pin's port is not in the descriptor (or the
-    /// port index is one this crate does not model). This is the base-hidden builder: it resolves the
-    /// per-pin port bases and the family ISTAT offset internally, so no caller-facing raw base or
-    /// `GpioPath` is involved.
+    /// port index is one this crate does not model), or if the descriptor carries no RCU base to
+    /// clock the port from. This is the base-hidden builder: it resolves the per-pin port bases and
+    /// the family ISTAT offset internally, so no caller-facing raw base or `GpioPath` is involved.
     pub fn input_group(
         &self,
         pins: [u8; INPUT_GROUP_LINES],
     ) -> Result<InputGroup, DescriptorError> {
         let mut lines = [(0u32, 0u8); INPUT_GROUP_LINES];
         for (slot, &pin) in lines.iter_mut().zip(pins.iter()) {
-            let base = self.base(gpio_port_label(pin)?)?;
-            *slot = (base, pin & 0x0F);
+            *slot = (self.clocked_port_base(pin)?, pin & 0x0F);
         }
         Ok(InputGroup::resolve(self.desc.gpio, lines))
     }
