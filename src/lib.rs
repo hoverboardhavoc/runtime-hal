@@ -76,7 +76,7 @@ pub use addr::{AddrTable, PeriphLabel};
 pub use chip::Chip;
 pub use clock::{
     clear_reset_flags, configure_tree, configure_tree_timeout, enable_adc, enable_general_timer,
-    enable_gpio_port, enable_i2c, enable_lsi, enable_spi, enable_timer, enable_usart,
+    enable_gpio_port, enable_i2c, enable_lsi, enable_spi, enable_timer, enable_usart, reset_cause,
     was_fwdgt_reset, ClockConfig, ClockSource, DEFAULT_CLOCK_SPIN_CAP,
 };
 pub use config::{
@@ -127,6 +127,6 @@ pub use usart::{
 };
 pub use usart_rx::{supports_rx, BufferedRx, RingBufferedRx, RxRing};
 pub use watchdog::{
-    clear_reset_cause, was_watchdog_reset, FreeWatchdog, WdgTimeout, FWDGT_TIMEOUT, LSI_HZ,
-    PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,
+    clear_reset_cause, reset_cause_flags, was_watchdog_reset, FreeWatchdog, WdgTimeout,
+    FWDGT_TIMEOUT, LSI_HZ, PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,
 };

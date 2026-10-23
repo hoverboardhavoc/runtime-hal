@@ -391,12 +391,23 @@ pub fn enable_general_timer(
 // --- LSI / IRC40K (the free-watchdog clock source) + reset-cause flags (G-WDG) ----------------
 //
 // The free watchdog (FWDGT) is clocked from the always-available ~40 kHz internal RC oscillator
-// (IRC40K / LSI). Its enable + stabilisation flag and the watchdog reset-cause flag all live in the
-// RCU `RSTSCK` register (offset 0x24) with the SAME bit positions on both families
+// (IRC40K / LSI). Its enable + stabilisation flag and the whole set of reset-cause flags all live in
+// the RCU `RSTSCK` register (offset 0x24) with the SAME bit positions on both families
 // (gd32f1x0_rcu.h / gd32f10x_rcu.h): IRC40KEN bit 0, IRC40KSTB bit 1, RSTFC (reset-flag-clear) bit
 // 24, FWDGTRSTF bit 29. They sit in `clock.rs` because this module owns the RCU base + register
 // model, NOT because they branch by family (they do not); the FWDGT register block itself is one
 // model parameterised by base (see `watchdog.rs`).
+//
+// THE CAUSE FIELD, both manuals, bit for bit. GD32F1x0 User Manual Rev3.6 section 4.3.10 and
+// GD32F10x User Manual Rev2.6 section 5.3.10 give `RCU_RSTSCK` the same offset (0x24), the same
+// reset value (0x0C00_0000, which is PORRSTF + EPRSTF already set out of a power-on) and the same
+// positions for every cause the fleet can hit: LPRSTF 31 (deep-sleep / standby), WWDGTRSTF 30,
+// FWDGTRSTF 29, SWRSTF 28, PORRSTF 27, EPRSTF 26 (the external NRST pin). The F1x0 defines two
+// more that the F10x leaves reserved-and-reading-zero, OBLRSTF 25 (option-byte loader) and
+// V12RSTF 23 (the 1.2 V domain), so a mask covering all eight is correct on both parts and needs
+// no `ClockPath` branch. Every one of them is cleared by writing 1 to RSTFC and by nothing else:
+// they are STICKY across resets and accumulate, which is why a board that has never cleared them
+// reports its whole history at once and says nothing about the most recent reset.
 
 /// `RCU_RSTSCK` (reset source / clock register) offset (both families, 0x24).
 const RSTSCK: u32 = 0x24;
@@ -408,6 +419,12 @@ const RSTSCK_IRC40KSTB: u32 = 1 << 1;
 const RSTSCK_RSTFC: u32 = 1 << 24;
 /// Free-watchdog reset flag (`RSTSCK_FWDGTRSTF`, bit 29): set when the last reset was the FWDGT.
 const RSTSCK_FWDGTRSTF: u32 = 1 << 29;
+/// Every reset-cause flag in `RSTSCK`, and nothing else: bits 31..25 (low-power, window watchdog,
+/// free watchdog, software, power, external pin, option-byte loader) plus bit 23 (the 1.2 V
+/// domain). RSTFC (bit 24) is excluded because it is the clear CONTROL, not a cause, and the
+/// IRC40K enable/stable pair (bits 0..1) because they are the oscillator, not the reset. The two
+/// F1x0-only bits read 0 on an F10x, so the one mask serves both families.
+const RSTSCK_CAUSE_MASK: u32 = 0xFE80_0000;
 
 /// Spin budget for the IRC40K stabilisation poll. Iterations, not cycles (clock-independent),
 /// generous enough never to false-time a healthy oscillator but always escaping a dead one. Mirrors
@@ -437,6 +454,22 @@ pub fn enable_lsi(rcu_base: u32) -> Result<(), ClockError> {
     Ok(())
 }
 
+/// Every reset-cause flag `RSTSCK` is carrying, masked to the cause field (`RSTSCK_CAUSE_MASK`)
+/// and otherwise unmodified: the bits at their register positions, so a reader decodes them
+/// against the manual rather than against a re-encoding invented here.
+///
+/// The flags are STICKY and accumulate until [`clear_reset_flags`] writes RSTFC, so what this
+/// returns is "every cause since the last clear", not "the last cause". A firmware that wants an
+/// unambiguous per-boot answer reads this at the boot seam and clears immediately, making the
+/// next read describe exactly one reset. Same positions on both families (the header above), so
+/// there is no [`ClockPath`] branch.
+///
+/// The public entry point is [`crate::watchdog::reset_cause_flags`].
+#[inline]
+pub fn reset_cause(rcu_base: u32) -> u32 {
+    Reg32::new(rcu_base, RSTSCK).read() & RSTSCK_CAUSE_MASK
+}
+
 /// True if the last reset was caused by the free watchdog (`RSTSCK.FWDGTRSTF`).
 ///
 /// The reset-cause flag persists across the reset until [`clear_reset_flags`] clears it, so a
@@ -444,7 +477,7 @@ pub fn enable_lsi(rcu_base: u32) -> Result<(), ClockError> {
 /// families. The public entry point is [`crate::watchdog::was_watchdog_reset`].
 #[inline]
 pub fn was_fwdgt_reset(rcu_base: u32) -> bool {
-    Reg32::new(rcu_base, RSTSCK).read() & RSTSCK_FWDGTRSTF != 0
+    reset_cause(rcu_base) & RSTSCK_FWDGTRSTF != 0
 }
 
 /// Clear the RCU reset-cause flags by writing `RSTSCK.RSTFC` (reset-flag clear), so a later

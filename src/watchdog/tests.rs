@@ -10,8 +10,9 @@
 //!   bit with [`WatchdogError::Timeout`].
 //! - **feed** ([`FreeWatchdog::feed`]): writes ONLY the reload key (CTL = 0xAAAA), leaving PSC/RLD
 //!   untouched.
-//! - **reset cause** ([`was_watchdog_reset`] / [`clear_reset_cause`], over `clock::was_fwdgt_reset`
-//!   / `clock::clear_reset_flags`): reads the `FWDGTRSTF` bit, and the clear writes `RSTFC`.
+//! - **reset cause** ([`reset_cause_flags`] / [`was_watchdog_reset`] / [`clear_reset_cause`],
+//!   over `clock::reset_cause` / `clock::clear_reset_flags`): the whole cause field at its register
+//!   positions, the `FWDGTRSTF` bit on its own, and the clear writing `RSTFC`.
 //!
 //! The mock backend is a flat array (a static snapshot, not a sequencer): each CTL write overwrites
 //! the last, so the inter-write ORDER of the three CTL keys is not separately observable here (it is
@@ -191,6 +192,40 @@ fn was_watchdog_reset_reads_fwdgtrstf() {
     assert!(!was_watchdog_reset(RCU_BASE), "clear flag -> false");
     Reg32::new(RCU_BASE, RSTSCK).write(1 << 29);
     assert!(was_watchdog_reset(RCU_BASE), "set FWDGTRSTF -> true");
+}
+
+/// **The cause field is every flag the manuals define, at their register positions.** GD32F1x0
+/// UM Rev3.6 4.3.10 / GD32F10x UM Rev2.6 5.3.10: LPRSTF 31, WWDGTRSTF 30, FWDGTRSTF 29, SWRSTF 28,
+/// PORRSTF 27, EPRSTF 26, plus the F1x0-only OBLRSTF 25 and V12RSTF 23 (reserved and reading zero
+/// on an F10x, so the one mask serves both). RSTFC (24) is the clear control and the IRC40K pair
+/// (0, 1) is the oscillator, so neither belongs in a cause reading.
+#[test]
+fn reset_cause_flags_reports_the_whole_cause_field_and_nothing_around_it() {
+    let _g = seed_reset();
+    assert_eq!(reset_cause_flags(RCU_BASE), 0, "nothing set -> no cause");
+
+    // The documented power-on reset value: power reset and external pin both already set. A read
+    // of it says nothing about the most recent reset, which is why the boot seam clears.
+    Reg32::new(RCU_BASE, RSTSCK).write(0x0C00_0000);
+    assert_eq!(reset_cause_flags(RCU_BASE), 0x0C00_0000);
+
+    // Every defined cause bit survives the mask.
+    for bit in [31, 30, 29, 28, 27, 26, 25, 23] {
+        Reg32::new(RCU_BASE, RSTSCK).write(1 << bit);
+        assert_eq!(
+            reset_cause_flags(RCU_BASE),
+            1 << bit,
+            "bit {bit} is a cause and is reported where the manual puts it"
+        );
+    }
+
+    // RSTFC is the clear control, the IRC40K pair is the oscillator: not causes, not reported.
+    Reg32::new(RCU_BASE, RSTSCK).write((1 << 24) | 0b11);
+    assert_eq!(reset_cause_flags(RCU_BASE), 0, "no cause bit set");
+
+    // And the sticky accumulation the clear exists to break: two causes read as both.
+    Reg32::new(RCU_BASE, RSTSCK).write((1 << 29) | (1 << 28) | (1 << 24) | 0b11);
+    assert_eq!(reset_cause_flags(RCU_BASE), (1 << 29) | (1 << 28));
 }
 
 #[test]

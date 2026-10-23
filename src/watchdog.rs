@@ -332,6 +332,17 @@ pub fn was_watchdog_reset(rcu_base: u32) -> bool {
     clock::was_fwdgt_reset(rcu_base)
 }
 
+/// Every RCU reset-cause flag, at its register bit position (`RSTSCK` bits 31..25 and 23).
+///
+/// A convenience re-export of [`crate::clock::reset_cause`], beside [`was_watchdog_reset`] because
+/// the watchdog is one of the causes it reports. The flags are sticky and accumulate, so read this
+/// at the boot seam and call [`clear_reset_cause`] straight after: that pairing is what makes a
+/// reading name THIS boot's reset instead of every reset since the part was last powered.
+#[inline]
+pub fn reset_cause_flags(rcu_base: u32) -> u32 {
+    clock::reset_cause(rcu_base)
+}
+
 /// Clear the RCU reset-cause flags (`RSTSCK.RSTFC`), so the next boot's [`was_watchdog_reset`]
 /// reflects only a fresh reset cause. A convenience re-export of [`crate::clock::clear_reset_flags`].
 #[inline]
