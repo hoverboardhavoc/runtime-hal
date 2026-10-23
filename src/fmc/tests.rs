@@ -197,7 +197,10 @@ fn check_program_into_erased(chip: &Chip) {
     let mut fmc = Fmc::new(chip);
     let addr = FLASH_BASE;
     Reg32::new(CTL_A, 0).write(CTL_LK); // LK set so unlock fires.
-    seed_erased(addr, 8);
+
+    // Ten bytes, not eight: the span's successor halfword must read erased too, or the
+    // closed-halfword pre-check refuses the last (HIGH) halfword of the span.
+    seed_erased(addr, 10);
 
     let bytes = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     assert_eq!(fmc.program(addr, &bytes), Ok(()));
@@ -327,6 +330,104 @@ fn mock_store_models_write_once_reprogram_refused() {
         rh(addr),
         0xAAAA,
         "re-program refused: content unchanged (not ANDed)"
+    );
+}
+
+// --- the closed-halfword rule (module docs, bench-measured 2026-10-23) ------------------------
+
+#[test]
+fn program_of_a_closed_high_halfword_is_refused_with_zero_writes() {
+    // The span reads fully erased, but its LAST halfword is the HIGH half of a word whose successor
+    // is already programmed, which closes it on silicon. The pre-check must refuse before the FMC
+    // is touched, so the span's FIRST halfword is not left behind (the config store's half-written
+    // page-header commit).
+    for chip in [chip_k1(), chip_k2()] {
+        let _g = seed_reset();
+        let mut fmc = Fmc::new(&chip);
+        let addr = FLASH_BASE;
+        seed_erased(addr, 8);
+        Reg16::new(addr + 4, 0).write(0x0001); // the successor of addr+2: closes it.
+        seed_fmc_sentinel();
+        assert_eq!(
+            fmc.program(addr, &[0x52, 0x4F, 0x54, 0x53]),
+            Err(FmcError::Closed)
+        );
+        assert_fmc_untouched();
+        assert_eq!(rh(addr), ERASED, "no partial write: the low halfword too");
+        assert_eq!(
+            rh(addr + 2),
+            ERASED,
+            "the closed halfword still reads erased"
+        );
+    }
+}
+
+#[test]
+fn ascending_order_is_never_closed() {
+    // The same four bytes land when nothing above them has been programmed yet, which is the order
+    // every caller must use. Then the word ABOVE programs on top, and closes nothing already written.
+    for chip in [chip_k1(), chip_k2()] {
+        let _g = seed_reset();
+        let mut fmc = Fmc::new(&chip);
+        let addr = FLASH_BASE;
+        seed_erased(addr, 8);
+        assert_eq!(fmc.program(addr, &[0x52, 0x4F, 0x54, 0x53]), Ok(()));
+        assert_eq!(fmc.program(addr + 4, &[0x01, 0x00]), Ok(()));
+        assert_eq!(rh(addr), 0x4F52);
+        assert_eq!(rh(addr + 2), 0x5354);
+        assert_eq!(rh(addr + 4), 0x0001);
+    }
+}
+
+#[test]
+fn a_closed_low_halfword_is_not_a_thing() {
+    // Only a HIGH halfword is ever closed. A LOW halfword whose own word's high half is already
+    // programmed still programs (measured: write `+2`, then `+0`, both take).
+    for chip in [chip_k1(), chip_k2()] {
+        let _g = seed_reset();
+        let mut fmc = Fmc::new(&chip);
+        let addr = FLASH_BASE;
+        seed_erased(addr, 6);
+        assert_eq!(fmc.program(addr + 2, &[0x54, 0x53]), Ok(()));
+        assert_eq!(fmc.program(addr, &[0x52, 0x4F]), Ok(()));
+        assert_eq!(rh(addr), 0x4F52);
+    }
+}
+
+#[test]
+fn the_rule_does_not_cross_a_page_boundary() {
+    // Measured: programming the first halfword of a page leaves the previous page's last halfword
+    // programmable. The pre-check must not refuse it.
+    for chip in [chip_k1(), chip_k2()] {
+        let _g = seed_reset();
+        let mut fmc = Fmc::new(&chip);
+        let page = fmc.page_size();
+        let last = FLASH_BASE + page - 2; // last halfword of page 0 (a HIGH halfword)
+        seed_erased(FLASH_BASE, 2 * page);
+        Reg16::new(FLASH_BASE + page, 0).write(0xAAAA); // first halfword of page 1
+        assert_eq!(fmc.program(last, &[0xBB, 0xBB]), Ok(()));
+        assert_eq!(rh(last), 0xBBBB);
+    }
+}
+
+#[test]
+fn mock_store_models_the_closed_halfword_rule() {
+    // Past the API pre-check: the mock store itself must refuse a closed halfword with PGERR and
+    // leave it reading erased, so a descending-write bug fails here and not only on silicon.
+    let _g = seed_reset();
+    let chip = chip_k1();
+    let fmc = Fmc::new(&chip);
+    let addr = FLASH_BASE;
+    Reg32::new(CTL_A, 0).write(CTL_LK);
+    seed_erased(addr, 8);
+    assert_eq!(fmc.program_host(addr + 4, &[0x01, 0x00]) & STAT_PGERR, 0);
+    let st = fmc.program_host(addr, &[0x52, 0x4F, 0x54, 0x53]);
+    assert_ne!(st & STAT_PGERR, 0, "the closed high halfword sets PGERR");
+    assert_eq!(rh(addr), 0x4F52, "the low halfword still programs");
+    assert_eq!(
+        rh(addr + 2),
+        ERASED,
+        "the closed one is refused, still erased"
     );
 }
 

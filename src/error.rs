@@ -338,6 +338,13 @@ pub enum FmcError {
     /// touched (flash left unchanged, no partial write). Recoverable by erasing the page; typically
     /// signals a frontier/scan bug, distinct from [`FmcError::BadArg`].
     NotErased,
+    /// A program target is the HIGH halfword of a 32-bit word whose successor (the next word's LOW
+    /// halfword, `addr + 2`) is already programmed in the same page, which CLOSES it: the silicon
+    /// refuses that program with `PGERR` and leaves the cell reading `0xFFFF`. Caught by the
+    /// pre-check before the FMC is touched (flash left unchanged, no partial write). Recoverable
+    /// only by erasing the page; it means the caller programmed the page out of ascending address
+    /// order. See [`crate::fmc`], "A high halfword is closed by its successor".
+    Closed,
     /// The controller raised `WPERR` (a write-protected page).
     WriteProtect,
     /// The controller raised `PGERR` for a reason the pre-check did not foresee (the backstop behind
