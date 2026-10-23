@@ -29,6 +29,31 @@
 //!   spent halfword. [`Fmc::erase_page`] is page-at-a-time only (no mass erase: it keeps a bricking
 //!   footgun out of the immutable bootloader's reach).
 //!
+//! # A high halfword is closed by its successor: PROGRAM A PAGE IN ASCENDING ORDER
+//!
+//! Erased is not the same as programmable. Programming the halfword at a 4-byte-aligned address
+//! `A` (the LOW halfword of a 32-bit word) CLOSES the halfword at `A - 2` (the HIGH halfword of the
+//! preceding word) for the rest of that page's erase cycle. A later program there is refused with
+//! `PGERR` and the cell keeps reading `0xFFFF`, so a read-back of the target alone cannot tell a
+//! closed cell from an erased one.
+//!
+//! Measured on a GD32F130C8 on 2026-10-23 by driving this exact register sequence over SWD with the
+//! core halted, one erased page per trial (`specs/bench-evidence/2026-10-23/store-compact-commit/`
+//! in the firmware repo). The rule is narrow and every edge of it was measured: only the HIGH
+//! halfword of a word is ever closed, only by a write to the next word's LOW halfword, and only that
+//! one halfword (writing `+0xC` leaves `+8` programmable; writing `+8` closes `+6` and leaves `+4`
+//! programmable). A write to a HIGH halfword closes nothing. It does NOT cross a page boundary:
+//! programming the first halfword of a page leaves the previous page's last halfword programmable.
+//! Ascending order never trips it, which is why an append-style caller never saw it.
+//!
+//! So the contract for every caller is: **within one erase cycle of a page, program halfwords in
+//! strictly ascending address order**. A caller that must commit something LAST puts that something
+//! at the HIGHEST address it writes, not the lowest. [`Fmc::program`] enforces what it can see: a
+//! target whose successor is already programmed is refused with [`FmcError::Closed`] BEFORE the FMC
+//! is touched, so the call is all-or-nothing instead of leaving the surviving half of the span in
+//! flash (which is exactly how the config store's page-header commit failed: the magic's low
+//! halfword landed, its high halfword could not, and the page was left looking half-committed).
+//!
 //! # Straddle: reject, do not read-modify-write
 //!
 //! [`Fmc::program`] requires halfword-aligned `addr`/`len`. The store already aligns/pads and the
@@ -234,9 +259,30 @@ impl Fmc {
             }
             off += 2;
         }
+        // Pre-check the span is still OPEN (the closed-halfword rule in the module docs): a target
+        // that is the HIGH halfword of a word whose successor is already programmed cannot be
+        // programmed, however erased it reads. Only the span's LAST halfword can fail this (an
+        // interior target's successor is itself a target, and the erased pre-check above just
+        // cleared it), and only when that last halfword is a high one. Refuse BEFORE the FMC is
+        // touched so the call stays all-or-nothing.
+        let last = addr + len - 2;
+        if last % 4 == 2
+            && self.same_page(last, last + 2)
+            && Reg16::new(last + 2, 0).read() != ERASED
+        {
+            return Err(FmcError::Closed);
+        }
         // The span is erased: program it halfword by halfword in order.
         let stat = self.run_program(addr, bytes);
         decode(stat)
+    }
+
+    /// True iff `a` and `b` fall in the same erase page. The closed-halfword rule is per erase
+    /// cycle of one page and does NOT cross a page boundary (bench-measured), so the pre-check for
+    /// it must not look past the page the target lives in.
+    #[inline]
+    fn same_page(&self, a: u32, b: u32) -> bool {
+        (a - FLASH_BASE) / self.page_size == (b - FLASH_BASE) / self.page_size
     }
 
     /// True iff `[addr, addr + span)` lies inside main flash (`[FLASH_BASE, FLASH_BASE + extent)`),
@@ -363,8 +409,11 @@ impl Fmc {
             let a = addr + i as u32;
             let hw = (bytes[i] as u16) | ((bytes[i + 1] as u16) << 8);
             let cell = Reg16::new(a, 0);
-            if cell.read() != ERASED {
-                // Write-once: silicon refuses a re-program with PGERR and leaves the cell UNCHANGED.
+            let closed =
+                a % 4 == 2 && self.same_page(a, a + 2) && Reg16::new(a + 2, 0).read() != ERASED;
+            if cell.read() != ERASED || closed {
+                // Write-once, and the closed-halfword rule (module docs): silicon refuses both with
+                // PGERR and leaves the cell UNCHANGED (a closed cell keeps reading `0xFFFF`).
                 self.reg(STAT).modify(STAT_PGERR, STAT_PGERR);
             } else {
                 cell.write(hw);
