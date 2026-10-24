@@ -329,7 +329,9 @@ fn run_slave(chip: &Chip, usart1: Usart) -> ! {
     // Stage 3: the polled adapter over the rejoined whole handle.
     let (tx, buffered) = s2.into_parts();
     let rx = buffered.release();
-    let mut s3 = PolledSerial::from_usart(Usart::rejoin(tx, rx), CLOCK.sysclk_hz);
+    // Both halves quiesce before the rejoin: the receiver's `release` gives back the RX half, and
+    // the transmit half's gives back the polled `UsartTx` whichever carrier it was holding.
+    let mut s3 = PolledSerial::from_usart(Usart::rejoin(tx.release(), rx), CLOCK.sysclk_hz);
     let (recv, loss) = drain_stage(&mut s3, N_POLLED);
     st!(p3_recv, recv);
     st!(p3_loss, loss);

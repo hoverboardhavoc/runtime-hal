@@ -63,6 +63,10 @@ pub mod usart;
 /// a `'static` SPSC ring from the RX interrupt and drains it non-blocking, without spending a DMA
 /// channel. The polled path ([`serial::Serial`]) is unchanged.
 pub mod usart_rx;
+/// One-shot DMA USART transmit (G-DMA-TX): [`usart_tx::DmaTx`] copies a frame into an owned
+/// `'static` buffer and hands it to a DMA channel, so a frame's wire time costs the caller's loop
+/// nothing. The polled transmit ([`usart::UsartTx`]) is unchanged and stays the default.
+pub mod usart_tx;
 /// Free (independent) watchdog bring-up (G-WDG): the FWDGT/IWDG on the LSI/IRC40K
 /// ([`watchdog::FreeWatchdog`]). Resolve-once handle + per-pass [`watchdog::FreeWatchdog::feed`];
 /// one model parameterised by base, no per-family register branch.
@@ -99,7 +103,7 @@ pub use detect::{
 pub use dbg::{debug_hold_on_sleep, debug_hold_timer0};
 #[cfg(feature = "detect-internals")]
 pub use detect::{family_capability, synthesize, Family};
-pub use dma::DmaRxMap;
+pub use dma::{DmaRxMap, DmaTxMap};
 pub use error::{
     AdcError, BringUpError, ClockError, DescriptorError, DetectError, FmcError, I2cError, PwmError,
     SpiError, UsartError, WatchdogError,
@@ -117,7 +121,7 @@ pub use irq::{
 pub use pwm::PwmOut;
 pub use reg::{Reg16, Reg32};
 pub use regdump::{AdcInjectedRegs, RegDumpConfig, TimerRegs};
-pub use serial::{PolledSerial, RxBackend, Serial, SplitSerial};
+pub use serial::{PolledSerial, RxBackend, Serial, SplitSerial, TxHalf};
 pub use spi::{mode_bits, prescaler_for, spi_input_clock, DataSize, Spi};
 pub use timebase::{reload_for, Timebase, TimebaseError};
 pub use timer::arming::ArmGate;
@@ -126,6 +130,7 @@ pub use usart::{
     compute_brr, usart_input_clock, Status, Usart, UsartBus, UsartModel, UsartRx, UsartTx,
 };
 pub use usart_rx::{supports_rx, BufferedRx, RingBufferedRx, RxRing};
+pub use usart_tx::{DmaTx, TxBusy};
 pub use watchdog::{
     clear_reset_cause, reset_cause_flags, was_watchdog_reset, FreeWatchdog, WdgTimeout,
     FWDGT_TIMEOUT, LSI_HZ, PRESCALER_MAX, PRESCALER_MIN, RELOAD_MAX,

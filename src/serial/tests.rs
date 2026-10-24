@@ -21,9 +21,12 @@ use crate::chip::Chip;
 use crate::clock::ClockConfig;
 use crate::config::{Oversampling, UsartConfig, UsartFrame};
 use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, PageSize};
-use crate::dma::{DmaRxMap, DMA0_BASE};
+use crate::dma::{DmaRxMap, DmaTxMap, DMA0_BASE};
 use crate::error::UsartError;
-use crate::irq::{install_mock, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ};
+use crate::irq::{
+    install_mock, mock_advance_cycles, mock_vtor, F10X_DMA0_CH5_IRQ, F10X_DMA0_CH6_IRQ,
+    F10X_USART1_IRQ,
+};
 use crate::reg::{mock, Reg32};
 use crate::serial::{
     worst_case_write_block_us, write_budget, PolledSerial, SplitSerial, WRITE_BUDGET_US,
@@ -31,6 +34,7 @@ use crate::serial::{
 };
 use crate::usart::Usart;
 use crate::usart_rx::{BufferedRx, RingBufferedRx, RxRing};
+use crate::usart_tx::DmaTx;
 use embedded_io::{Error, ErrorKind, Read, ReadReady, Write, WriteReady};
 
 use std::boxed::Box;
@@ -77,6 +81,9 @@ fn setup() -> MutexGuard<'static, ()> {
     crate::usart_rx::reset_for_test();
     crate::dma::reset_for_test();
     mock_vtor::reset();
+    // The DMA transmit deadline is measured against the cycle counter, which under `mock` is the
+    // harness's to advance; start every case at zero.
+    crate::irq::mock_reset_cycles();
     g
 }
 
@@ -899,4 +906,138 @@ fn the_write_budget_is_a_wall_clock_bound_at_every_clock() {
     // Derived, not fixed: a faster clock spends more iterations to buy the same microseconds.
     assert!(write_budget(72_000_000) > write_budget(8_000_000));
     assert_eq!(write_budget(0), 1, "a nonsensical clock still terminates");
+}
+
+// ================== SplitSerial<RingBufferedRx, DmaTx<N>>: the TX-backend seam =================
+//
+// The adapter's transmit half is a BACKEND, defaulting to the polled `UsartTx` every case above
+// drives. These cases drive the other one: the inter-board link's shape, a DMA ring receiving and
+// a one-shot DMA transmitting, through the same `embedded-io` surface.
+
+/// The bench port with BOTH halves on DMA: ring RX, one-shot TX. Returns the adapter, the transmit
+/// channel, and the receive channel.
+fn split_dma_both(ring_len: usize) -> (SplitSerial<RingBufferedRx>, u8, u8) {
+    let c = chip();
+    let (tx, rx) = bring_up().split();
+    let buf: &'static mut [u8] = vec![0u8; ring_len].leak();
+    let rx_ch = DmaRxMap::usart1_rx(&c).channel;
+    let tx_ch = DmaTxMap::usart1_tx(&c).channel;
+    let ring = RingBufferedRx::new(&c, rx, PeriphLabel::Usart1, buf).unwrap();
+    let txbuf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
+    let dma_tx = DmaTx::new(&c, tx, txbuf, TEST_CORE_HZ, 460_800).unwrap();
+    install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
+    (SplitSerial::new(dma_tx, ring, TEST_CORE_HZ), tx_ch, rx_ch)
+}
+
+/// Fire the transmit completion vector (F10x: DMA0 Ch6, IRQ 17).
+fn complete_tx(ch: u8) {
+    let ftf = 1 << (4 * ch as u32 + 1);
+    Reg32::new(DMA0_BASE, 0x00).modify(ftf, ftf);
+    // SAFETY: the RAM table is installed and the slot holds the transmit handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH6_IRQ) };
+}
+
+/// A whole frame leaves in ONE transfer, and the adapter reports every byte taken: the polled
+/// backend hands over what the data register accepts and is called again, this one hands over the
+/// frame.
+#[test]
+fn split_dma_tx_takes_a_whole_frame_in_one_transfer() {
+    let _g = setup();
+    let (mut s, tx_ch, _rx_ch) = split_dma_both(16);
+
+    assert_eq!(s.write(&[1, 2, 3, 4, 5, 6, 7]), Ok(7));
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_cnt(tx_ch)).read(),
+        7,
+        "one transfer carries the frame"
+    );
+    assert_eq!(
+        s.write_ready(),
+        Ok(false),
+        "a transfer is running: a write would wait"
+    );
+    complete_tx(tx_ch);
+    assert_eq!(s.write_ready(), Ok(true), "the channel is free again");
+    assert_eq!(s.tx_timeouts(), 0);
+}
+
+/// **`write_all` must never meet `Ok(0)`**: it panics on one, and the consuming firmware frames
+/// every outbound PDU through it. A write issued while the previous transfer is still running
+/// waits inside the adapter's budget rather than reporting nothing taken.
+#[test]
+fn split_dma_tx_never_reports_zero_on_a_busy_channel() {
+    let _g = setup();
+    let (mut s, tx_ch, _rx_ch) = split_dma_both(16);
+
+    assert_eq!(s.write(&[1, 2, 3]), Ok(3));
+    // The channel is busy and its deadline has not passed; the wait is bounded, so the call
+    // returns having dropped-and-counted rather than returning Ok(0).
+    let n = s.write(&[4, 5, 6]).unwrap();
+    assert_ne!(n, 0, "Ok(0) on a non-empty buffer panics write_all");
+    assert_eq!(n, 3, "a timed-out write reports the buffer consumed");
+    assert_eq!(s.tx_timeouts(), 1, "and counts the drop");
+
+    // Once the completion lands, writes go again.
+    complete_tx(tx_ch);
+    assert_eq!(s.write(&[7, 8]), Ok(2));
+}
+
+/// A wedged channel (a completion that never arrives) is recovered by the backend's force-restart,
+/// and the restart is visible in the adapter's one transmit-health number: the backend counts its
+/// own fault, the adapter counts its own expired wait, and `tx_timeouts` is the sum.
+#[test]
+fn split_dma_tx_force_restart_surfaces_in_tx_timeouts() {
+    let _g = setup();
+    let (mut s, tx_ch, _rx_ch) = split_dma_both(16);
+
+    assert_eq!(s.write(&[1, 2, 3]), Ok(3));
+    let after_first = s.tx_timeouts();
+
+    // Past the deadline for a 3-byte frame at 460800 on a 72 MHz core, with no completion ever.
+    mock_advance_cycles(TEST_CORE_HZ / 460_800 * 10 * 4 * 3 + 64);
+    assert_eq!(s.write(&[9, 9]), Ok(2), "the new frame is taken");
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_cnt(tx_ch)).read(),
+        2,
+        "the channel carries the new frame"
+    );
+    assert_eq!(
+        s.tx_timeouts(),
+        after_first + 1,
+        "the abandoned transfer is counted once, through the backend"
+    );
+}
+
+/// `flush` is the real wait for the line to go idle, and on this backend that includes the
+/// transfer: a caller about to change the baud or tear the port down needs the bytes gone, not
+/// merely handed to a channel. Bounded like every other wait here.
+#[test]
+fn split_dma_tx_flush_waits_for_the_transfer_and_is_bounded() {
+    let _g = setup();
+    let (mut s, tx_ch, _rx_ch) = split_dma_both(16);
+    set_stat(STAT_TBE | STAT_TC);
+
+    assert_eq!(s.write(&[1, 2]), Ok(2));
+    // The transfer never completes, so the flush spends its budget and counts the expiry.
+    assert_eq!(s.flush(), Ok(()));
+    assert_eq!(s.tx_timeouts(), 1, "the bounded flush gave up and counted");
+
+    // With the completion in and TC set, the same flush returns clean.
+    complete_tx(tx_ch);
+    assert_eq!(s.flush(), Ok(()));
+    assert_eq!(s.tx_timeouts(), 1, "no second timeout");
+}
+
+/// The receive side is untouched by the transmit backend: the same adapter still drains staged
+/// bytes behind the ring's DMA head.
+#[test]
+fn split_dma_tx_leaves_the_receive_path_alone() {
+    let _g = setup();
+    let (mut s, _tx_ch, rx_ch) = split_dma_both(8);
+
+    assert_eq!(s.write(&[0xAA]), Ok(1));
+    // Three bytes arrived meanwhile.
+    Reg32::new(DMA0_BASE, ch_cnt(rx_ch)).write(8 - 3);
+    let mut out = [0u8; 8];
+    assert_eq!(s.read(&mut out), Ok(3), "the ring still reads");
 }

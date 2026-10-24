@@ -187,6 +187,12 @@ const CTL1_STB: u32 = 0b11 << 12;
 /// the shared RX ISR can surface it (the fail-loud path).
 const CTL2_ERRIE: u32 = 1 << 0;
 const CTL2_DENR: u32 = 1 << 6;
+/// CTL2 DMA-transmission-enable `DENT` (bit 7), the transmit twin of `DENR` and identical on both
+/// families (GD32F10x User Manual Rev2.6 section 16.3.4 / GD32F1x0 User Manual Rev3.6 section 17.4.3,
+/// the `USART_CTL2` bit tables; `gd32f10x_usart.h` / `gd32f1x0_usart.h` agree). With it set the DMA
+/// controller's write into `TDATA` is what feeds the shift register, so the CPU hands over a whole
+/// frame instead of a byte ([`crate::usart_tx::DmaTx`]).
+const CTL2_DENT: u32 = 1 << 7;
 
 // Shared STAT bit positions (identical on both families).
 const STAT_PERR: u32 = 1 << 0;
@@ -398,6 +404,13 @@ impl UsartTx {
     #[inline]
     pub fn tx_complete(&self) -> bool {
         self.regs.read_status().tx_complete
+    }
+
+    /// The register view (crate-internal, the mirror of [`UsartRx::regs`]): the DMA transmitter in
+    /// [`crate::usart_tx`] drives the TX-side register ops (`DENT`, the `TDATA` address) through it.
+    #[inline]
+    pub(crate) fn regs(&self) -> UsartRegs {
+        self.regs
     }
 }
 
@@ -918,6 +931,32 @@ impl UsartRegs {
     #[inline]
     pub fn listen_errors(&self) {
         self.ctl2().modify(CTL2_ERRIE, CTL2_ERRIE);
+    }
+
+    /// Enable DMA transmission (`DENT`, CTL2 bit 7): the DMA controller's write into `TDATA` feeds
+    /// the transmitter, so a whole frame leaves without the CPU touching a byte of it
+    /// ([`crate::usart_tx::DmaTx`]). Read-modify-write, beside its receive twin
+    /// [`UsartRegs::enable_dma_rx`].
+    #[inline]
+    pub fn enable_dma_tx(&self) {
+        self.ctl2().modify(CTL2_DENT, CTL2_DENT);
+    }
+
+    /// Disable DMA transmission (the inverse of [`UsartRegs::enable_dma_tx`]): the transmit half is
+    /// handed back polled, as it was before it was armed ([`crate::usart_tx::DmaTx::release`]).
+    #[inline]
+    pub(crate) fn disable_dma_tx(&self) {
+        self.ctl2().modify(CTL2_DENT, 0);
+    }
+
+    /// Absolute address of the transmit-data register: the destination address (`CHxPADDR`) the DMA
+    /// channel writes each byte to. The transmit twin of [`UsartRegs::rdata_addr`]; on F10x the two
+    /// are the same register (`DATA`, offset `0x04`), on F1x0 they are distinct (`TDATA` `0x28`,
+    /// `RDATA` `0x24`), which is exactly why it comes from the register model rather than a
+    /// constant.
+    #[inline]
+    pub(crate) fn tdata_addr(&self) -> u32 {
+        self.base + self.model.tx_data
     }
 
     /// Absolute address of the receive-data register: the source address (`CHxPADDR`) the DMA channel
