@@ -28,11 +28,11 @@ use super::{
     build_table, call_control_handler, clear_control_handler, clear_tick_count, clear_tick_handler,
     default_isr, handler_addr, install_mock, mock_vtor, on_systick, register_control_handler,
     register_tick_handler, set_grouped_demux_timer_base, tick_count, ControlHandler, TickHandler,
-    F10X_ADC0_1_IRQ, F10X_DMA0_CH2_IRQ, F10X_EXTI10_15_IRQ, F10X_EXTI5_9_IRQ, F10X_TIMER0_BRK_IRQ,
-    F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ, F10X_TIMER0_UP_IRQ, F1X0_ADC_CMP_IRQ,
-    F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ,
-    F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF, INTF_UPIF, MAX_VECTORS,
-    SYSTEM_VECTORS, TIMER_INTF,
+    F10X_ADC0_1_IRQ, F10X_DMA0_CH2_IRQ, F10X_DMA0_CH5_IRQ, F10X_DMA0_CH6_IRQ, F10X_EXTI10_15_IRQ,
+    F10X_EXTI5_9_IRQ, F10X_TIMER0_BRK_IRQ, F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ,
+    F10X_TIMER0_UP_IRQ, F1X0_ADC_CMP_IRQ, F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ,
+    F1X0_TIMER0_BRK_UP_TRG_COM_IRQ, F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF,
+    INTF_UPIF, MAX_VECTORS, SYSTEM_VECTORS, TIMER_INTF,
 };
 use super::{
     DMA_RX_ISR_METRIC, F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ, SYSTICK_ISR_METRIC,
@@ -70,6 +70,21 @@ fn f1x0_grouped_slots_match_spl_layout() {
     for irq in [F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ] {
         assert_eq!(slot(&t, irq), handler_addr(super::exti_isr));
     }
+
+    // The link's DMA vector (IRQ 11, grouped Ch3/4) is the slot that runs BOTH halves' bodies:
+    // receive on Ch4 and transmit on Ch3 share it, so it is not the F10x receive-only body.
+    assert_eq!(
+        slot(&t, F1X0_DMA_CH3_4_IRQ),
+        handler_addr(super::dma_ch3_4_isr)
+    );
+    assert_ne!(
+        slot(&t, F1X0_DMA_CH3_4_IRQ),
+        handler_addr(super::dma_rx_isr),
+        "the grouped slot must not be the receive-only body: it would drop every transmit completion"
+    );
+    // F10x's separate transmit vector (IRQ 17) is not routed here: on F1x0 that number is the
+    // unrelated TIMER1 vector and the transmit channel is on the grouped slot above.
+    assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(default_isr));
 
     // A slot the layout does not route (e.g. IRQ 50, an unused gap) stays the default ISR. This is
     // the "misplaced slot points at the wrong handler" guard: only the named slots diverge.
@@ -120,6 +135,16 @@ fn f10x_separate_slots_match_spl_layout() {
     assert_eq!(
         slot(&t, F10X_DMA0_CH2_IRQ),
         handler_addr(super::module_dma_rx_isr)
+    );
+    // The link's two DMA channels have a vector each on this layout: receive on Ch5 (IRQ 16),
+    // transmit on Ch6 (IRQ 17), no demux between them.
+    assert_eq!(slot(&t, F10X_DMA0_CH5_IRQ), handler_addr(super::dma_rx_isr));
+    assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(super::dma_tx_isr));
+    // The grouped Ch3/4 body belongs to the other layout and must not appear here.
+    let grouped_dma = handler_addr(super::dma_ch3_4_isr);
+    assert!(
+        !t.iter().any(|&s| s == grouped_dma),
+        "the grouped DMA body must not appear in the F10x separate table"
     );
     // The grouped demux is never installed on the separate layout.
     let demux = handler_addr(super::timer0_grouped_demux);
@@ -454,8 +479,8 @@ fn isr_metrics_count_entries_per_vector() {
 use super::{
     apply_motor_era_priorities, irq_priority, motor_era_irqs, set_irq_priority,
     set_systick_priority, systick_priority, DMA_RX_PRIORITY, F10X_ADC0_1_IRQ as R7_F10X_ADC,
-    F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ, MOTOR_ISR_PRIORITY, NVIC_IPR_BASE, SCB_SHPR3,
-    SYSTICK_PRIORITY, USART1_RX_PRIORITY,
+    F10X_USART1_IRQ, MOTOR_ISR_PRIORITY, NVIC_IPR_BASE, SCB_SHPR3, SYSTICK_PRIORITY,
+    USART1_RX_PRIORITY,
 };
 
 /// The priority levels are strictly ordered (lower numeric = higher urgency): period ISR ABOVE
@@ -547,6 +572,18 @@ fn r7_apply_motor_era_priorities_both_families() {
             "usart1 RX below period"
         );
         assert_eq!(irq_priority(dma), DMA_RX_PRIORITY, "dma RX below usart1");
+        // The link's DMA TRANSMIT vector is covered too: a transmitter unmasks it, and an NVIC
+        // priority byte resets to 0, the most urgent value there is, so an unwritten one would
+        // preempt the period ISR. On F1x0 it is the same vector as the receive side.
+        assert_eq!(
+            irq_priority(super::dma_tx_irq(layout)),
+            DMA_RX_PRIORITY,
+            "dma TX below usart1"
+        );
+        assert!(
+            irq_priority(super::dma_tx_irq(layout)) > irq_priority(period),
+            "{layout:?}: a transmit completion must not outrank the period ISR"
+        );
         assert_eq!(systick_priority(), SYSTICK_PRIORITY, "systick lowest");
         // The ordering is strict: period < usart1 < dma < systick (numeric = inverse urgency).
         assert!(irq_priority(period) < irq_priority(usart1));

@@ -25,7 +25,10 @@
 //!   consumer that stopped reading for too long, which is the whole question on the BLE port.
 //! - **`ReadReady` = "a read will make progress"** (data available, or a pending condition the read
 //!   would clear), answered from real state, consuming nothing.
-//! - **`Write` is polled, `WriteReady` = TBE**, and DMA TX is out of scope. BOTH adapters wait
+//! - **`Write` is non-blocking past its budget, and the TX carrier is the port's choice.**
+//!   [`PolledSerial`] is always polled; [`SplitSerial`] takes a TX BACKEND, the polled [`UsartTx`]
+//!   by default and the one-shot [`DmaTx`] where a frame's wire time no longer fits the caller's
+//!   loop (the inter-board link, `specs/uart-tx-dma.md`). Underneath the polled ones wait
 //!   `TBE` only, take as many bytes as the register accepts and report how many, so a caller can
 //!   meter a frame onto a slow wire without blocking (the 9600-baud BLE module: 1.04 ms a byte
 //!   against a 4 ms control tick). `flush` is the real `TC` wait on both, and is what a caller
@@ -56,6 +59,7 @@ use crate::error::{DescriptorError, UsartError};
 use crate::gpio::Pin;
 use crate::usart::{Usart, UsartTx};
 use crate::usart_rx::{BufferedRx, RingBufferedRx};
+use crate::usart_tx::DmaTx;
 
 /// The headline alias: application code reads `Serial::new(&chip, &clock, instance, (pa2, pa3),
 /// baud)` (the pin-handle constructor), the [`crate::i2c::I2c`] analogue for the serial port.
@@ -386,10 +390,13 @@ impl WriteReady for PolledSerial {
 // --- the split adapter (DMA / interrupt RX + polled TX) ------------------------------------------
 
 mod private {
-    /// Seals [`super::RxBackend`]: exactly the two in-crate receivers implement it.
+    /// Seals [`super::RxBackend`] and [`super::TxBackend`]: exactly the in-crate receivers and
+    /// transmitters implement them.
     pub trait Sealed {}
     impl Sealed for crate::usart_rx::RingBufferedRx {}
     impl Sealed for crate::usart_rx::BufferedRx {}
+    impl Sealed for crate::usart::UsartTx {}
+    impl<const N: usize> Sealed for crate::usart_tx::DmaTx<N> {}
 }
 
 /// The RX side a [`SplitSerial`] adapts: [`RingBufferedRx`] (DMA ring) or [`BufferedRx`]
@@ -435,11 +442,153 @@ impl RxBackend for BufferedRx {
     }
 }
 
-/// Non-blocking `embedded-io` endpoint over a split port: a [`UsartTx`] (polled transmit) plus an
-/// owned RX backend (`R`: DMA ring or interrupt ring). The link/firmware shape: RX never blocks the
-/// scheduler, TX is polled. See the module docs for the contract.
-pub struct SplitSerial<R: RxBackend> {
-    tx: UsartTx,
+/// What one backend write did: how many bytes the port took, and whether a bounded wait expired.
+/// A write that times out reports the whole buffer as taken (see "the polled-write time budget":
+/// `Ok(0)` on a non-empty buffer panics `embedded-io`'s `write_all`, so the choice is a counted drop
+/// or a panic), and `timed_out` is what lets the adapter count that drop.
+pub struct TxWrite {
+    /// Bytes the caller's buffer may consider handed over (sent, or dropped on a timeout).
+    pub accepted: usize,
+    /// A bounded wait expired and the rest of the buffer was dropped.
+    pub timed_out: bool,
+}
+
+/// The TX side a [`SplitSerial`] drives: the polled [`UsartTx`] (what every port had, and the
+/// default) or the one-shot [`DmaTx`] (the inter-board link). Sealed for the same reason
+/// [`RxBackend`] is: the quirk ownership the adapter promises is a property of these
+/// implementations, not an extension point.
+///
+/// The budget passed in is the adapter's per-call [`write_budget`], so the "every wait on the write
+/// path is BOUNDED" contract holds whichever backend is underneath, and neither backend decides how
+/// long the caller's loop may be held.
+pub trait TxBackend: private::Sealed {
+    /// Hand as many bytes as the port will take now, blocking only within `budget`.
+    #[doc(hidden)]
+    fn tx_write(&mut self, data: &[u8], budget: u32) -> TxWrite;
+    /// Wait for the line to go idle (`TC`, and for a DMA backend the transfer that precedes it).
+    /// `false` if the budget expired first.
+    #[doc(hidden)]
+    fn tx_flush(&mut self, budget: u32) -> bool;
+    /// True if a write would make progress without waiting.
+    #[doc(hidden)]
+    fn tx_ready(&self) -> bool;
+    /// Transmit faults the BACKEND itself absorbed and counted (a DMA force-restart). The polled
+    /// handle has none of its own: its only fault is the adapter's bounded wait expiring, which the
+    /// adapter counts where it happens. [`SplitSerial::tx_timeouts`] reports the sum, so each event
+    /// is counted once, by whoever produced it.
+    #[doc(hidden)]
+    fn tx_faults(&self) -> u16 {
+        0
+    }
+}
+
+impl TxBackend for UsartTx {
+    /// The polled transmit this adapter has always done: wait `TBE` for the FIRST byte (bounded),
+    /// then take as many more as the register accepts without waiting. See [`SplitSerial`]'s
+    /// `write` for why it does not wait `TC` per byte.
+    fn tx_write(&mut self, data: &[u8], budget: u32) -> TxWrite {
+        let Some((&first, rest)) = data.split_first() else {
+            return TxWrite {
+                accepted: 0,
+                timed_out: false,
+            };
+        };
+        let mut left = budget;
+        if !wait_bounded(&mut left, || self.try_write_byte(first)) {
+            return TxWrite {
+                accepted: data.len(),
+                timed_out: true,
+            };
+        }
+        let mut n = 1;
+        for &b in rest {
+            if !self.try_write_byte(b) {
+                break;
+            }
+            n += 1;
+        }
+        TxWrite {
+            accepted: n,
+            timed_out: false,
+        }
+    }
+
+    fn tx_flush(&mut self, budget: u32) -> bool {
+        let mut left = budget;
+        wait_bounded(&mut left, || self.tx_complete())
+    }
+
+    fn tx_ready(&self) -> bool {
+        self.tx_empty()
+    }
+}
+
+impl<const N: usize> TxBackend for DmaTx<N> {
+    /// Hand the whole frame to the channel in one transfer.
+    ///
+    /// On a busy channel it RETRIES within the budget rather than reporting nothing taken, for two
+    /// reasons. `Ok(0)` on a non-empty buffer panics `embedded-io`'s `write_all`, which is what the
+    /// consuming firmware's framed send calls. And the backend's own force-restart deadline is
+    /// checked inside [`DmaTx::try_send`], so a call that never reaches `try_send` is a call that
+    /// can never recover a wedged channel: retrying through it is what makes the deadline reachable.
+    /// A frame whose budget runs out is dropped and counted, exactly as a polled one is.
+    fn tx_write(&mut self, data: &[u8], budget: u32) -> TxWrite {
+        if data.is_empty() {
+            return TxWrite {
+                accepted: 0,
+                timed_out: false,
+            };
+        }
+        let mut sent = 0usize;
+        let mut left = budget;
+        let taken = wait_bounded(&mut left, || match self.try_send(data) {
+            Ok(n) => {
+                sent = n;
+                true
+            }
+            Err(_) => false,
+        });
+        if taken {
+            TxWrite {
+                accepted: sent,
+                timed_out: false,
+            }
+        } else {
+            TxWrite {
+                accepted: data.len(),
+                timed_out: true,
+            }
+        }
+    }
+
+    /// The line is idle only once the transfer has finished AND the last byte has shifted out, so
+    /// this waits both, inside the one budget. It is the real wait a caller owes before a baud
+    /// change, a rejoin or a teardown (see the module docs: the completion flag means the last byte
+    /// reached `TDATA`, not the wire).
+    fn tx_flush(&mut self, budget: u32) -> bool {
+        let mut left = budget;
+        wait_bounded(&mut left, || !self.in_flight() && self.tx_complete())
+    }
+
+    fn tx_ready(&self) -> bool {
+        !self.in_flight()
+    }
+
+    fn tx_faults(&self) -> u16 {
+        self.timeouts()
+    }
+}
+
+/// Non-blocking `embedded-io` endpoint over a split port: an owned TX backend (`T`: the polled
+/// [`UsartTx`] by default, or [`DmaTx`]) plus an owned RX backend (`R`: DMA ring or interrupt ring).
+/// The link/firmware shape: RX never blocks the scheduler, and TX is whichever carrier the port
+/// chose. See the module docs for the contract.
+///
+/// `T` defaults to [`UsartTx`], so every port that had polled transmit keeps it by writing
+/// `SplitSerial<R>` exactly as before; a port selects the DMA transmit by constructing a [`DmaTx`]
+/// and handing THAT to [`new`](SplitSerial::new).
+pub struct SplitSerial<R: RxBackend, T: TxBackend = UsartTx> {
+    tx: T,
     rx: R,
     line_errors: u16,
     lap_overruns: u16,
@@ -448,14 +597,14 @@ pub struct SplitSerial<R: RxBackend> {
     tx_timeouts: u16,
 }
 
-impl<R: RxBackend> SplitSerial<R> {
+impl<R: RxBackend, T: TxBackend> SplitSerial<R, T> {
     /// Adapt an already-armed receiver + the TX half. The adapter brings nothing up; construction
     /// is explicit from the slice-3 ownership pieces (`specs/serial-adapters.md` D5):
     /// `usart.split()`, arm the backend on the RX half, wrap both here.
     #[inline]
     /// `core_hz` is the system clock the write budget is derived against; see
     /// [`PolledSerial::from_usart`] for why it is a parameter and not a constant.
-    pub fn new(tx: UsartTx, rx: R, core_hz: u32) -> Self {
+    pub fn new(tx: T, rx: R, core_hz: u32) -> Self {
         SplitSerial {
             tx,
             rx,
@@ -469,7 +618,7 @@ impl<R: RxBackend> SplitSerial<R> {
     /// Take the adapter apart (the reconfigure path: `into_parts` -> backend `release` ->
     /// [`Usart::rejoin`] -> `set_baud` -> `split` -> re-arm -> `new`).
     #[inline]
-    pub fn into_parts(self) -> (UsartTx, R) {
+    pub fn into_parts(self) -> (T, R) {
         (self.tx, self.rx)
     }
 
@@ -486,16 +635,15 @@ impl<R: RxBackend> SplitSerial<R> {
         self.line_errors
     }
 
-    /// Diagnostic: **buffer-overrun losses** absorbed by `read` so far, saturating: a DMA-ring
-    /// [`RingOverrun`](crate::error::UsartError::RingOverrun) (the circular DMA lapped the read cursor)
-    /// or a `BufferedRx` ring-full [`Overrun`](crate::error::UsartError::Overrun). Both mean the
-    /// consumer fell behind and bytes were dropped; each is absorbed with reception continuing (no
-    /// re-arm). Counted SEPARATELY from [`line_errors`](Self::line_errors) (a wire disturbance) so
-    /// "the consumer is too slow" is distinguishable from "the line glitched". Outside the
-    /// `embedded-io` traits by design.
+    /// Diagnostic: **abandoned writes** so far, saturating: the adapter's own bounded wait expiring
+    /// (the rest of the buffer dropped, reported to the caller as consumed) PLUS the transmit
+    /// backend's own absorbed faults ([`TxBackend::tx_faults`]: a [`DmaTx`] force-restart of a
+    /// transfer that never completed). Each event is counted once, where it happens, and summed
+    /// here because one number is what a port's transmit health is. Outside the `embedded-io`
+    /// traits by design.
     #[inline]
     pub fn tx_timeouts(&self) -> u16 {
-        self.tx_timeouts
+        self.tx_timeouts.saturating_add(self.tx.tx_faults())
     }
 
     /// Diagnostic: **buffer-overrun losses** absorbed by `read` so far, saturating (see
@@ -506,7 +654,7 @@ impl<R: RxBackend> SplitSerial<R> {
     }
 }
 
-impl SplitSerial<RingBufferedRx> {
+impl<T: TxBackend> SplitSerial<RingBufferedRx, T> {
     /// **Validation hook** (DMA-ring backend only): inject one line error into the RX path exactly as
     /// the ERRIE ISR would record it, so the next [`read`](Read::read) surfaces it (counted into
     /// [`line_errors`](Self::line_errors)) and self-heals in place. Passthrough to
@@ -529,11 +677,11 @@ impl SplitSerial<RingBufferedRx> {
     }
 }
 
-impl<R: RxBackend> ErrorType for SplitSerial<R> {
+impl<R: RxBackend, T: TxBackend> ErrorType for SplitSerial<R, T> {
     type Error = Infallible;
 }
 
-impl<R: RxBackend> Read for SplitSerial<R> {
+impl<R: RxBackend, T: TxBackend> Read for SplitSerial<R, T> {
     /// Non-blocking: drain what the backend has; `Ok(0)` when nothing is available. The IDLE latch
     /// is consumed (dropped) here so it can never leak to a consumer; an absorbed condition ticks the
     /// matching counter (a wire disturbance -> [`line_errors`](Self::line_errors), a buffer-overrun
@@ -566,7 +714,7 @@ impl<R: RxBackend> Read for SplitSerial<R> {
     }
 }
 
-impl<R: RxBackend> ReadReady for SplitSerial<R> {
+impl<R: RxBackend, T: TxBackend> ReadReady for SplitSerial<R, T> {
     /// The backend's own progress state (buffered bytes / bytes behind the live DMA write position,
     /// or a pending condition a read would clear). Consumes nothing.
     #[inline]
@@ -575,10 +723,14 @@ impl<R: RxBackend> ReadReady for SplitSerial<R> {
     }
 }
 
-impl<R: RxBackend> Write for SplitSerial<R> {
-    /// Hand the peripheral as many bytes as its transmit register will take, blocking only for
-    /// the FIRST one, and return how many went in. Identical in shape to
-    /// [`PolledSerial`]'s, because the two adapters face the same caller.
+impl<R: RxBackend, T: TxBackend> Write for SplitSerial<R, T> {
+    /// Hand the port as many bytes as it will take, blocking only where the backend must, and
+    /// return how many went. Over the polled backend that is `TBE` for the FIRST byte and then
+    /// whatever the register accepts, identical in shape to [`PolledSerial`]'s because the two
+    /// adapters face the same caller; over [`DmaTx`] it is the whole frame into one transfer.
+    ///
+    /// **Never `Ok(0)` on a non-empty buffer**, whichever backend is underneath: that return
+    /// panics `embedded-io`'s `write_all`, and the consumer is a panic-free image.
     ///
     /// **It used to wait `TBE` then `TC` on EVERY byte, and that was wrong on both of this
     /// adapter's ports** (corrected 2026-10-22, measured). `TC` says the byte has finished
@@ -604,41 +756,31 @@ impl<R: RxBackend> Write for SplitSerial<R> {
     ///
     /// Bounded, and a timeout reports the buffer as consumed: see "the polled-write time budget".
     fn write(&mut self, data: &[u8]) -> Result<usize, Self::Error> {
-        let Some((&first, rest)) = data.split_first() else {
-            return Ok(0);
-        };
-        let mut left = self.write_budget;
-        if !wait_bounded(&mut left, || self.tx.try_write_byte(first)) {
+        let w = self.tx.tx_write(data, self.write_budget);
+        if w.timed_out {
             self.tx_timeouts = self.tx_timeouts.saturating_add(1);
-            return Ok(data.len());
         }
-        let mut n = 1;
-        for &b in rest {
-            if !self.tx.try_write_byte(b) {
-                break;
-            }
-            n += 1;
-        }
-        Ok(n)
+        Ok(w.accepted)
     }
 
-    /// Wait for `TC`: the last byte written has fully shifted out and the line is idle. The real
-    /// wait now that [`write`](Write::write) does not pay it per byte, and what a caller owes
-    /// before a baud change, a rejoin or a teardown. Bounded like every other wait here.
+    /// Wait for the line to go idle: `TC` on the polled backend, and on the DMA one the transfer
+    /// that precedes it. The real wait now that [`write`](Write::write) does not pay it per byte,
+    /// and what a caller owes before a baud change, a rejoin or a teardown. Bounded like every
+    /// other wait here.
     fn flush(&mut self) -> Result<(), Self::Error> {
-        let mut left = self.write_budget;
-        if !wait_bounded(&mut left, || self.tx.tx_complete()) {
+        if !self.tx.tx_flush(self.write_budget) {
             self.tx_timeouts = self.tx_timeouts.saturating_add(1);
         }
         Ok(())
     }
 }
 
-impl<R: RxBackend> WriteReady for SplitSerial<R> {
-    /// `TBE` on the TX half.
+impl<R: RxBackend, T: TxBackend> WriteReady for SplitSerial<R, T> {
+    /// A write will make progress without waiting: `TBE` on the polled backend, an idle channel on
+    /// the DMA one.
     #[inline]
     fn write_ready(&mut self) -> Result<bool, Self::Error> {
-        Ok(self.tx.tx_empty())
+        Ok(self.tx.tx_ready())
     }
 }
 
