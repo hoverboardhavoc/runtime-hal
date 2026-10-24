@@ -86,9 +86,9 @@ fn f1x0_grouped_slots_match_spl_layout() {
     // unrelated TIMER1 vector and the transmit channel is on the grouped slot above.
     assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(default_isr));
 
-    // A slot the layout does not route (e.g. IRQ 50, an unused gap) stays the default ISR. This is
+    // A slot the layout does not route (the table's last, an unused gap) stays the default ISR. This is
     // the "misplaced slot points at the wrong handler" guard: only the named slots diverge.
-    assert_eq!(slot(&t, 50), handler_addr(default_isr));
+    assert_eq!(slot(&t, super::MAX_IRQS - 1), handler_addr(default_isr));
     // The F10x-only ADC slot (18) is NOT routed on F1x0 (its ADC is at 12).
     assert_eq!(slot(&t, F10X_ADC0_1_IRQ), handler_addr(default_isr));
 }
@@ -357,9 +357,17 @@ fn grouped_demux_does_not_invent_a_cleared_subsource() {
 
 #[test]
 fn table_size_covers_both_families() {
-    // The table covers F1x0's highest external IRQ (73, CAN1_SCE) -> 90 entries total.
+    // 64 entries = 256 B at a 256 B VTOR alignment, with no padding. The part's highest external
+    // IRQ (73, CAN1_SCE) is NOT covered on purpose: only an unmasked IRQ can fire, the highest the
+    // HAL installs is 40, and the const asserts beside MAX_IRQS hold every named vector inside.
     assert_eq!(MAX_VECTORS, SYSTEM_VECTORS + super::MAX_IRQS);
-    assert_eq!(MAX_VECTORS, 16 + 74);
+    assert_eq!(MAX_VECTORS, 16 + 48);
+    assert_eq!(core::mem::align_of::<super::RamVectorTable>(), 256);
+    // On the 32-bit target the struct is exactly its alignment; on the 64-bit host each slot is 8 B.
+    assert_eq!(
+        core::mem::size_of::<super::RamVectorTable>(),
+        (MAX_VECTORS * core::mem::size_of::<usize>()).next_multiple_of(256)
+    );
 }
 
 // --- Planted-bug self-test: a misplaced vector-table slot is caught (M3 T12) -------------------

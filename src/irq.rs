@@ -19,7 +19,8 @@
 //!   = 13, with the capture/compare channels on a separate vector `TIMER0_Channel_IRQn` = 14. EXTI
 //!   is grouped: `EXTI0_1` = 5, `EXTI2_3` = 6, `EXTI4_15` = 7. The ADC (which carries the injected
 //!   end-of-conversion, the control loop) is `ADC_CMP_IRQn` = 12 (shared with the comparators).
-//!   Highest external IRQ = 73, so the table is 16 system + 74 IRQ = 90 entries.
+//!   The part's highest external IRQ is 73, but the table reserves [`MAX_IRQS`] = 48 (64 entries,
+//!   256 B): only an IRQ this HAL unmasks can fire, and the highest it installs is 40.
 //! - **F10x (separate)** is where the SPEC's implied "fully separate" wording is INACCURATE, and
 //!   this is the HP-4 discrepancy to record: the four advanced-timer sub-sources are NOT four
 //!   separate vectors. `TIMER0_BRK_IRQn` = 24 and `TIMER0_UP_IRQn` = 25 are individual, but trigger
@@ -66,13 +67,52 @@ pub type Handler = unsafe extern "C" fn();
 /// `SYSTEM_VECTORS + n`.
 pub const SYSTEM_VECTORS: usize = 16;
 
-/// External IRQ count the table reserves. Sized to cover BOTH families: F1x0's highest external
-/// IRQ is `CAN1_SCE_IRQn` = 73 (so 74 IRQ slots), which also covers F10x (highest 59 on MD/HD).
-/// Over-provisioning is fine (DECISIONS.md / the milestone's "over-provision is fine").
-pub const MAX_IRQS: usize = 74;
+/// External IRQ count the table reserves: 48, so the table is 64 slots = 256 B and takes a 256 B
+/// VTOR alignment ([`RamVectorTable`]).
+///
+/// It used to reserve 74 (F1x0's highest external IRQ, `CAN1_SCE_IRQn` = 73) on the "over-provision
+/// is fine" argument, which was wrong about the cost: 90 slots is 360 B, but a 360 B table needs a
+/// 512 B alignment, and Rust pads the static to its alignment, so the table COST 512 B of the 8 KiB
+/// part's RAM, 152 B of it padding behind slots nothing could ever route to. Only an IRQ this HAL
+/// unmasks can ever fire, and the highest vector either family's table installs is
+/// [`F10X_EXTI10_15_IRQ`] = 40. The 256 B this gives back is stack: the DMA transmit on the
+/// inter-board link (`specs/uart-tx-dma.md`) costs the consuming firmware 160 B of RAM and stack,
+/// and on an image whose armed margin was 84 B that overflowed the stack into the motor state the
+/// moment the board was armed (hoverboard-firmware, `specs/bench-evidence/2026-10-24/dma-tx-drive/`).
+///
+/// Every IRQ number this module names is asserted below to fit; a new vector past the table fails
+/// the build there, not at the first spurious entry into RAM past the table.
+pub const MAX_IRQS: usize = 48;
 
 /// Total vector-table entries (system + external IRQ).
 pub const MAX_VECTORS: usize = SYSTEM_VECTORS + MAX_IRQS;
+
+// Every vector this module can install or unmask fits the table. Compile-time: a number past the
+// table is a build failure naming the constant, never a RAM table entered past its end.
+const _: () = {
+    assert!(F1X0_ADC_CMP_IRQ < MAX_IRQS);
+    assert!(F1X0_TIMER0_BRK_UP_TRG_COM_IRQ < MAX_IRQS);
+    assert!(F1X0_TIMER0_CHANNEL_IRQ < MAX_IRQS);
+    assert!(F1X0_EXTI0_1_IRQ < MAX_IRQS);
+    assert!(F1X0_EXTI2_3_IRQ < MAX_IRQS);
+    assert!(F1X0_EXTI4_15_IRQ < MAX_IRQS);
+    assert!(F10X_ADC0_1_IRQ < MAX_IRQS);
+    assert!(F10X_TIMER0_BRK_IRQ < MAX_IRQS);
+    assert!(F10X_TIMER0_UP_IRQ < MAX_IRQS);
+    assert!(F10X_TIMER0_TRG_CMT_IRQ < MAX_IRQS);
+    assert!(F10X_TIMER0_CHANNEL_IRQ < MAX_IRQS);
+    assert!(F10X_EXTI5_9_IRQ < MAX_IRQS);
+    assert!(F10X_EXTI10_15_IRQ < MAX_IRQS);
+    assert!(F1X0_USART1_IRQ < MAX_IRQS);
+    assert!(F10X_USART1_IRQ < MAX_IRQS);
+    assert!(F1X0_USART0_IRQ < MAX_IRQS);
+    assert!(F10X_USART_MODULE_IRQ < MAX_IRQS);
+    assert!(F10X_DMA0_CH5_IRQ < MAX_IRQS);
+    assert!(F10X_DMA0_CH2_IRQ < MAX_IRQS);
+    assert!(F1X0_DMA_CH1_2_IRQ < MAX_IRQS);
+    assert!(F1X0_DMA_CH3_4_IRQ < MAX_IRQS);
+    assert!(F10X_DMA0_CH6_IRQ < MAX_IRQS);
+};
 
 // --- GD SPL IRQ numbers (the authority; see the HP-4 note above) ------------------------------
 
@@ -875,21 +915,20 @@ pub fn unmask_irq(_irq: usize) {}
 
 /// The owned RAM vector table (DECISIONS.md #6): an alignment-correct `static` in a dedicated
 /// section. The Cortex-M `VTOR` requires the table to be aligned to a power of two at least as large
-/// as the table: `MAX_VECTORS * 4 = 360` bytes rounds up to **512**, so the table is `align(512)` (the
-/// `align(R) >= TBLOFF` rule, the exact power-of-two granule).
+/// as the table: `MAX_VECTORS * 4 = 256` bytes, so the table is `align(256)` (the `align(R) >=
+/// TBLOFF` rule, the exact power-of-two granule), and the struct's size is exactly its alignment, so
+/// the static carries no padding.
 ///
-/// Aligning to 512 (not 1024) reclaims 1 KiB of RAM from the universal firmware's single
-/// `RamVectorTable` static (its `VECTORS`): 512 B because the struct size is padded to its alignment
-/// (1024 -> 512), plus 512 B because the linker no longer pads the preceding RAM up to a 1024-byte
-/// boundary. That 1 KiB goes to the 8 KiB-RAM image's stack, which the deep `store` flash-write path
-/// needs (a too-small stack overflows into `.bss` and corrupts the ISR state). It is one half of a
-/// **two-part** stack-overflow fix that together keep the peak under the region; neither is sufficient
-/// alone: this `align(512)` (region 3004 -> 4028 B) AND the firmware's `store::MAX_RECORD = 272`
-/// (peak 4820 -> 3044 B). (The detect-probe table is a SEPARATE `align(128)` `AlignedVectorTable` in
-/// [`crate::detect`] holding only the 16 reachable system vectors, unaffected by this.) `#[no_mangle]` +
-/// the section let the linker place it in RAM;
-/// the flash table still covers reset + the first exceptions until [`install`] flips `VTOR`.
-#[repr(C, align(512))]
+/// The alignment has come down twice, and each step was RAM for the 8 KiB part's stack. 1024 -> 512
+/// reclaimed 1 KiB (512 B of struct padding plus 512 B the linker no longer spent padding up to the
+/// boundary), one half of the two-part fix for the deep `store` flash-write path (with the firmware's
+/// `store::MAX_RECORD = 272`). 512 -> 256 came with [`MAX_IRQS`] 74 -> 48 and reclaims 256 B of
+/// struct padding plus whatever the consuming linker script spent reaching the 512 boundary (see
+/// [`MAX_IRQS`] for the trigger). The detect-probe table is a SEPARATE `align(128)`
+/// `AlignedVectorTable` in [`crate::detect`] holding only the 16 reachable system vectors, unaffected
+/// by this. `#[no_mangle]` + the section let the linker place it in RAM; the flash table still covers
+/// reset + the first exceptions until [`install`] flips `VTOR`.
+#[repr(C, align(256))]
 pub struct RamVectorTable {
     /// The vector slots (slot 0 reserved for the initial SP value the hardware reads; slots 1..15
     /// the system exceptions; 16.. the external IRQs).
@@ -897,13 +936,13 @@ pub struct RamVectorTable {
 }
 
 // VTOR alignment guard: on the 32-bit target each slot is 4 bytes, and the table base must be aligned
-// to a power of two >= its byte size. `align(512)` is valid only while the table fits in 512 bytes
-// (<= 128 slots); if MAX_VECTORS ever exceeds that, bump align(..) to the next power of two or VTOR
+// to a power of two >= its byte size. `align(256)` is valid only while the table fits in 256 bytes
+// (<= 64 slots); if MAX_VECTORS ever exceeds that, bump align(..) to the next power of two or VTOR
 // would reject the (then-unaligned) table base. (Asserted on the slot COUNT so it is the same on the
 // 32-bit firmware target and the 64-bit host test build.)
 const _: () = assert!(
-    MAX_VECTORS <= 128,
-    "RamVectorTable exceeds its 512-byte VTOR alignment; bump align(..) to the next power of two"
+    MAX_VECTORS <= 64,
+    "RamVectorTable exceeds its 256-byte VTOR alignment; bump align(..) to the next power of two"
 );
 
 /// Build the RAM vector table contents for the given [`IrqLayout`], as plain data (so it is
