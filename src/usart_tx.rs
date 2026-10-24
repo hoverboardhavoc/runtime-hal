@@ -113,18 +113,23 @@ fn tx_irq_num(chip: &Chip) -> usize {
 /// Built from the TX half of a split [`crate::usart::Usart`], consuming it the way
 /// [`crate::usart_rx::RingBufferedRx`] consumes the RX half: the transmit path now owns that
 /// instance's `TDATA` and its DMA channel, and [`release`](DmaTx::release) gives the half back
-/// polled. `N` is the caller's largest frame.
+/// polled. The buffer's length is the caller's largest frame.
 ///
 /// The `'static` buffer is OWNED rather than borrowed per call, because a DMA transfer reads its
 /// source for as long as it runs and a frame handed in by reference does not live that long. The
 /// owned copy plus the in-flight refusal are together what makes [`try_send`](DmaTx::try_send) safe
 /// from safe code: there is no window in which the caller can touch the bytes the channel is reading.
-pub struct DmaTx<const N: usize> {
+///
+/// **Not generic over the buffer length**, for the same reason [`crate::usart_rx::RingBufferedRx`]
+/// is not: the type is named by [`crate::serial::SplitSerial`]'s transmit half, which every port
+/// shares, and a const generic there would split that type (and with it the whole generic stack
+/// above it) once per buffer size. The length is a runtime field, checked once at bring-up.
+pub struct DmaTx {
     map: DmaTxMap,
     /// The owned source buffer. `&'static mut` rather than an inline array so the application places
     /// it (DECISIONS.md #10: buffers are application code) and so moving the handle never moves the
     /// memory a running channel is reading.
-    buf: &'static mut [u8; N],
+    buf: &'static mut [u8],
     /// The consumed TX half, held for `TC` waits and for [`release`](DmaTx::release).
     tx: UsartTx,
     /// The `TDATA` address resolved once from the register model (it differs by family).
@@ -140,16 +145,7 @@ pub struct DmaTx<const N: usize> {
     timeouts: u16,
 }
 
-impl<const N: usize> DmaTx<N> {
-    /// Compile-time rejection of a degenerate buffer: `N = 0` is a transmitter that can never take a
-    /// byte, and `N` above `CHxCNT`'s 16-bit range cannot be programmed. Referenced from
-    /// [`DmaTx::new`], so a bad `N` fails the BUILD of the instantiating crate (the
-    /// [`crate::usart_rx::RxRing`] precedent); no runtime test is possible or needed.
-    const VALID: () = assert!(
-        N >= 1 && N <= u16::MAX as usize,
-        "DmaTx needs 1 <= N <= 65535 (N is the largest frame, and CHxCNT is 16-bit)"
-    );
-
+impl DmaTx {
     /// Arm DMA transmit on the TX half of a brought-up USART, sending out of `buf`
     /// (`specs/uart-tx-dma.md` section 3.2). In order: resolve [`DmaTxMap`]; enable the DMA clock;
     /// stop any channel left running; **write-back self-check** (fail loud, arming nothing); set
@@ -167,18 +163,22 @@ impl<const N: usize> DmaTx<N> {
     ///
     /// **`tx` must be USART1's half**, the only transmit channel this HAL maps (section 3.1): any
     /// other handle is refused with [`DescriptorError::Unsupported`] rather than armed onto a
-    /// channel that feeds a different peripheral's `TDATA`. A failed self-check is
+    /// channel that feeds a different peripheral's `TDATA`. A buffer that is empty or longer than
+    /// `CHxCNT`'s 16-bit range is [`DescriptorError::Unsupported`] too, and a failed self-check is
     /// [`DescriptorError::SelfCheckFailed`].
     pub fn new(
         chip: &Chip,
         tx: UsartTx,
-        buf: &'static mut [u8; N],
+        buf: &'static mut [u8],
         core_hz: u32,
         baud: u32,
-    ) -> Result<DmaTx<N>, DescriptorError> {
-        // Force the compile-time N check at every instantiation site.
-        #[allow(clippy::let_unit_value)]
-        let () = Self::VALID;
+    ) -> Result<DmaTx, DescriptorError> {
+        // A zero-length buffer is a transmitter that can never take a byte, and a length past
+        // `CHxCNT`'s 16 bits cannot be programmed. Checked here rather than by a const assert,
+        // because the length is runtime data now (see the type's docs).
+        if buf.is_empty() || buf.len() > u16::MAX as usize {
+            return Err(DescriptorError::Unsupported);
+        }
 
         // The map is `USART1_TX` and nothing else, so a handle on another instance would arm a
         // channel whose peripheral request line belongs to a different USART: the transfer would
@@ -232,11 +232,11 @@ impl<const N: usize> DmaTx<N> {
         })
     }
 
-    /// Hand a frame to the channel: copy `min(frame.len(), N)` bytes into the owned buffer, program
-    /// the channel and start it, returning how many bytes were taken. A frame longer than `N` is
-    /// TRUNCATED rather than refused (the caller sized `N` to its largest frame, so an over-long one
-    /// is a caller bug the return value reports; failing the whole write would lose the part that
-    /// fits as well). An empty frame starts no transfer and reports zero.
+    /// Hand a frame to the channel: copy as much of it as the owned buffer holds, program the
+    /// channel and start it, returning how many bytes were taken. A frame longer than the buffer is
+    /// TRUNCATED rather than refused (the caller sized the buffer to its largest frame, so an
+    /// over-long one is a caller bug the return value reports; failing the whole write would lose
+    /// the part that fits as well). An empty frame starts no transfer and reports zero.
     ///
     /// While a transfer is in flight it refuses with [`TxBusy`] and touches neither the buffer nor
     /// the channel, UNTIL that transfer's deadline has passed; then it force-restarts (disable
@@ -261,7 +261,7 @@ impl<const N: usize> DmaTx<N> {
             self.timeouts = self.timeouts.saturating_add(1);
         }
 
-        let n = frame.len().min(N);
+        let n = frame.len().min(self.buf.len());
         self.buf[..n].copy_from_slice(&frame[..n]);
         self.budget = budget_cycles(self.per_byte, n);
         self.started = irq::cycle_count();

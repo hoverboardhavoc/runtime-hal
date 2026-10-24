@@ -916,14 +916,14 @@ fn the_write_budget_is_a_wall_clock_bound_at_every_clock() {
 
 /// The bench port with BOTH halves on DMA: ring RX, one-shot TX. Returns the adapter, the transmit
 /// channel, and the receive channel.
-fn split_dma_both(ring_len: usize) -> (SplitSerial<RingBufferedRx, DmaTx<32>>, u8, u8) {
+fn split_dma_both(ring_len: usize) -> (SplitSerial<RingBufferedRx>, u8, u8) {
     let c = chip();
     let (tx, rx) = bring_up().split();
     let buf: &'static mut [u8] = vec![0u8; ring_len].leak();
     let rx_ch = DmaRxMap::usart1_rx(&c).channel;
     let tx_ch = DmaTxMap::usart1_tx(&c).channel;
     let ring = RingBufferedRx::new(&c, rx, PeriphLabel::Usart1, buf).unwrap();
-    let txbuf: &'static mut [u8; 32] = Box::leak(Box::new([0u8; 32]));
+    let txbuf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
     let dma_tx = DmaTx::new(&c, tx, txbuf, TEST_CORE_HZ, 460_800).unwrap();
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
     (SplitSerial::new(dma_tx, ring, TEST_CORE_HZ), tx_ch, rx_ch)

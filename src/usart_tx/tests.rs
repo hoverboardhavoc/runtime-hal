@@ -158,13 +158,13 @@ fn gif_flag(ch: u8) -> u32 {
 /// Bring up USART1 and arm a `DmaTx` of capacity `N` on its TX half, with the RAM table flipped for
 /// `fam`'s layout. Returns the transmitter, the resolved channel, and the `TDATA` address the
 /// channel should have been pointed at.
-fn arm<const N: usize>(fam: &Fam) -> (DmaTx<N>, u8, u32, *const u8) {
+fn arm<const N: usize>(fam: &Fam) -> (DmaTx, u8, u32, *const u8) {
     let chip = chip_for(fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &link_cfg()).unwrap();
     let (tx_half, _rx_half) = usart.split();
     let tdata = tx_half.regs().tdata_addr();
     let ch = DmaTxMap::usart1_tx(&chip).channel;
-    let buf: &'static mut [u8; N] = Box::leak(Box::new([0u8; N]));
+    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; N]));
     // The real host pointer: `CHxMADDR` holds it truncated to 32 bits (the register is 32-bit and
     // the host's addresses are not), so the buffer is inspected through this and the register is
     // only ever compared against the same truncation.
@@ -421,7 +421,7 @@ fn c7_grouped_vector_services_ch3_ch4_and_both() {
     let (tx_half, rx_half) = usart.split();
     let dma_buf: &'static mut [u8] = vec![0u8; 16].leak();
     let rx = RingBufferedRx::new(&chip, rx_half, PeriphLabel::Usart1, dma_buf).unwrap();
-    let txbuf: &'static mut [u8; 32] = Box::leak(Box::new([0u8; 32]));
+    let txbuf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
     let mut tx = DmaTx::new(&chip, tx_half, txbuf, CORE_HZ, BAUD).unwrap();
     install_mock(fam.irq, RAM_ADDR);
     let (tx_ch, rx_ch) = (3u8, 4u8);
@@ -478,7 +478,7 @@ fn self_check_failure_arms_nothing() {
     let chip = chip_for(&fam);
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &link_cfg()).unwrap();
     let ch = DmaTxMap::usart1_tx(&chip).channel;
-    let buf: &'static mut [u8; 32] = Box::leak(Box::new([0u8; 32]));
+    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
 
     mock::freeze(DMA0_BASE + ch_maddr(ch));
 
@@ -509,7 +509,7 @@ fn a_non_usart1_half_is_refused() {
     let _g = setup();
     let chip = chip_for(&fam);
     let module = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
-    let buf: &'static mut [u8; 32] = Box::leak(Box::new([0u8; 32]));
+    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
 
     assert!(
         matches!(
