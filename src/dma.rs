@@ -611,11 +611,24 @@ impl DmaTxCtx {
 /// contexts and not three; the receive side's three ([`DMA_RX`]) predate that observation.
 static DMA_TX: [DmaTxCtx; 2] = [DmaTxCtx::new(), DmaTxCtx::new()];
 
+/// Context `ctx_index`: 0 is the link's, anything else the module port's. SELECTED rather than
+/// indexed, because the index is runtime data (the transmitter's own field) and an index the
+/// compiler cannot bound puts a `panic_bounds_check` on the transmit path, in a consumer image that
+/// is built to keep panics off it.
+#[inline]
+fn tx_ctx(ctx_index: usize) -> &'static DmaTxCtx {
+    if ctx_index == 0 {
+        &DMA_TX[0]
+    } else {
+        &DMA_TX[1]
+    }
+}
+
 /// Install DMA-TX context `ctx_index` for `map` and register the matching completion ISR body.
 /// Called by [`crate::usart_tx::DmaTx::new`] before it unmasks the vector. Clears any in-flight flag
 /// left by a previous arming of the port (a `release` + fresh `new` starts from idle).
 pub(crate) fn install_tx(map: &DmaTxMap, ctx_index: usize) {
-    let ctx = &DMA_TX[ctx_index];
+    let ctx = tx_ctx(ctx_index);
     ctx.in_flight.store(false, Ordering::Release);
     ctx.base.store(map.base, Ordering::Release);
     ctx.channel.store(map.channel, Ordering::Release);
@@ -629,7 +642,7 @@ pub(crate) fn install_tx(map: &DmaTxMap, ctx_index: usize) {
 /// Mark context `ctx_index` uninstalled (the transmit half is being given back): its ISR becomes a
 /// no-op and nothing is left claiming a transfer is running.
 pub(crate) fn uninstall_tx(ctx_index: usize) {
-    let ctx = &DMA_TX[ctx_index];
+    let ctx = tx_ctx(ctx_index);
     ctx.installed.store(false, Ordering::Release);
     ctx.in_flight.store(false, Ordering::Release);
 }
@@ -637,21 +650,21 @@ pub(crate) fn uninstall_tx(ctx_index: usize) {
 /// True while a transfer programmed on context `ctx_index` has not yet reported its completion.
 #[inline]
 pub(crate) fn tx_in_flight(ctx_index: usize) -> bool {
-    DMA_TX[ctx_index].in_flight.load(Ordering::Acquire)
+    tx_ctx(ctx_index).in_flight.load(Ordering::Acquire)
 }
 
 /// Claim context `ctx_index`'s channel for a transfer about to be programmed (stored before `CHEN`,
 /// see the field).
 #[inline]
 pub(crate) fn mark_tx_in_flight(ctx_index: usize) {
-    DMA_TX[ctx_index].in_flight.store(true, Ordering::Release);
+    tx_ctx(ctx_index).in_flight.store(true, Ordering::Release);
 }
 
 /// Release context `ctx_index`'s claim without a completion: the force-restart path, which has
 /// already disabled the channel and cleared its flags.
 #[inline]
 pub(crate) fn clear_tx_in_flight(ctx_index: usize) {
-    DMA_TX[ctx_index].in_flight.store(false, Ordering::Release);
+    tx_ctx(ctx_index).in_flight.store(false, Ordering::Release);
 }
 
 /// The registered ISR body for the link's transmit channel (context 0). Reached through
@@ -669,6 +682,9 @@ extern "C" fn module_dma_tx_handler() {
 
 /// The DMA-TX completion ISR, factored out so a host test drives it against the mock `INTF`.
 ///
+/// `inline(never)`: two vectors call it (the link's and the module port's), and one shared body is
+/// a call's worth of latency on a completion flag against a second copy in the consumer's flash.
+///
 /// Reads DMA `INTF` and services ONLY the resolved channel's full-transfer flag: clear the flag in
 /// `INTC`, clear `CHEN`, clear the in-flight flag. That is all it does. It starts nothing, for the
 /// reason the receive path does not auto-restart: what to do about a transmit that did not go out is
@@ -677,6 +693,7 @@ extern "C" fn module_dma_tx_handler() {
 ///
 /// The in-flight flag is cleared LAST: it is the gate `try_send` reads, so clearing it before `CHEN`
 /// would let a new transfer be programmed and then have its freshly-set `CHEN` torn down here.
+#[inline(never)]
 fn service_dma_tx(ctx: &DmaTxCtx) {
     if !ctx.installed.load(Ordering::Acquire) {
         return;
