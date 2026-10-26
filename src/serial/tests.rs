@@ -1008,6 +1008,39 @@ fn split_dma_tx_force_restart_surfaces_in_tx_timeouts() {
     );
 }
 
+/// The same wedged channel, met by a caller that writes ONLY when `write_ready` says so (the
+/// consuming firmware's BLE owner, `MeteredTx::pump`). `write_ready` turns true at the deadline, so
+/// the write that follows reaches the force-restart: the port recovers and the fault is counted.
+/// With readiness as "no transfer in flight" this caller would never write again, and nothing
+/// would count it.
+#[test]
+fn split_dma_tx_write_ready_lets_a_ready_gated_caller_recover_a_lost_completion() {
+    let _g = setup();
+    let (mut s, tx_ch, _rx_ch) = split_dma_both(16);
+
+    assert_eq!(s.write(&[1, 2, 3]), Ok(3));
+    assert_eq!(s.write_ready(), Ok(false), "inside the deadline");
+
+    // No completion, ever. Past the 3-byte frame's deadline the port reports ready.
+    mock_advance_cycles(TEST_CORE_HZ / 460_800 * 10 * 4 * 3 + 64);
+    assert_eq!(
+        s.write_ready(),
+        Ok(true),
+        "the lost completion does not silence the port"
+    );
+    assert_eq!(s.write(&[9, 9]), Ok(2), "the ready-gated write is taken");
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_cnt(tx_ch)).read(),
+        2,
+        "the channel carries the new frame"
+    );
+    assert_eq!(
+        s.tx_timeouts(),
+        1,
+        "counted once, by the backend's restart; the adapter waited for nothing"
+    );
+}
+
 /// `flush` is the real wait for the line to go idle, and on this backend that includes the
 /// transfer: a caller about to change the baud or tear the port down needs the bytes gone, not
 /// merely handed to a channel. Bounded like every other wait here.

@@ -575,11 +575,13 @@ impl TxHalf {
         }
     }
 
-    /// True if a write would make progress without waiting: `TBE` polled, an idle channel on DMA.
+    /// True if a write would make progress without waiting: `TBE` polled; on DMA an idle channel,
+    /// or one whose transfer is past its deadline and would be force-restarted by the write
+    /// ([`DmaTx::ready`]: a caller that writes only when ready must still reach the restart).
     fn ready(&self) -> bool {
         match self {
             TxHalf::Polled(tx) => tx.tx_empty(),
-            TxHalf::Dma(dma) => !dma.in_flight(),
+            TxHalf::Dma(dma) => dma.ready(),
         }
     }
 
@@ -791,8 +793,8 @@ impl<R: RxBackend> Write for SplitSerial<R> {
 }
 
 impl<R: RxBackend> WriteReady for SplitSerial<R> {
-    /// A write will make progress without waiting: `TBE` on the polled backend, an idle channel on
-    /// the DMA one.
+    /// A write will make progress without waiting: `TBE` on the polled backend; on the DMA one an
+    /// idle channel, or a transfer past its deadline that the write will abandon and count.
     #[inline]
     fn write_ready(&mut self) -> Result<bool, Self::Error> {
         Ok(self.tx.ready())

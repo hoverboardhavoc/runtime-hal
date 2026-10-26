@@ -1,12 +1,12 @@
 //! DMA channel driver for the USART ports: the circular RX (G-DMA-UART Gate B) and the one-shot TX
 //! (G-DMA-TX, `specs/uart-tx-dma.md`).
 //!
-//! Only what the two USART users need: resolve which DMA controller / channel / IRQ grouping carries
-//! `USART1_RX` ([`DmaRxMap`]) and `USART1_TX` ([`DmaTxMap`]) for the detected family, program the
+//! Only what the USART users need: resolve which DMA controller / channel / IRQ grouping carries a
+//! port's receive ([`DmaRxMap`]) and transmit ([`DmaTxMap`]) for the detected family, program the
 //! channel (circular periph->mem for receive, one-shot mem->periph for transmit), read the live
-//! remaining-count `CHxCNT`, and the two tiny ISR contexts: the receive one counts buffer wraps (for
-//! lap-overrun detection), the transmit one clears the in-flight flag on a completion. Each services
-//! ONLY its own channel's `INTF` bits, which is what lets the F1x0 grouped Ch3/4 vector carry both
+//! remaining-count `CHxCNT`, and the tiny ISR contexts: a receive one counts buffer wraps (for
+//! lap-overrun detection), a transmit one clears the in-flight flag on a completion. Each services
+//! ONLY its own channel's `INTF` bits, which is what lets an F1x0 grouped vector carry two channels
 //! (the DMA twin of the grouped advanced-timer demux).
 //!
 //! # The F1x0 grouped vector carries BOTH halves of the link
@@ -17,6 +17,9 @@
 //! demux that returned after the first match would drop the other channel's completion, and on the
 //! transmit side a dropped completion is an in-flight flag that never clears: a port that never
 //! transmits again until the force-restart budget expires.
+//!
+//! The module port's halves share a grouped vector the same way: `USART0_TX` (Ch1) and `USART0_RX`
+//! (Ch2) on `DMA_Channel1_2_IRQn` = 10, served by the same two-body shape (`dma_ch1_2_isr`).
 //!
 //! # Register layout (confirmed against the GD SPL `dma_*` + manuals)
 //!
@@ -288,21 +291,23 @@ impl DmaRxMap {
 
 // --- the transmit map ---------------------------------------------------------------------------
 
-/// The chip-resolved DMA mapping for `USART1_TX`: controller base, channel index, and whether the
-/// channel's IRQ is grouped (F1x0) or separate (F10x). The transmit twin of [`DmaRxMap`], resolved
-/// from the detected family at bring-up, never probed (`specs/uart-tx-dma.md` section 3.1).
+/// The chip-resolved DMA mapping for a USART's transmit: controller base, channel index, and whether
+/// the channel's IRQ is grouped (F1x0) or separate (F10x). The transmit twin of [`DmaRxMap`],
+/// resolved from the detected family at bring-up, never probed (`specs/uart-tx-dma.md` section 3.1).
 ///
-/// There is no `usart0_tx` and no `module_tx`: neither has a consumer, and an unexercised mapping is
-/// a wrong mapping waiting to be trusted. The receive side carries those two because its ports use
-/// them.
+/// Three mappings, one per port that transmits on DMA: the inter-board link's `USART1_TX`
+/// ([`usart1_tx`](Self::usart1_tx)), and the BLE module port's, which is `USART2_TX` on F10x
+/// ([`module_tx`](Self::module_tx)) and `USART0_TX` on F1x0 ([`usart0_tx`](Self::usart0_tx)), the
+/// same per-family split the receive side's [`DmaRxMap::module_rx`] / [`DmaRxMap::usart0_rx`] make.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DmaTxMap {
     /// DMA controller base ([`DMA0_BASE`] on both families).
     pub base: u32,
-    /// The `USART1_TX` channel index: **6 on F10x (F103), 3 on F1x0 (F130)**.
+    /// The transmit channel index: `USART1_TX` is **6 on F10x (F103), 3 on F1x0 (F130)**; the
+    /// module port's is **1** on both.
     pub channel: u8,
-    /// True if the channel's DMA IRQ is the grouped `DMA_Channel3_4` vector it shares with the
-    /// link's RX channel (F1x0); false if it has its own `DMA0_Channel6` vector (F10x).
+    /// True if the channel's DMA IRQ is a grouped vector it shares with its port's RX channel
+    /// (F1x0: Ch3/4 for the link, Ch1/2 for the module port); false if it has its own (F10x).
     pub grouped: bool,
 }
 
@@ -328,6 +333,44 @@ impl DmaTxMap {
                 channel: 3,
                 grouped: true,
             },
+        }
+    }
+
+    /// Resolve the BLE-module USART's TX mapping (HAL `Usart2` = GD `USART2`, F10x-only). The GD32F10x
+    /// User Manual Rev2.6 Table 9-3 (the "USART" row, the same row [`DmaRxMap::module_rx`] reads
+    /// `USART2_RX` = Ch2 from) maps GD **`USART2_TX` to DMA0 Channel 1**, with its own vector
+    /// `DMA0_Channel1_IRQn` = 12. The caller ([`crate::usart_tx::DmaTx::new`]) only reaches this after
+    /// matching the handle to USART2 on an F10x part, so this is unconditionally the F10x Ch1 mapping.
+    ///
+    /// The channel's other requests (`TIMER0_CH0`, `TIMER1_UP`, `TIMER2_CH2`, `SPI0_RX`) are all
+    /// unrequested: no timer or SPI path in this HAL sets a DMA request enable.
+    #[inline]
+    pub fn module_tx() -> DmaTxMap {
+        DmaTxMap {
+            base: DMA0_BASE,
+            channel: 1,
+            grouped: false,
+        }
+    }
+
+    /// Resolve USART0's TX mapping (the PB6/PB7 mapping, F1x0-only). The GD32F1x0 User Manual Rev3.6
+    /// Table 8-3 maps **`USART0_TX` to DMA channel 1** when not remapped; the `SYSCFG_CFG0` field
+    /// `USART0_TX_DMA_RMP` (bit 9) would move it to channel 3, colliding with `USART1_TX`, and is left
+    /// at its reset value of 0 because this HAL never enables the `SYSCFG` clock (the same reasoning
+    /// as [`DmaRxMap::usart0_rx`] and bit 10). Channel 1 shares the grouped `DMA_Channel1_2_IRQn` = 10
+    /// with `USART0_RX` on channel 2, so `grouped` is true and the slot runs both bodies, each gated
+    /// on its own channel's `INTF` bits. The caller only reaches this after matching the handle to
+    /// USART0 on an F1x0 part.
+    ///
+    /// The channel's other requests (`SPI0_RX`, `I2C0_TX`, `TIMER0_CH0`, `TIMER1_UP`, `TIMER2_CH2`,
+    /// and the ADC when remapped) are all unrequested: the I2C, SPI, timer and ADC paths in this HAL
+    /// set no DMA request enable.
+    #[inline]
+    pub fn usart0_tx() -> DmaTxMap {
+        DmaTxMap {
+            base: DMA0_BASE,
+            channel: 1,
+            grouped: true,
         }
     }
 
@@ -480,7 +523,7 @@ extern "C" fn module_dma_rx_handler() {
 }
 
 /// The registered ISR body for USART0's DMA channel (context 2, F1x0-only). Reached via the grouped
-/// Ch1/2 vector slot (`usart0_dma_rx_isr`) through `call_dma_rx_handler3`. Independent of the other
+/// Ch1/2 vector slot (`dma_ch1_2_isr`) through `call_dma_rx_handler3`. Independent of the other
 /// two: it services only Ch2's flags and bumps only context 2's wrap counter, which is also the Ch1
 /// demux on that grouped vector.
 extern "C" fn usart0_dma_rx_handler() {
@@ -536,12 +579,9 @@ pub(crate) fn mock_service(ctx_index: usize) {
 
 // --- DMA-TX ISR context (the in-flight flag) ---------------------------------------------------
 
-/// The static DMA-TX context: the resolved channel (so the ISR knows which `INTF` bits are its own,
-/// ignoring the other channel on the F1x0 grouped vector) plus the in-flight flag. Inert until
+/// A static DMA-TX context: the resolved channel (so the ISR knows which `INTF` bits are its own,
+/// ignoring the other channel on an F1x0 grouped vector) plus the in-flight flag. Inert until
 /// [`crate::usart_tx::DmaTx::new`] installs it, like the receive contexts.
-///
-/// ONE context, not an array: the only mapped transmit channel is `USART1_TX` (section 3.1), so a
-/// second would be a context for a channel nothing resolves.
 struct DmaTxCtx {
     installed: AtomicBool,
     base: AtomicU32,
@@ -563,52 +603,87 @@ impl DmaTxCtx {
     }
 }
 
-static DMA_TX: DmaTxCtx = DmaTxCtx::new();
+/// The DMA-TX contexts, one per port that can transmit on DMA: index 0 = the inter-board link's
+/// `USART1_TX` (Ch6 F10x / Ch3 F1x0), index 1 = the BLE module port's (`USART2_TX` Ch1 on F10x,
+/// `USART0_TX` Ch1 on F1x0). Both can be live at once, so each has its own in-flight flag and its own
+/// completion body, and a busy link never refuses a BLE frame or the reverse. Index 1 serves two
+/// instances that never coexist (one is F10x-only, the other F1x0-only), which is why there are two
+/// contexts and not three; the receive side's three ([`DMA_RX`]) predate that observation.
+static DMA_TX: [DmaTxCtx; 2] = [DmaTxCtx::new(), DmaTxCtx::new()];
 
-/// Install the DMA-TX context for `map` and register the completion ISR body. Called by
-/// [`crate::usart_tx::DmaTx::new`] before it unmasks the vector. Clears any in-flight flag left by a
-/// previous arming of the port (a `release` + fresh `new` starts from idle).
-pub(crate) fn install_tx(map: &DmaTxMap) {
-    DMA_TX.in_flight.store(false, Ordering::Release);
-    DMA_TX.base.store(map.base, Ordering::Release);
-    DMA_TX.channel.store(map.channel, Ordering::Release);
-    DMA_TX.installed.store(true, Ordering::Release);
-    irq::register_dma_tx_handler(dma_tx_handler);
-}
-
-/// Mark the context uninstalled (the transmit half is being given back): the ISR becomes a no-op and
-/// nothing is left claiming a transfer is running.
-pub(crate) fn uninstall_tx() {
-    DMA_TX.installed.store(false, Ordering::Release);
-    DMA_TX.in_flight.store(false, Ordering::Release);
-}
-
-/// True while a programmed transfer has not yet reported its completion.
+/// Context `ctx_index`: 0 is the link's, anything else the module port's. SELECTED rather than
+/// indexed, because the index is runtime data (the transmitter's own field) and an index the
+/// compiler cannot bound puts a `panic_bounds_check` on the transmit path, in a consumer image that
+/// is built to keep panics off it.
 #[inline]
-pub(crate) fn tx_in_flight() -> bool {
-    DMA_TX.in_flight.load(Ordering::Acquire)
+fn tx_ctx(ctx_index: usize) -> &'static DmaTxCtx {
+    if ctx_index == 0 {
+        &DMA_TX[0]
+    } else {
+        &DMA_TX[1]
+    }
 }
 
-/// Claim the channel for a transfer about to be programmed (stored before `CHEN`, see the field).
+/// Install DMA-TX context `ctx_index` for `map` and register the matching completion ISR body.
+/// Called by [`crate::usart_tx::DmaTx::new`] before it unmasks the vector. Clears any in-flight flag
+/// left by a previous arming of the port (a `release` + fresh `new` starts from idle).
+pub(crate) fn install_tx(map: &DmaTxMap, ctx_index: usize) {
+    let ctx = tx_ctx(ctx_index);
+    ctx.in_flight.store(false, Ordering::Release);
+    ctx.base.store(map.base, Ordering::Release);
+    ctx.channel.store(map.channel, Ordering::Release);
+    ctx.installed.store(true, Ordering::Release);
+    match ctx_index {
+        0 => irq::register_dma_tx_handler(dma_tx_handler),
+        _ => irq::register_dma_tx_handler2(module_dma_tx_handler),
+    }
+}
+
+/// Mark context `ctx_index` uninstalled (the transmit half is being given back): its ISR becomes a
+/// no-op and nothing is left claiming a transfer is running.
+pub(crate) fn uninstall_tx(ctx_index: usize) {
+    let ctx = tx_ctx(ctx_index);
+    ctx.installed.store(false, Ordering::Release);
+    ctx.in_flight.store(false, Ordering::Release);
+}
+
+/// True while a transfer programmed on context `ctx_index` has not yet reported its completion.
 #[inline]
-pub(crate) fn mark_tx_in_flight() {
-    DMA_TX.in_flight.store(true, Ordering::Release);
+pub(crate) fn tx_in_flight(ctx_index: usize) -> bool {
+    tx_ctx(ctx_index).in_flight.load(Ordering::Acquire)
 }
 
-/// Release the claim without a completion: the force-restart path, which has already disabled the
-/// channel and cleared its flags.
+/// Claim context `ctx_index`'s channel for a transfer about to be programmed (stored before `CHEN`,
+/// see the field).
 #[inline]
-pub(crate) fn clear_tx_in_flight() {
-    DMA_TX.in_flight.store(false, Ordering::Release);
+pub(crate) fn mark_tx_in_flight(ctx_index: usize) {
+    tx_ctx(ctx_index).in_flight.store(true, Ordering::Release);
 }
 
-/// The registered ISR body for the transmit channel. Reached through `call_dma_tx_handler` from the
-/// F10x Ch6 vector or the F1x0 grouped Ch3/4 vector.
+/// Release context `ctx_index`'s claim without a completion: the force-restart path, which has
+/// already disabled the channel and cleared its flags.
+#[inline]
+pub(crate) fn clear_tx_in_flight(ctx_index: usize) {
+    tx_ctx(ctx_index).in_flight.store(false, Ordering::Release);
+}
+
+/// The registered ISR body for the link's transmit channel (context 0). Reached through
+/// `call_dma_tx_handler` from the F10x Ch6 vector or the F1x0 grouped Ch3/4 vector.
 extern "C" fn dma_tx_handler() {
-    service_dma_tx(&DMA_TX);
+    service_dma_tx(&DMA_TX[0]);
+}
+
+/// The registered ISR body for the module port's transmit channel (context 1). Reached through
+/// `call_dma_tx_handler2` from the F10x Ch1 vector or the F1x0 grouped Ch1/2 vector. Independent of
+/// [`dma_tx_handler`]: it services only Ch1's flags and clears only context 1's in-flight flag.
+extern "C" fn module_dma_tx_handler() {
+    service_dma_tx(&DMA_TX[1]);
 }
 
 /// The DMA-TX completion ISR, factored out so a host test drives it against the mock `INTF`.
+///
+/// `inline(never)`: two vectors call it (the link's and the module port's), and one shared body is
+/// a call's worth of latency on a completion flag against a second copy in the consumer's flash.
 ///
 /// Reads DMA `INTF` and services ONLY the resolved channel's full-transfer flag: clear the flag in
 /// `INTC`, clear `CHEN`, clear the in-flight flag. That is all it does. It starts nothing, for the
@@ -618,6 +693,7 @@ extern "C" fn dma_tx_handler() {
 ///
 /// The in-flight flag is cleared LAST: it is the gate `try_send` reads, so clearing it before `CHEN`
 /// would let a new transfer be programmed and then have its freshly-set `CHEN` torn down here.
+#[inline(never)]
 fn service_dma_tx(ctx: &DmaTxCtx) {
     if !ctx.installed.load(Ordering::Acquire) {
         return;
@@ -641,9 +717,9 @@ fn service_dma_tx(ctx: &DmaTxCtx) {
     ctx.in_flight.store(false, Ordering::Release);
 }
 
-/// Reset every DMA-RX context + the DMA-TX context + every registered handler (host-test teardown
-/// between cases). All three receive contexts are reset so a case that installed the module or
-/// USART0 channel cannot leak into the next.
+/// Reset every DMA-RX and DMA-TX context + every registered handler (host-test teardown between
+/// cases). Every context is reset so a case that installed the module or USART0 channel cannot leak
+/// into the next.
 #[cfg(feature = "mock")]
 pub fn reset_for_test() {
     for ctx in &DMA_RX {
@@ -652,10 +728,12 @@ pub fn reset_for_test() {
         ctx.channel.store(0, Ordering::Release);
         ctx.wraps.store(0, Ordering::Release);
     }
-    DMA_TX.installed.store(false, Ordering::Release);
-    DMA_TX.base.store(0, Ordering::Release);
-    DMA_TX.channel.store(0, Ordering::Release);
-    DMA_TX.in_flight.store(false, Ordering::Release);
+    for ctx in &DMA_TX {
+        ctx.installed.store(false, Ordering::Release);
+        ctx.base.store(0, Ordering::Release);
+        ctx.channel.store(0, Ordering::Release);
+        ctx.in_flight.store(false, Ordering::Release);
+    }
     irq::clear_dma_rx_handler();
     irq::clear_dma_rx_handler2();
     // The third slot is USART0's DMA handler (F1x0 PB6/PB7, the offroad BLE wiring). It was omitted
@@ -663,4 +741,5 @@ pub fn reset_for_test() {
     // otherwise leak its handler into the next case.
     irq::clear_dma_rx_handler3();
     irq::clear_dma_tx_handler();
+    irq::clear_dma_tx_handler2();
 }

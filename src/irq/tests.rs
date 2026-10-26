@@ -28,14 +28,14 @@ use super::{
     build_table, call_control_handler, clear_control_handler, clear_tick_count, clear_tick_handler,
     default_isr, handler_addr, install_mock, mock_vtor, on_systick, register_control_handler,
     register_tick_handler, set_grouped_demux_timer_base, tick_count, ControlHandler, TickHandler,
-    F10X_ADC0_1_IRQ, F10X_DMA0_CH2_IRQ, F10X_DMA0_CH5_IRQ, F10X_DMA0_CH6_IRQ, F10X_EXTI10_15_IRQ,
-    F10X_EXTI5_9_IRQ, F10X_TIMER0_BRK_IRQ, F10X_TIMER0_CHANNEL_IRQ, F10X_TIMER0_TRG_CMT_IRQ,
-    F10X_TIMER0_UP_IRQ, F1X0_ADC_CMP_IRQ, F1X0_EXTI0_1_IRQ, F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ,
-    F1X0_TIMER0_BRK_UP_TRG_COM_IRQ, F1X0_TIMER0_CHANNEL_IRQ, INTF_BRKIF, INTF_CMTIF, INTF_TRGIF,
-    INTF_UPIF, MAX_VECTORS, SYSTEM_VECTORS, TIMER_INTF,
+    F10X_ADC0_1_IRQ, F10X_DMA0_CH1_IRQ, F10X_DMA0_CH2_IRQ, F10X_DMA0_CH5_IRQ, F10X_DMA0_CH6_IRQ,
+    F10X_EXTI10_15_IRQ, F10X_EXTI5_9_IRQ, F10X_TIMER0_BRK_IRQ, F10X_TIMER0_CHANNEL_IRQ,
+    F10X_TIMER0_TRG_CMT_IRQ, F10X_TIMER0_UP_IRQ, F1X0_ADC_CMP_IRQ, F1X0_EXTI0_1_IRQ,
+    F1X0_EXTI2_3_IRQ, F1X0_EXTI4_15_IRQ, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ, F1X0_TIMER0_CHANNEL_IRQ,
+    INTF_BRKIF, INTF_CMTIF, INTF_TRGIF, INTF_UPIF, MAX_VECTORS, SYSTEM_VECTORS, TIMER_INTF,
 };
 use super::{
-    DMA_RX_ISR_METRIC, F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ, SYSTICK_ISR_METRIC,
+    DMA_RX_ISR_METRIC, F1X0_DMA_CH1_2_IRQ, F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ, SYSTICK_ISR_METRIC,
     USART1_RX_ISR_METRIC,
 };
 use crate::descriptor::IrqLayout;
@@ -85,6 +85,20 @@ fn f1x0_grouped_slots_match_spl_layout() {
     // F10x's separate transmit vector (IRQ 17) is not routed here: on F1x0 that number is the
     // unrelated TIMER1 vector and the transmit channel is on the grouped slot above.
     assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(default_isr));
+
+    // The module port's DMA vector (IRQ 10, grouped Ch1/2) is the same two-body shape: USART0's
+    // receive on Ch2 and its transmit on Ch1 share it, so the slot must not be a receive-only body.
+    assert_eq!(
+        slot(&t, F1X0_DMA_CH1_2_IRQ),
+        handler_addr(super::dma_ch1_2_isr)
+    );
+    // F10x's separate module-transmit vector (IRQ 12) is the ADC vector on this layout, asserted
+    // above; the F10x body must not appear anywhere in this table.
+    let module_tx = handler_addr(super::module_dma_tx_isr);
+    assert!(
+        !t.iter().any(|&s| s == module_tx),
+        "the F10x module-transmit body must not appear in the F1x0 grouped table"
+    );
 
     // A slot the layout does not route (the table's last, an unused gap) stays the default ISR. This is
     // the "misplaced slot points at the wrong handler" guard: only the named slots diverge.
@@ -140,12 +154,22 @@ fn f10x_separate_slots_match_spl_layout() {
     // transmit on Ch6 (IRQ 17), no demux between them.
     assert_eq!(slot(&t, F10X_DMA0_CH5_IRQ), handler_addr(super::dma_rx_isr));
     assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(super::dma_tx_isr));
-    // The grouped Ch3/4 body belongs to the other layout and must not appear here.
-    let grouped_dma = handler_addr(super::dma_ch3_4_isr);
-    assert!(
-        !t.iter().any(|&s| s == grouped_dma),
-        "the grouped DMA body must not appear in the F10x separate table"
+    // The module port's transmit (GD USART2_TX) is DMA0 Ch1, its own vector (IRQ 12), next to its
+    // receive on Ch2 (IRQ 13) above.
+    assert_eq!(
+        slot(&t, F10X_DMA0_CH1_IRQ),
+        handler_addr(super::module_dma_tx_isr)
     );
+    // The grouped Ch3/4 and Ch1/2 bodies belong to the other layout and must not appear here.
+    for (grouped_dma, name) in [
+        (handler_addr(super::dma_ch3_4_isr), "Ch3/4"),
+        (handler_addr(super::dma_ch1_2_isr), "Ch1/2"),
+    ] {
+        assert!(
+            !t.iter().any(|&s| s == grouped_dma),
+            "the grouped {name} DMA body must not appear in the F10x separate table"
+        );
+    }
     // The grouped demux is never installed on the separate layout.
     let demux = handler_addr(super::timer0_grouped_demux);
     assert!(
@@ -600,6 +624,28 @@ fn r7_apply_motor_era_priorities_both_families() {
     }
 }
 
+/// `module_tx_irq` resolves the module port's transmit vector: its own DMA0 Ch1 vector on the
+/// standard family (GD `USART2_TX`), the grouped Ch1/2 vector it shares with the port's receive on
+/// the offroad one (GD `USART0_TX`). Never one of the link's vectors, so the two transmitters'
+/// completions cannot arrive on each other's slot.
+#[test]
+fn module_tx_irq_resolves_per_family_and_is_not_a_link_vector() {
+    use super::{dma_tx_irq, module_rx_irqs, module_tx_irq};
+    assert_eq!(module_tx_irq(IrqLayout::F10xSeparate), F10X_DMA0_CH1_IRQ);
+    assert_eq!(module_tx_irq(IrqLayout::F1x0Grouped), F1X0_DMA_CH1_2_IRQ);
+    assert_eq!(
+        module_tx_irq(IrqLayout::F1x0Grouped),
+        module_rx_irqs(IrqLayout::F1x0Grouped).1,
+        "F1x0: the module port's two DMA channels share one grouped vector"
+    );
+    for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
+        let (period, usart1, dma) = motor_era_irqs(layout);
+        for link in [period, usart1, dma, dma_tx_irq(layout)] {
+            assert_ne!(module_tx_irq(layout), link, "{layout:?}");
+        }
+    }
+}
+
 /// `module_rx_irqs` resolves the mirrored BLE-module port's `(usart_rx, dma_rx)` vectors: USART2 +
 /// its own DMA0 Ch2 vector on the standard family, USART0 + the grouped Ch1/2 vector on the offroad
 /// one. Distinct from the inter-board triplet on BOTH families, which is what lets the two ports
@@ -639,20 +685,28 @@ fn r7_module_rx_irqs_resolve_per_family_and_never_collide() {
 /// character. Assert they carry the RX priorities and sit strictly BELOW the period ISR.
 #[test]
 fn r7_module_rx_vectors_are_ordered_below_the_period_isr() {
-    use super::module_rx_irqs;
+    use super::{module_rx_irqs, module_tx_irq};
     for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
         let _g = mock::lock();
         mock::reset();
         // Pre-state: the reset value really is the most-urgent byte, so this is not vacuous.
         let (m_usart, m_dma) = module_rx_irqs(layout);
+        let m_tx = module_tx_irq(layout);
         assert_eq!(irq_priority(m_usart), 0, "{layout:?}: reset byte is 0");
         assert_eq!(irq_priority(m_dma), 0, "{layout:?}: reset byte is 0");
+        assert_eq!(irq_priority(m_tx), 0, "{layout:?}: reset byte is 0");
 
         apply_motor_era_priorities(layout);
 
         let (period, ..) = motor_era_irqs(layout);
         assert_eq!(irq_priority(m_usart), USART1_RX_PRIORITY);
         assert_eq!(irq_priority(m_dma), DMA_RX_PRIORITY);
+        // The module port's DMA TRANSMIT vector: a `DmaTx` on the BLE port unmasks it.
+        assert_eq!(irq_priority(m_tx), DMA_RX_PRIORITY);
+        assert!(
+            irq_priority(period) < irq_priority(m_tx),
+            "{layout:?}: the module transmit completion must not outrank the period ISR"
+        );
         assert!(
             irq_priority(period) < irq_priority(m_usart),
             "{layout:?}: the module USART must not outrank the period ISR"
