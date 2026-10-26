@@ -448,6 +448,44 @@ fn c6_elapsed_budget_force_restarts_counts_and_takes_the_frame() {
     );
 }
 
+// --- Case 8: readiness turns true at the deadline, so a ready-gated caller reaches the restart --
+
+/// A caller that only sends when the transmitter is ready (the consuming firmware's BLE owner) must
+/// still recover a transfer whose completion never arrives. `ready()` is false while the transfer
+/// is inside its deadline and true from the deadline on, WITHOUT touching anything itself; the send
+/// it lets through is what abandons the transfer and counts it. Against `!in_flight()` as the
+/// readiness, this caller would never send again.
+#[test]
+fn c8_ready_turns_true_at_the_deadline_so_a_ready_gated_caller_recovers() {
+    for fam in [f10x(), f1x0()] {
+        let _g = setup();
+        let (mut tx, ch, _tdata, _src) = arm::<32>(&fam);
+        assert!(tx.ready(), "idle: ready");
+
+        assert_eq!(tx.try_send(&[1, 2, 3, 4]), Ok(4));
+        assert!(!tx.ready(), "in flight inside the deadline: not ready");
+
+        // The completion is lost: nothing fires. Just inside the deadline, still not ready.
+        mock_advance_cycles(deadline(4) - 1);
+        assert!(!tx.ready());
+        // At the deadline: ready, and asking changed nothing.
+        mock_advance_cycles(1);
+        assert!(
+            tx.ready(),
+            "{:?}: past the deadline a send would go",
+            fam.clock
+        );
+        assert!(tx.in_flight(), "ready() abandons nothing by itself");
+        assert_eq!(tx.timeouts(), 0, "and counts nothing by itself");
+
+        // The send it lets through restarts the channel and counts the lost transfer.
+        assert_eq!(tx.try_send(&[5, 6]), Ok(2));
+        assert_eq!(tx.timeouts(), 1);
+        assert_eq!(Reg32::new(DMA0_BASE, ch_cnt(ch)).read(), 2);
+        assert!(!tx.ready(), "the new transfer has a fresh deadline");
+    }
+}
+
 // --- Case 7: the F1x0 grouped vector services whichever channels are flagged, including both ---
 
 /// The case the shape of the handler is chosen for. Ch3 (the link's TX) and Ch4 (its RX) share

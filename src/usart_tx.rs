@@ -308,9 +308,7 @@ impl DmaTx {
             return Ok(0);
         }
         if dma::tx_in_flight(self.ctx()) {
-            // Wrapping difference: `CYCCNT` is free-running and the deadline is far below one wrap.
-            let elapsed = irq::cycle_count().wrapping_sub(self.started);
-            if elapsed < self.budget {
+            if !self.expired() {
                 return Err(TxBusy);
             }
             // The deadline passed: abandon the transfer. Order matters: stop the channel before
@@ -344,6 +342,27 @@ impl DmaTx {
     #[inline]
     pub fn in_flight(&self) -> bool {
         dma::tx_in_flight(self.ctx())
+    }
+
+    /// True if a [`try_send`](DmaTx::try_send) now would take a frame: the channel is idle, OR the
+    /// transfer in flight is past its deadline, so the send would abandon it, count it and go.
+    ///
+    /// This, not `!in_flight()`, is the readiness a caller that only writes when ready must gate
+    /// on. The deadline is checked inside `try_send`, so a caller that waits for the in-flight flag
+    /// to clear before calling it never reaches the deadline: a completion that never arrives (a
+    /// wedged channel, a lost vector) then silences the port for good, and silently, because the
+    /// count that would have reported it is never taken. Reporting ready at the deadline is what
+    /// lets that caller recover the port and see the fault in [`timeouts`](DmaTx::timeouts).
+    #[inline]
+    pub fn ready(&self) -> bool {
+        !self.in_flight() || self.expired()
+    }
+
+    /// The transfer in flight has outlived its deadline. Meaningful only while one is in flight.
+    #[inline]
+    fn expired(&self) -> bool {
+        // Wrapping difference: `CYCCNT` is free-running and the deadline is far below one wrap.
+        irq::cycle_count().wrapping_sub(self.started) >= self.budget
     }
 
     /// Transfers the force-restart path abandoned, saturating: a wedged channel, a completion
