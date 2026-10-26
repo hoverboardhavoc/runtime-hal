@@ -22,8 +22,8 @@ use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, 
 use crate::dma::{DmaTxMap, DMA0_BASE};
 use crate::error::DescriptorError;
 use crate::irq::{
-    install_mock, mock_advance_cycles, mock_reset_cycles, mock_vtor, F10X_DMA0_CH6_IRQ,
-    F1X0_DMA_CH3_4_IRQ,
+    install_mock, mock_advance_cycles, mock_reset_cycles, mock_vtor, F10X_DMA0_CH1_IRQ,
+    F10X_DMA0_CH6_IRQ, F1X0_DMA_CH1_2_IRQ, F1X0_DMA_CH3_4_IRQ,
 };
 use crate::reg::{mock, Reg32};
 use crate::usart::Usart;
@@ -33,8 +33,10 @@ use std::sync::MutexGuard;
 
 /// The bench USART1 base in the mock window (the offsets within it are what assertions key on).
 const USART_BASE: u32 = 0x4000_4400;
-/// The BLE-module USART base, used by the one case that proves a non-USART1 handle is refused.
+/// The F10x BLE-module USART (GD `USART2`) base.
 const MODULE_BASE: u32 = 0x4000_4800;
+/// The F1x0 BLE-module USART (GD `USART0`, PB6/PB7) base.
+const USART0_BASE: u32 = 0x4001_3800;
 /// A non-zero RAM-table address for `install_mock` (stands in for the section).
 const RAM_ADDR: u32 = 0x2000_4000;
 
@@ -42,6 +44,8 @@ const RAM_ADDR: u32 = 0x2000_4000;
 /// the budgets the cases step over are the ones the port runs with.
 const CORE_HZ: u32 = 72_000_000;
 const BAUD: u32 = 460_800;
+/// The BLE module's baud (`ble::at::BAUD` in the consuming firmware).
+const MODULE_BAUD: u32 = 9_600;
 
 // CHxCTL bits (identical on both families).
 const CHEN: u32 = 1 << 0;
@@ -53,14 +57,20 @@ const MNAGA: u32 = 1 << 7;
 /// CTL2 `DENT`, the DMA-transmission enable the bring-up sets.
 const CTL2_DENT: u32 = 1 << 7;
 
-/// Per-family register offsets + the matching IRQ layout / transmit vector.
+/// Per-family register offsets + the matching IRQ layout / transmit vectors.
 struct Fam {
     ctl2: u32,
     clock: ClockPath,
     irq: IrqLayout,
-    /// The vector the transmit completion arrives on: its own Ch6 vector on F10x, the grouped Ch3/4
-    /// vector on F1x0.
+    /// The vector the link's transmit completion arrives on: its own Ch6 vector on F10x, the
+    /// grouped Ch3/4 vector on F1x0.
     dispatch: usize,
+    /// The BLE module port's USART on this family (GD `USART2` on F10x, `USART0` on F1x0), its
+    /// register base, and the vector its transmit completion arrives on (its own Ch1 vector on
+    /// F10x, the grouped Ch1/2 vector on F1x0).
+    module: PeriphLabel,
+    module_base: u32,
+    module_dispatch: usize,
 }
 
 fn f10x() -> Fam {
@@ -69,6 +79,9 @@ fn f10x() -> Fam {
         clock: ClockPath::F10xRcc,
         irq: IrqLayout::F10xSeparate,
         dispatch: F10X_DMA0_CH6_IRQ,
+        module: PeriphLabel::Usart2,
+        module_base: MODULE_BASE,
+        module_dispatch: F10X_DMA0_CH1_IRQ,
     }
 }
 
@@ -78,13 +91,20 @@ fn f1x0() -> Fam {
         clock: ClockPath::F1x0Rcu,
         irq: IrqLayout::F1x0Grouped,
         dispatch: F1X0_DMA_CH3_4_IRQ,
+        module: PeriphLabel::Usart0,
+        module_base: USART0_BASE,
+        module_dispatch: F1X0_DMA_CH1_2_IRQ,
     }
 }
+
+/// The module port's transmit channel: 1 on both families.
+const MODULE_CH: u8 = 1;
 
 fn chip_for(fam: &Fam) -> Chip {
     let mut addrs = AddrTable::new();
     addrs.set(PeriphLabel::Usart1, USART_BASE);
     addrs.set(PeriphLabel::Usart2, MODULE_BASE);
+    addrs.set(PeriphLabel::Usart0, USART0_BASE);
     addrs.set(PeriphLabel::Rcu, 0x4002_1000);
     Chip::from_descriptor(McuDescriptor {
         gpio: if fam.clock == ClockPath::F1x0Rcu {
@@ -112,10 +132,10 @@ fn link_cfg() -> UsartConfig {
     }
 }
 
-fn module_cfg() -> UsartConfig {
+fn module_cfg(usart: PeriphLabel) -> UsartConfig {
     UsartConfig {
-        usart: PeriphLabel::Usart2,
-        baud: BAUD,
+        usart,
+        baud: MODULE_BAUD,
         frame: UsartFrame::EIGHT_N_ONE,
         oversampling: Oversampling::By16,
     }
@@ -174,10 +194,35 @@ fn arm<const N: usize>(fam: &Fam) -> (DmaTx, u8, u32, *const u8) {
     (tx, ch, tdata, ptr)
 }
 
-/// Fire the transmit completion vector the way hardware would.
+/// Bring up the family's module USART and arm a `DmaTx` of capacity `N` on its TX half. Does NOT
+/// install the RAM table, so a case can arm the link's transmitter as well before flipping it.
+/// Returns the transmitter, the `TDATA` address and the owned buffer's pointer.
+fn arm_module<const N: usize>(fam: &Fam) -> (DmaTx, u32, *const u8) {
+    let chip = chip_for(fam);
+    let usart = Usart::bring_up(
+        &chip,
+        &ClockConfig::REFERENCE_72M_IRC8M,
+        &module_cfg(fam.module),
+    )
+    .unwrap();
+    let (tx_half, _rx_half) = usart.split();
+    let tdata = tx_half.regs().tdata_addr();
+    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; N]));
+    let ptr: *const u8 = buf.as_ptr();
+    let tx = DmaTx::new(&chip, tx_half, buf, CORE_HZ, MODULE_BAUD).unwrap();
+    (tx, tdata, ptr)
+}
+
+/// Fire the link's transmit completion vector the way hardware would.
 fn fire(fam: &Fam) {
     // SAFETY: the RAM table is installed (install_mock) and the slot holds a handler.
     unsafe { mock_vtor::dispatch(fam.dispatch) };
+}
+
+/// Fire the module port's transmit completion vector the way hardware would.
+fn fire_module(fam: &Fam) {
+    // SAFETY: the RAM table is installed (install_mock) and the slot holds a handler.
+    unsafe { mock_vtor::dispatch(fam.module_dispatch) };
 }
 
 /// Raise the channel's full-transfer flag in `INTF`, as the hardware does when `CHxCNT` hits zero.
@@ -501,28 +546,305 @@ fn self_check_failure_arms_nothing() {
     );
 }
 
-/// `USART1_TX` is the only transmit channel this HAL maps, so a TX half from any other instance is
-/// refused instead of being armed onto a channel whose request line belongs elsewhere.
+/// The module port's instance is per family, as on the receive side: `USART2` is the module on F10x
+/// and `USART0` on F1x0. The OTHER family's module label resolves to no transmit channel here (on
+/// F10x, `USART0`'s PB6/PB7 mapping needs an AFIO remap this HAL does not implement; on F1x0 there is
+/// no `USART2`), so a half from it is refused instead of being armed onto channel 1, whose request
+/// line belongs to a different USART.
 #[test]
-fn a_non_usart1_half_is_refused() {
-    let fam = f10x();
-    let _g = setup();
-    let chip = chip_for(&fam);
-    let module = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
-    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
+fn a_half_with_no_mapped_transmit_channel_is_refused() {
+    for (fam, other, other_base) in [
+        (f10x(), PeriphLabel::Usart0, USART0_BASE),
+        (f1x0(), PeriphLabel::Usart2, MODULE_BASE),
+    ] {
+        let _g = setup();
+        let chip = chip_for(&fam);
+        // The USART itself comes up (the instance exists in the descriptor); it is the transmit
+        // channel that has no mapping.
+        let usart =
+            Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg(other)).unwrap();
+        let buf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
 
+        assert!(
+            matches!(
+                DmaTx::new(&chip, usart.split().0, buf, CORE_HZ, MODULE_BAUD),
+                Err(DescriptorError::Unsupported)
+            ),
+            "{other:?} has no transmit channel on {:?}",
+            fam.clock
+        );
+        assert_eq!(
+            Reg32::new(other_base, fam.ctl2).read() & CTL2_DENT,
+            0,
+            "the refused instance's DENT is untouched"
+        );
+        assert_eq!(
+            Reg32::new(DMA0_BASE, ch_ctl(MODULE_CH)).read() & CHEN,
+            0,
+            "channel 1 was not armed for a USART that does not own it"
+        );
+    }
+}
+
+// --- The module port: its own channel, vector and in-flight state ------------------------------
+
+#[test]
+fn tx_map_resolves_the_module_port_channel_per_family() {
+    let f103 = DmaTxMap::module_tx();
+    assert_eq!(f103.channel, 1, "GD USART2_TX is DMA0 Ch1 on F10x");
+    assert_eq!(f103.base, DMA0_BASE);
+    assert!(!f103.grouped, "F10x DMA0_Channel1 has its own vector");
+
+    let f130 = DmaTxMap::usart0_tx();
+    assert_eq!(f130.channel, 1, "USART0_TX is Ch1 on F1x0, unremapped");
+    assert_eq!(f130.base, DMA0_BASE);
+    assert!(f130.grouped, "F1x0 Ch1/2 share a grouped vector");
+
+    // Never the link's channel on either family, so neither port can program the other's.
+    assert_ne!(
+        f103.channel,
+        DmaTxMap::usart1_tx(&chip_for(&f10x())).channel
+    );
+    assert_ne!(
+        f130.channel,
+        DmaTxMap::usart1_tx(&chip_for(&f1x0())).channel
+    );
+}
+
+/// The module port's half arms channel 1 against its own `TDATA`, and its completion arrives on its
+/// own vector: Ch1 = IRQ 12 on F10x, the grouped Ch1/2 = IRQ 10 on F1x0.
+#[test]
+fn m1_module_port_sends_on_channel_1_and_completes_on_its_own_vector() {
+    for fam in [f10x(), f1x0()] {
+        let _g = setup();
+        let (mut tx, tdata, src) = arm_module::<20>(&fam);
+        install_mock(fam.irq, RAM_ADDR);
+
+        assert_eq!(
+            Reg32::new(fam.module_base, fam.ctl2).read() & CTL2_DENT,
+            CTL2_DENT,
+            "{:?}: DENT set on the module USART",
+            fam.clock
+        );
+
+        let frame: Vec<u8> = (0..20).map(|i| 0x30 + i).collect();
+        assert_eq!(
+            tx.try_send(&frame),
+            Ok(20),
+            "a 20 B wire frame in one transfer"
+        );
+        assert!(tx.in_flight());
+        assert_eq!(
+            Reg32::new(DMA0_BASE, ch_paddr(MODULE_CH)).read(),
+            tdata,
+            "CH1PADDR = the module USART's TDATA"
+        );
+        assert_eq!(Reg32::new(DMA0_BASE, ch_cnt(MODULE_CH)).read(), 20);
+        assert_eq!(
+            Reg32::new(DMA0_BASE, ch_maddr(MODULE_CH)).read(),
+            src as u32,
+            "CH1MADDR = the owned buffer"
+        );
+        let ctl = Reg32::new(DMA0_BASE, ch_ctl(MODULE_CH)).read();
+        assert_eq!(
+            ctl & (DIR | MNAGA | FTFIE | CHEN),
+            DIR | MNAGA | FTFIE | CHEN
+        );
+        assert_eq!(
+            ctl & (CMEN | HTFIE),
+            0,
+            "one shot, no half-transfer interrupt"
+        );
+
+        // The LINK's vector does not complete it: its context is not this one.
+        complete(MODULE_CH);
+        if fam.dispatch != fam.module_dispatch {
+            fire(&fam);
+            assert!(
+                tx.in_flight(),
+                "{:?}: the link's vector must not service the module channel",
+                fam.clock
+            );
+        }
+        fire_module(&fam);
+        assert!(
+            !tx.in_flight(),
+            "{:?}: the module vector serviced Ch1",
+            fam.clock
+        );
+        assert_eq!(
+            Reg32::new(DMA0_BASE, 0x00).read() & ftf_flag(MODULE_CH),
+            0,
+            "Ch1 FTFIF cleared"
+        );
+        assert_eq!(tx.try_send(&[1, 2]), Ok(2), "the next frame is taken");
+    }
+}
+
+/// **The reason the transmit context became one per port.** With both transmitters live, each one's
+/// in-flight state is its own: a busy link never refuses a BLE frame, a busy BLE port never refuses
+/// a link frame, and a completion on one never clears the other.
+#[test]
+fn m2_link_and_module_transmitters_are_independent() {
+    for fam in [f10x(), f1x0()] {
+        let _g = setup();
+        // Both transmitters live under the one installed table (`arm` installs it last).
+        let (mut module, _mt, _ms) = arm_module::<20>(&fam);
+        let (mut link, link_ch, _t, _s) = arm::<32>(&fam);
+
+        assert_eq!(link.try_send(&[1, 2, 3]), Ok(3));
+        assert!(link.in_flight());
+        assert!(
+            !module.in_flight(),
+            "{:?}: the link's claim is not the module's",
+            fam.clock
+        );
+        assert_eq!(
+            module.try_send(&[9; 20]),
+            Ok(20),
+            "{:?}: a busy link does not refuse a BLE frame",
+            fam.clock
+        );
+        assert!(module.in_flight());
+
+        // The module port completes; the link is still mid-transfer.
+        complete(MODULE_CH);
+        fire_module(&fam);
+        assert!(
+            !module.in_flight(),
+            "{:?}: the module completion serviced",
+            fam.clock
+        );
+        assert!(
+            link.in_flight(),
+            "{:?}: and did not clear the link",
+            fam.clock
+        );
+        assert_eq!(
+            Reg32::new(DMA0_BASE, ch_ctl(link_ch)).read() & CHEN,
+            CHEN,
+            "the link's channel is still running"
+        );
+
+        // A busy module port does not refuse a link frame either.
+        assert_eq!(module.try_send(&[7; 20]), Ok(20));
+        complete(link_ch);
+        fire(&fam);
+        assert!(
+            !link.in_flight(),
+            "{:?}: the link completion serviced",
+            fam.clock
+        );
+        assert!(
+            module.in_flight(),
+            "{:?}: and did not clear the module port",
+            fam.clock
+        );
+        assert_eq!(link.try_send(&[4]), Ok(1));
+
+        // The force-restart deadlines are each port's own: past the link's 4-byte budget at
+        // 460800, the 20-byte module frame at 9600 is still well inside its own.
+        mock_advance_cycles(deadline(1) + 1);
+        assert_eq!(
+            link.try_send(&[5]),
+            Ok(1),
+            "the link's wedged transfer restarts"
+        );
+        assert_eq!(link.timeouts(), 1);
+        assert_eq!(
+            module.try_send(&[6]),
+            Err(TxBusy),
+            "the module port's does not"
+        );
+        assert_eq!(module.timeouts(), 0);
+    }
+}
+
+/// The F1x0 grouped Ch1/2 vector carries both halves of the module port, `USART0_TX` on Ch1 and
+/// `USART0_RX` on Ch2: the [`c7_grouped_vector_services_ch3_ch4_and_both`] case for the other
+/// grouped vector. One entry services whichever channel is flagged, and both when both are.
+#[test]
+fn m3_grouped_ch1_2_services_the_module_tx_rx_and_both() {
+    let fam = f1x0();
+    let _g = setup();
+
+    let chip = chip_for(&fam);
+    let usart = Usart::bring_up(
+        &chip,
+        &ClockConfig::REFERENCE_72M_IRC8M,
+        &module_cfg(PeriphLabel::Usart0),
+    )
+    .unwrap();
+    let (tx_half, rx_half) = usart.split();
+    let ring: &'static mut [u8] = vec![0u8; 16].leak();
+    let rx = RingBufferedRx::new(&chip, rx_half, PeriphLabel::Usart0, ring).unwrap();
+    let txbuf: &'static mut [u8] = Box::leak(Box::new([0u8; 20]));
+    let mut tx = DmaTx::new(&chip, tx_half, txbuf, CORE_HZ, MODULE_BAUD).unwrap();
+    install_mock(fam.irq, RAM_ADDR);
+    let (tx_ch, rx_ch) = (MODULE_CH, 2u8);
+    // The USART0 ring is the DMA-RX context 2 (`usart_rx`'s slot index for USART0).
+    let usart0_wraps = || crate::dma::wraps(2);
+
+    // (a) Ch1 alone: the transmit completion is serviced, no receive wrap is invented.
+    assert_eq!(tx.try_send(&[1, 2, 3]), Ok(3));
+    complete(tx_ch);
+    fire_module(&fam);
+    assert!(!tx.in_flight(), "the Ch1 completion was serviced");
+    assert_eq!(usart0_wraps(), 0, "no receive wrap was invented");
+
+    // (b) Ch2 alone: the receive wrap is counted and the transmitter is left mid-transfer.
+    assert_eq!(tx.try_send(&[4, 5, 6]), Ok(3));
+    complete(rx_ch);
+    fire_module(&fam);
+    assert_eq!(usart0_wraps(), 1, "the Ch2 wrap was counted");
     assert!(
-        matches!(
-            DmaTx::new(&chip, module.split().0, buf, CORE_HZ, BAUD),
-            Err(DescriptorError::Unsupported)
-        ),
-        "only USART1's transmit channel is mapped"
+        tx.in_flight(),
+        "a receive-only entry must not clear the transmit in-flight flag"
     );
-    assert_eq!(
-        Reg32::new(MODULE_BASE, fam.ctl2).read() & CTL2_DENT,
-        0,
-        "the refused instance's DENT is untouched"
-    );
+
+    // (c) BOTH flagged in one entry: both are serviced.
+    complete(tx_ch);
+    complete(rx_ch);
+    fire_module(&fam);
+    assert!(!tx.in_flight(), "the transmit completion was serviced");
+    assert_eq!(usart0_wraps(), 2, "the receive wrap was counted too");
+    let intf = Reg32::new(DMA0_BASE, 0x00).read();
+    assert_eq!(intf & (0xF << (4 * tx_ch as u32)), 0, "Ch1 flags cleared");
+    assert_eq!(intf & ftf_flag(rx_ch), 0, "Ch2 FTFIF cleared");
+
+    let _ = rx;
+}
+
+/// Releasing one port's transmitter leaves the other's armed: `release` uninstalls its OWN context
+/// only, so the BLE port can be torn down for a reconfigure without silencing the link.
+#[test]
+fn m4_releasing_the_module_port_leaves_the_link_armed() {
+    for fam in [f10x(), f1x0()] {
+        let _g = setup();
+        let (module, _mt, _ms) = arm_module::<20>(&fam);
+        let (mut link, link_ch, _t, _s) = arm::<32>(&fam);
+
+        let _half = module.release();
+        assert_eq!(
+            Reg32::new(fam.module_base, fam.ctl2).read() & CTL2_DENT,
+            0,
+            "the module USART's DENT is cleared"
+        );
+        assert_eq!(
+            Reg32::new(USART_BASE, fam.ctl2).read() & CTL2_DENT,
+            CTL2_DENT,
+            "the link's DENT is not"
+        );
+
+        assert_eq!(link.try_send(&[1, 2]), Ok(2));
+        complete(link_ch);
+        fire(&fam);
+        assert!(
+            !link.in_flight(),
+            "{:?}: the link's completion is still serviced",
+            fam.clock
+        );
+    }
 }
 
 /// `release` gives the polled half back: the channel is stopped, `DENT` is cleared, and the context

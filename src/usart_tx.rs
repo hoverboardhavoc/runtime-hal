@@ -7,6 +7,15 @@
 //! Here the CPU copies the frame into an owned buffer, arms a channel, and leaves; the DMA feeds
 //! `TDATA` byte by byte and raises one interrupt at the end.
 //!
+//! # Two ports
+//!
+//! Two USARTs can transmit on DMA, each with its own channel, completion vector and in-flight state,
+//! so both can be live at once: the inter-board link (`USART1`), and the BLE module port (`USART2` on
+//! F10x, `USART0` on its PB6/PB7 mapping on F1x0; the same per-family split the receive side
+//! resolves). The module port is 9600 baud, where a 20 B frame is 21 ms of wire: polled, it can only
+//! go out a byte per main-loop visit, so the loop's pass rate sets the port's byte rate. On DMA the
+//! frame goes in one transfer and the pass rate stops mattering.
+//!
 //! # What it is NOT
 //!
 //! It queues nothing and drops nothing. A `try_send` while a transfer is in flight is REFUSED, and
@@ -31,7 +40,9 @@
 //! transfer (disable `CHEN`, clear the channel's flags), counts it, and takes the new frame. The
 //! count is what makes a wedging port visible rather than merely survived.
 
+use crate::addr::PeriphLabel;
 use crate::chip::Chip;
+use crate::descriptor::ClockPath;
 use crate::dma::{self, DmaTxMap};
 use crate::error::DescriptorError;
 use crate::irq;
@@ -99,16 +110,67 @@ const fn budget_cycles(per_byte: u32, len: usize) -> u32 {
     }
 }
 
-/// The DMA transmit IRQ number for `chip`'s family: its own `DMA0_Channel6` = 17 on F10x, the
-/// grouped `DMA_Channel3_4` = 11 on F1x0 (shared with the link's receive channel, where unmasking it
-/// a second time is idempotent). Hardware-build-only (drives the NVIC).
-#[cfg(not(feature = "mock"))]
-#[inline]
-fn tx_irq_num(chip: &Chip) -> usize {
-    irq::dma_tx_irq(chip.irq())
+/// Which transmit context a handle resolves to, and so which channel, vector and in-flight flag it
+/// owns. The index is the [`crate::dma`] context index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxPort {
+    /// The inter-board link's `USART1`: context 0.
+    Link,
+    /// The BLE module port: `USART2` on F10x, `USART0` (PB6/PB7) on F1x0. Context 1, shared by the
+    /// two instances because no part has both.
+    Module,
 }
 
-/// One-shot DMA USART transmitter for the inter-board link's port (G-DMA-TX).
+impl TxPort {
+    #[inline]
+    const fn ctx(self) -> usize {
+        match self {
+            TxPort::Link => 0,
+            TxPort::Module => 1,
+        }
+    }
+}
+
+/// Resolve a TX half's register base to the port it transmits for, and that port's channel map.
+///
+/// Keyed on the handle's base rather than on a selector the caller passes, so a channel can only be
+/// armed for the USART whose `TDATA` it feeds: the instance is what the caller actually handed over.
+/// The module instance follows the receive side's family rule (`usart_rx::resolve_instance`):
+/// `USART2` is the module on F10x and does not exist on F1x0; `USART0` is the module on F1x0 and is
+/// refused on F10x, where its PB6/PB7 mapping needs an AFIO remap this HAL does not implement. A
+/// label the descriptor has no address for simply does not match. Anything else is
+/// [`DescriptorError::Unsupported`].
+fn resolve_port(chip: &Chip, base: u32) -> Result<(TxPort, DmaTxMap), DescriptorError> {
+    let is = |label: PeriphLabel| chip.base(label).ok() == Some(base);
+    if is(PeriphLabel::Usart1) {
+        return Ok((TxPort::Link, DmaTxMap::usart1_tx(chip)));
+    }
+    match chip.clock() {
+        ClockPath::F10xRcc if is(PeriphLabel::Usart2) => {
+            Ok((TxPort::Module, DmaTxMap::module_tx()))
+        }
+        ClockPath::F1x0Rcu if is(PeriphLabel::Usart0) => {
+            Ok((TxPort::Module, DmaTxMap::usart0_tx()))
+        }
+        _ => Err(DescriptorError::Unsupported),
+    }
+}
+
+/// The DMA transmit IRQ number for `port` on `chip`'s family. The link: its own `DMA0_Channel6` = 17
+/// on F10x, the grouped `DMA_Channel3_4` = 11 on F1x0. The module port: its own `DMA0_Channel1` = 12
+/// on F10x, the grouped `DMA_Channel1_2` = 10 on F1x0. A grouped vector is shared with the port's
+/// receive channel, where unmasking it a second time is idempotent. Hardware-build-only (drives the
+/// NVIC).
+#[cfg(not(feature = "mock"))]
+#[inline]
+fn tx_irq_num(chip: &Chip, port: TxPort) -> usize {
+    match port {
+        TxPort::Link => irq::dma_tx_irq(chip.irq()),
+        TxPort::Module => irq::module_tx_irq(chip.irq()),
+    }
+}
+
+/// One-shot DMA USART transmitter for the inter-board link's port or the BLE module port (G-DMA-TX).
 ///
 /// Built from the TX half of a split [`crate::usart::Usart`], consuming it the way
 /// [`crate::usart_rx::RingBufferedRx`] consumes the RX half: the transmit path now owns that
@@ -126,6 +188,9 @@ fn tx_irq_num(chip: &Chip) -> usize {
 /// above it) once per buffer size. The length is a runtime field, checked once at bring-up.
 pub struct DmaTx {
     map: DmaTxMap,
+    /// The [`crate::dma`] transmit context this port owns ([`TxPort::ctx`]): its in-flight flag and
+    /// its completion body.
+    ctx: u8,
     /// The owned source buffer. `&'static mut` rather than an inline array so the application places
     /// it (DECISIONS.md #10: buffers are application code) and so moving the handle never moves the
     /// memory a running channel is reading.
@@ -161,7 +226,8 @@ impl DmaTx {
     /// frame in CPU cycles); `core_hz` is a parameter for the same reason
     /// [`crate::serial::PolledSerial::from_usart`]'s is.
     ///
-    /// **`tx` must be USART1's half**, the only transmit channel this HAL maps (section 3.1): any
+    /// **`tx` must be the half of a USART this HAL maps a transmit channel for**: `USART1` (the link)
+    /// on either family, `USART2` (the module port) on F10x, `USART0` (the module port) on F1x0. Any
     /// other handle is refused with [`DescriptorError::Unsupported`] rather than armed onto a
     /// channel that feeds a different peripheral's `TDATA`. A buffer that is empty or longer than
     /// `CHxCNT`'s 16-bit range is [`DescriptorError::Unsupported`] too, and a failed self-check is
@@ -180,16 +246,10 @@ impl DmaTx {
             return Err(DescriptorError::Unsupported);
         }
 
-        // The map is `USART1_TX` and nothing else, so a handle on another instance would arm a
-        // channel whose peripheral request line belongs to a different USART: the transfer would
-        // either never advance or feed the wrong port. Check the handle against the descriptor's
-        // USART1 base rather than trusting the caller (the `resolve_instance` posture on the RX
-        // side, expressed against the handle the caller actually passed).
-        if tx.regs().base() != chip.base(crate::addr::PeriphLabel::Usart1)? {
-            return Err(DescriptorError::Unsupported);
-        }
-
-        let map = DmaTxMap::usart1_tx(chip);
+        // A channel's request line belongs to one USART, so a handle armed on another instance's
+        // channel would either never advance or feed the wrong port. Resolve the channel from the
+        // handle the caller actually passed (the `resolve_instance` posture on the RX side).
+        let (port, map) = resolve_port(chip, tx.regs().base())?;
 
         // The DMA controller clock (shared with the receive ring, which may already have enabled it;
         // the write is idempotent).
@@ -215,13 +275,14 @@ impl DmaTx {
         // clock is a deadline that never arrives. It ZEROES the counter, which is why it belongs to
         // bring-up and nowhere else: a consumer timing a window across this call would see its
         // start stamp move.
-        dma::install_tx(&map);
+        dma::install_tx(&map, port.ctx());
         irq::enable_cycle_counter();
         #[cfg(not(feature = "mock"))]
-        nvic_unmask(tx_irq_num(chip));
+        nvic_unmask(tx_irq_num(chip, port));
 
         Ok(DmaTx {
             map,
+            ctx: port.ctx() as u8,
             buf,
             paddr: tx.regs().tdata_addr(),
             tx,
@@ -246,7 +307,7 @@ impl DmaTx {
         if frame.is_empty() {
             return Ok(0);
         }
-        if dma::tx_in_flight() {
+        if dma::tx_in_flight(self.ctx()) {
             // Wrapping difference: `CYCCNT` is free-running and the deadline is far below one wrap.
             let elapsed = irq::cycle_count().wrapping_sub(self.started);
             if elapsed < self.budget {
@@ -257,7 +318,7 @@ impl DmaTx {
             // the clear, and clear the in-flight claim last, as the ISR does.
             self.map.disable();
             self.map.clear_flags();
-            dma::clear_tx_in_flight();
+            dma::clear_tx_in_flight(self.ctx());
             self.timeouts = self.timeouts.saturating_add(1);
         }
 
@@ -267,7 +328,7 @@ impl DmaTx {
         self.started = irq::cycle_count();
         // Claim BEFORE `CHEN` (inside `configure_oneshot`): a completion landing between the start
         // and this store would clear a flag that was not yet set, stranding the port.
-        dma::mark_tx_in_flight();
+        dma::mark_tx_in_flight(self.ctx());
         // SAFETY: `self.buf` is the caller's `'static` buffer, owned by this handle for as long as
         // it lives, and the in-flight refusal is what keeps the CPU out of the first `n` bytes until
         // the channel reports it is done with them.
@@ -282,7 +343,7 @@ impl DmaTx {
     /// of the transmitter: a caller that gets [`TxBusy`] can poll this instead of retrying blindly.
     #[inline]
     pub fn in_flight(&self) -> bool {
-        dma::tx_in_flight()
+        dma::tx_in_flight(self.ctx())
     }
 
     /// Transfers the force-restart path abandoned, saturating: a wedged channel, a completion
@@ -312,8 +373,14 @@ impl DmaTx {
         self.map.disable();
         self.map.clear_flags();
         self.tx.regs().disable_dma_tx();
-        dma::uninstall_tx();
+        dma::uninstall_tx(self.ctx());
         self.tx
+    }
+
+    /// This port's [`crate::dma`] transmit context index.
+    #[inline]
+    fn ctx(&self) -> usize {
+        self.ctx as usize
     }
 }
 
