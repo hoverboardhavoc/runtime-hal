@@ -379,6 +379,7 @@ pub const F10X_K2_THRESHOLD_KIB: u16 = 128;
 /// fully HAL-owned: [`probe::run`] installs a probe-scoped vector table (BusFault slot ->
 /// [`probe::bus_fault_entry`]) and restores `VTOR` before returning, so the application defines NO
 /// `#[exception] BusFault`.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn detect_chip() -> Result<Chip, DetectError> {
     // The probe gathers EVERY silicon observation up front (family discriminator + flash density +
     // the MEASURED per-instance counts) into one fully-populated `Detected`; `synthesize` then builds

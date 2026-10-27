@@ -231,6 +231,7 @@ pub fn gate_set(chip: &Chip, hi: [u8; 3], lo: [u8; 3]) -> Option<PeriphLabel> {
 /// PB0-1 = 8-9, PC0-5 = 10-15, gated on [`pin_exists`] (so the PC channels answer only on the
 /// LQFP64-bonding parts, matching the datasheets' 10-vs-16 external-channel counts). Internal
 /// channels (16/17) are not pin-backed ([`crate::adc::is_internal_channel`] owns them).
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn adc_channel(chip: &Chip, pin: u8) -> Option<u8> {
     if !pin_exists(chip, pin) {
         return None;
@@ -305,6 +306,7 @@ pub fn i2c_instance(chip: &Chip, scl: u8, sda: u8) -> Option<PeriphLabel> {
 ///
 /// Answering `Some` is a ROUTING fact, not permission: [`check_pin_ownership`] is still the
 /// backstop every configure call goes through.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn usart_pins(chip: &Chip, tx: u8, rx: u8) -> Option<UsartMapping> {
     let f1x0 = matches!(chip.gpio(), GpioPath::AhbCtlAfsel);
     USART_PIN_MAPPINGS

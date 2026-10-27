@@ -310,6 +310,11 @@ impl AddrTable {
     }
 
     /// Resolve a label to its base, erroring if the wiring needs a base the table lacks.
+    ///
+    /// `#[inline]`, and measured: outlined behind `#[inline(never)]` the shipping image grew 332 B
+    /// (shrink round 7, 2026-10-27), because every one of its 28 call sites then marshals the
+    /// `Result<u32, DescriptorError>` through memory where the inlined form folds the `Option`
+    /// straight into the caller's branch.
     #[inline]
     pub fn resolve(&self, label: PeriphLabel) -> Result<u32, DescriptorError> {
         self.get(label).ok_or(DescriptorError::MissingBase(label))

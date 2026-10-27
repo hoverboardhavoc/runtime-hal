@@ -114,6 +114,7 @@ impl Chip {
     /// (0..15) within the port. Returns [`DescriptorError::MissingBase`] if the port or RCU base is
     /// absent from the descriptor.
     #[inline]
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn analog_pin(&self, port: PeriphLabel, pin: u8) -> Result<(), DescriptorError> {
         crate::pincap::check_pin_ownership(self, packed_pin(port, pin)?, PinClaim::NonGate)?;
         let base = self.base(port)?;
@@ -148,6 +149,7 @@ impl Chip {
     /// descriptor does not carry GPIOA (port presence is a RUNTIME `Result`, not a compile-time
     /// guarantee, because the chip is detected at runtime).
     #[inline]
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn gpioa(&self) -> Result<GpioPort<PortAPins>, DescriptorError> {
         self.gpio_port(PeriphLabel::Gpioa)
     }
@@ -164,6 +166,7 @@ impl Chip {
     /// `pc0..pc15` pins. Like [`Chip::gpioa`], the port clock is enabled and presence is a runtime
     /// `Result`.
     #[inline]
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn gpioc(&self) -> Result<GpioPort<PortCPins>, DescriptorError> {
         self.gpio_port(PeriphLabel::Gpioc)
     }
@@ -200,6 +203,7 @@ impl Chip {
     /// [`GpioPort::split`]'s: this resolves and clocks a pin, it does not configure one. Whether the
     /// pin may be claimed for the caller's function is still the ownership backstop's answer, asked
     /// by whichever configure seam consumes the handle.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn pin(&self, packed: u8) -> Result<Pin<Input<Floating>>, DescriptorError> {
         let base = self.clocked_port_base(packed)?;
         Ok(Pin::new(base, self.desc.gpio, packed))
@@ -214,6 +218,7 @@ impl Chip {
     /// three-element array, which the optimiser unrolls: inlined, the two tables are emitted per
     /// call site and the group builder costs ~520 B of flashed span instead of three branches.
     #[inline(never)]
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn clocked_port_base(&self, packed: u8) -> Result<u32, DescriptorError> {
         let port = gpio_port_label(packed)?;
         let base = self.base(port)?;
@@ -399,6 +404,7 @@ impl Chip {
     /// port index is one this crate does not model), or if the descriptor carries no RCU base to
     /// clock the port from. This is the base-hidden builder: it resolves the per-pin port bases and
     /// the family ISTAT offset internally, so no caller-facing raw base or `GpioPath` is involved.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn input_group(
         &self,
         pins: [u8; INPUT_GROUP_LINES],
@@ -463,6 +469,7 @@ impl Chip {
     /// (F1x0: per-pin AFSEL = AF2; F10x: CRL/CRH nibble) plus the pin's port-clock enable. The caller
     /// (a motor application) passes its board gate pins as DATA; the family difference is absorbed.
     /// Returns [`DescriptorError::MissingBase`] if the pin's port (or the RCU) is not in the descriptor.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn route_advanced_pwm_pin(&self, pin: u8) -> Result<(), DescriptorError> {
         crate::pincap::check_pin_ownership(self, pin, PinClaim::Gate)?;
         let port = gpio_port_label(pin)?;

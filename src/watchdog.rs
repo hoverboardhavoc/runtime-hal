@@ -237,6 +237,7 @@ impl FreeWatchdog {
     /// clears it). Use a GENEROUS timeout and feed it every loop pass; see
     /// [`FreeWatchdog::freeze_on_debug_halt`] to keep an SWD session from being reset out from under
     /// the core.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn start(chip: &crate::Chip, timeout: WdgTimeout) -> Result<FreeWatchdog, WatchdogError> {
         let rcu = chip.rcu_base().map_err(|_| WatchdogError::MissingRcuBase)?;
         clock::enable_lsi(rcu)?;
@@ -253,6 +254,7 @@ impl FreeWatchdog {
     /// The five-write key recipe, given the resolved PSC code and 12-bit reload. Separated from
     /// [`FreeWatchdog::start`] so the LSI-enable (a clock-path concern) and the FWDGT register
     /// sequence (this module) are distinct, and so the host tests can drive the recipe directly.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn program(&self, psc_code: u32, reload: u16) -> Result<(), WatchdogError> {
         // 1. Unlock write access to PSC + RLD.
         self.ctl().write(KEY_UNLOCK);
@@ -287,6 +289,7 @@ impl FreeWatchdog {
     /// there is no family branch or descriptor lookup here. It does NOT touch TIMER0 or any arming
     /// gate. When no debugger is attached the bit has no effect, so calling it unconditionally at
     /// bring-up is harmless on a production board.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn freeze_on_debug_halt() {
         const DBG_BASE: u32 = 0xE004_2000;
         const DBG_CTL_OFFSET: u32 = 0x04;
