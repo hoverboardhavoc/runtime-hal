@@ -476,6 +476,7 @@ impl Usart {
     ///    logical pin byte (the application never built them) and the AF-mux number the pin mapping
     ///    resolved to (step 1b), NOT one baked into the role.
     /// 4. Program BRR from `clock` + `baud`, the 8N1 /16 frame, and enable TX + RX + the peripheral.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new<TX, RX>(
         chip: &Chip,
         clock: &ClockConfig,
@@ -537,6 +538,7 @@ impl Usart {
     /// `usart_stop_bit_set` (`STB`), `usart_parity_config` (`PM/PCEN`), `usart_oversample_config`
     /// (`OVSMOD`), `usart_receive_config` / `usart_transmit_config` (`REN` / `TEN`), `usart_enable`
     /// (`UEN`). For an 8N1 /16 frame every frame field value is 0 (the reset frame).
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn program(
         base: u32,
         model: UsartModel,

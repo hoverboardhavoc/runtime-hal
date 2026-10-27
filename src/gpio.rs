@@ -271,6 +271,7 @@ impl PinRole {
 /// `port_base` is the resolved base of the pin's port (from the address table). `pin` is the
 /// logical `(port << 4) | pin` byte; only the low nibble (pin number 0..15) is used here, the port
 /// having already been resolved to `port_base`.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub(crate) fn configure_af(port_base: u32, path: GpioPath, pin: u8, role: PinRole) {
     let n = (pin & 0x0F) as u32;
     let cfg = role.config();
@@ -323,6 +324,7 @@ fn configure_f10x(port_base: u32, n: u32, cfg: &PinConfig) {
 /// 3. `AFSEL{0,1}`: the resolved AF-mux number (the mapping's `UsartAf` for USART, AF1 for I2C,
 ///    AF0 for SPI, AF2 for the timer roles).
 /// 4. For output roles, the output options: `OMODE` push-pull or open-drain, and `OSPD` 50 MHz.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 fn configure_f1x0(port_base: u32, n: u32, cfg: &PinConfig) {
     // 1. CTL: 2 bits/pin. AF mode for every role: the line goes through the AF mux either way, and
     // the SPL drives USART/SPI inputs as AF too (F1X0_MODE_INPUT is the documented non-AF
@@ -474,6 +476,7 @@ fn configure_input_f1x0(port_base: u32, n: u32, pull: InputPull) {
 ///   `gd32f10x_gpio.c::gpio_init` (`GPIO_MODE_AIN`).
 /// - F1x0 (CTL/PUD): `CTL` = analog mode (`0b11`); `GPIO_PUD` cleared to floating (a pull would
 ///   distort the analog reading), per `gd32f1x0_gpio.c::gpio_mode_set`.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub(crate) fn configure_analog(port_base: u32, path: GpioPath, pin: u8) {
     let n = (pin & 0x0F) as u32;
     match path {
@@ -590,6 +593,7 @@ fn configure_output_f1x0(port_base: u32, n: u32) {
 /// Bound by the arm-only I2C bus-clear (and the gpio host tests); on a non-arm lib build it is
 /// unreferenced, so allow dead code there (the same shape the other arm-only helpers use).
 #[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub(crate) fn configure_output_od(port_base: u32, path: GpioPath, pin: u8, pull_up: bool) {
     let n = (pin & 0x0F) as u32;
     match path {

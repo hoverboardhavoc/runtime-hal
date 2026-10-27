@@ -340,6 +340,7 @@ pub fn enable_spi(
 /// unconditionally and touches only `RCU_CFG0`. This mirrors the per-family `rcu_adc_clock_config`.
 ///
 /// Returns [`DescriptorError::UnknownSelector`] for a non-ADC label.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn enable_adc(
     rcu_base: u32,
     path: ClockPath,
@@ -359,6 +360,7 @@ pub fn enable_adc(
 /// **TIMER7** exists only on F10x (**APB2EN bit 13**, `gd32f10x_rcu.h:266`); the F1x0 has no TIMER7,
 /// so requesting it on the F1x0 path is a [`DescriptorError::SelectorAddrMismatch`]. Returns
 /// [`DescriptorError::UnknownSelector`] for a non-timer label.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn enable_timer(
     rcu_base: u32,
     path: ClockPath,
@@ -805,6 +807,7 @@ fn pll_mul_bits(mul: u8) -> u32 {
 /// shares this exact register sequence but gives up after a bounded spin budget and returns a
 /// [`ClockError`]; the bounded variant is host-tested only (it must NOT get an emulated golden, or
 /// it would diverge from the SPL's unbounded poll).
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn configure_tree(chip: &Chip, clock: &ClockConfig) -> Result<(), ClockError> {
     // Validate the application's free-form ClockConfig against the chip-bound ranges (DR-1
     // mitigation), THEN run the SPL-faithful unbounded register sequence. The unbounded path shares

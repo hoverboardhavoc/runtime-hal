@@ -232,6 +232,7 @@ impl DmaTx {
     /// channel that feeds a different peripheral's `TDATA`. A buffer that is empty or longer than
     /// `CHxCNT`'s 16-bit range is [`DescriptorError::Unsupported`] too, and a failed self-check is
     /// [`DescriptorError::SelfCheckFailed`].
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new(
         chip: &Chip,
         tx: UsartTx,

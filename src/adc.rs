@@ -237,6 +237,7 @@ impl Adc {
     }
 
     /// The CTL0/CTL1/RSQ/SAMPT field programming (everything before calibration), in SPL order.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn configure(&self, channel: u8, sample_time: u8) {
         // adc_special_function_config(SCAN_MODE, DISABLE): clear CTL0 SM (single, not scan).
         self.ctl0().modify(CTL0_SM, 0);
@@ -513,6 +514,7 @@ impl Adc {
     /// `adc_regular_channel_config` sample-time half: set channel `channel`'s 3-bit sample-time
     /// field in the right SAMPT register (channels 0..9 -> SAMPT1, 10..17 -> SAMPT0),
     /// clear-then-set the field, exactly as the SPL does.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn set_sample_time(&self, channel: u8, sample_time: u8) {
         let (off, shift) = if channel < 10 {
             (SAMPT1, 3 * channel as u32)
@@ -795,6 +797,7 @@ impl TriggeredAdc for InjectedAdcController {
     /// the registered control handler); enabling EOICIE here is what makes that ISR fire at the PWM
     /// rate. The firmware registers its control handler via
     /// [`crate::irq::register_control_handler`] at boot.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn configure(
         &self,
         chip: &Chip,
@@ -850,6 +853,7 @@ impl InjectedHandle {
     /// `TriggeredAdc::configure` body + host tests); the application gets it from configure, not by
     /// supplying a base. Resolves the injected-data accessors once.
     #[inline]
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub(crate) fn new(adc_base: u32, len: u8) -> Self {
         Self {
             idata: [

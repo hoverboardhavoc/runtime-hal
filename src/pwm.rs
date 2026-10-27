@@ -164,6 +164,7 @@ impl PwmOut {
     /// 3. CH1 output PWM mode 0 + compare shadow enable (CHCTL0), zero initial duty (CH1CV).
     /// 4. CH1 enable, active-high polarity (CHCTL2). NO complementary, NO break, NO MOE.
     /// 5. CEN: start the counter. With CH1 enabled the pin is driven immediately (no arming step).
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new(
         chip: &Chip,
         instance: PeriphLabel,
@@ -220,6 +221,7 @@ impl PwmOut {
 
     /// Program the time base + CH1 PWM, zero the duty, and START the counter. Separated from
     /// [`PwmOut::new`] so the host tests can drive the register sequence directly.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn configure(&self, period: u16) {
         // 1. Time base: PSC = 0 (the caller picks the frequency via CAR against the timer clock),
         //    CAR = period, edge-aligned up-count (clear DIR + CAM), ARSE on.

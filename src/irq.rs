@@ -918,6 +918,7 @@ pub const fn module_rx_irqs(layout: IrqLayout) -> (usize, usize) {
 /// this HAL's receivers can unmask, on both families, so it does not depend on which wiring a given
 /// board turns out to have; writing a priority enables nothing, so covering a vector that stays masked
 /// costs a register write and nothing else.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn apply_motor_era_priorities(layout: IrqLayout) {
     let (period, usart1, dma) = motor_era_irqs(layout);
     set_irq_priority(period, MOTOR_ISR_PRIORITY);
@@ -1016,6 +1017,7 @@ const _: () = assert!(
 /// owns reset, and the RAM table is only ever entered AFTER reset + RAM init (DECISIONS.md #6), so
 /// those two slots are never used from the RAM table. The system exceptions (NMI..SysTick) and the
 /// IRQs are filled.
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub fn build_table(layout: IrqLayout) -> [usize; MAX_VECTORS] {
     let mut t = [handler_addr(default_isr); MAX_VECTORS];
 
@@ -1379,6 +1381,7 @@ pub mod grouped_inner {
 /// The caller must guarantee (a) RAM init is complete, (b) no peripheral IRQ is enabled yet, and
 /// (c) `table` lives for the rest of the program (a `'static`), since the hardware will read it on
 /// every exception. The table must be aligned per [`RamVectorTable`].
+#[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub unsafe fn install(table: &'static mut RamVectorTable, layout: IrqLayout) {
     table.slots = build_table(layout);
     set_vtor(table.slots.as_ptr() as u32);

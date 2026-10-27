@@ -536,16 +536,24 @@ mod target {
         unlock_ram();
         write_volatile(CTL_PTR, CTL_PG);
         let mut worst = 0u32;
-        let mut i = 0usize;
-        let n = bytes.len();
-        while i < n {
-            let a = addr + i as u32;
-            let hw = (bytes[i] as u16) | ((bytes[i + 1] as u16) << 8);
+        // The caller guarantees an even length (checked, with the alignment, before this runs);
+        // `chunks_exact` states it to the compiler too, so the pair reads carry no bounds check.
+        // The indexed form (`bytes[i]`, `bytes[i + 1]`) made `panic_bounds_check` reachable from
+        // this RAM-resident body, which cost a 10 B range thunk IN RAM (`.data`) plus its flash
+        // init image and the check itself; a panic from here would also have halted with `PG`
+        // set and interrupts off. An odd tail byte, which the contract excludes, is left
+        // unprogrammed rather than faulted on.
+        debug_assert!(
+            bytes.len().is_multiple_of(2),
+            "program_ram: halfword-aligned length"
+        );
+        for (k, pair) in bytes.chunks_exact(2).enumerate() {
+            let a = addr + (2 * k) as u32;
+            let hw = u16::from_le_bytes([pair[0], pair[1]]);
             // Halfword store to flash triggers the program (the span is erased + halfword-aligned, so
             // no read-modify-write straddle).
             write_volatile(a as *mut u16, hw);
             worst |= wait_ram();
-            i += 2;
         }
         write_volatile(CTL_PTR, 0);
         worst

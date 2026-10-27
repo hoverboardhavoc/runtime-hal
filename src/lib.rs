@@ -1,4 +1,9 @@
 #![cfg_attr(not(feature = "mock"), no_std)]
+// `#[optimize(size)]` on the boot-time functions, on a nightly compiler only (`build.rs` sets the
+// cfg from the channel). The shipping consumer compiles this crate at `opt-level = 3` for the I2C
+// burst and the ISRs; the attribute keeps the once-per-boot bring-up on the size pipeline inside
+// that crate. On stable the attribute is absent and nothing changes.
+#![cfg_attr(runtime_hal_nightly, feature(optimize_attribute))]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]

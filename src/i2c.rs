@@ -480,6 +480,7 @@ impl I2c {
     ///
     /// The returned [`I2c`] implements [`embedded_hal::i2c::I2c`], so an IMU driver generic over that
     /// trait drives it directly.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new<S, D>(
         chip: &Chip,
         clock: &ClockConfig,
@@ -551,6 +552,7 @@ impl I2c {
     /// and level-read go through the gpio module. A clean bus issues zero pulses. The pins are left as
     /// open-drain outputs; the caller's [`configure_af`] immediately re-claims them as AF open-drain.
     #[cfg(target_arch = "arm")]
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn bus_clear_before_claim<S, D>(scl: &Pin<S>, sda: &Pin<D>, clock: &ClockConfig) {
         let (scl_base, path, scl_pin) = (scl.port_base(), scl.path(), scl.pin());
         let (sda_base, sda_pin) = (sda.port_base(), sda.pin());
@@ -840,6 +842,7 @@ impl I2c {
     ///
     /// An empty `bytes` still does the START + address handshake (an `embedded-hal` zero-length
     /// write is a bus presence check); the trailing BTC wait is skipped when no byte was sent.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn write_bytes(
         &self,
         addr7: u8,

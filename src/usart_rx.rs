@@ -534,6 +534,7 @@ impl BufferedRx {
     /// The application must have flipped `VTOR` to the RAM table (the [`crate::irq::install`] contract)
     /// BEFORE calling this, since `new` is the thing that enables the IRQ the table must already
     /// route. `N` is the ring capacity word (the ring holds `N - 1` bytes, [`RxRing`]).
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new<const N: usize>(
         chip: &Chip,
         rx: UsartRx,
@@ -697,6 +698,7 @@ impl RingBufferedRx {
     ///
     /// `dma_buf` length must fit `CHxCNT` (<= 65535) and be non-empty; an out-of-range length is a
     /// [`DescriptorError::Unsupported`]. A failed self-check is [`DescriptorError::SelfCheckFailed`].
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new(
         chip: &Chip,
         rx: UsartRx,
