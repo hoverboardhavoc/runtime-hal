@@ -1021,13 +1021,18 @@ pub trait PortPins {
 /// [`PortPins::from_port`] constructor that fills it. One invocation per port (this keeps the
 /// 16-fields-per-port boilerplate from being hand-written 5 times). Parameters: the struct name, the
 /// port letter (a string literal, for the doc comment), the port-number nibble (the high nibble of
-/// the logical pin byte: A=0, B=1, C=2, D=3, F=5), then the 16 `pin => field` pairs. Stable Rust has
+/// the logical pin byte: A=0, B=1, C=2, D=3, F=5), then the `pin => field` pairs. Stable Rust has
 /// no identifier concatenation, so the field names (`pa0`, `pa1`, ...) are spelled out at the call
 /// site rather than synthesized from the letter.
+///
+/// Port A's bag has no `pa13` / `pa14`: those are the SWD pins (SWDIO / SWCLK), refused for every
+/// function (`crate::pincap::check_not_swd`). A bag pin can be reconfigured with no runtime check
+/// ([`Pin::into_push_pull_output`]), so leaving them out of the bag is the refusal on this path, the
+/// way [`crate::Chip::pin`] refuses them by packed byte.
 macro_rules! gpio_pin_struct {
     ($struct_name:ident, $letter:literal, $port_nibble:literal,
         [$($pin:literal => $field:ident),+ $(,)?]) => {
-        #[doc = concat!("The 16 named pins of GPIO port ", $letter, ", each in its reset")]
+        #[doc = concat!("The named pins of GPIO port ", $letter, ", each in its reset")]
         /// [`Input<Floating>`] state. Produced by [`GpioPort::split`] for that port. Reconfigure a
         /// pin with [`Pin::into_push_pull_output`].
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1051,7 +1056,7 @@ macro_rules! gpio_pin_struct {
 
 gpio_pin_struct! { PortAPins, "A", 0,
 [0 => pa0, 1 => pa1, 2 => pa2, 3 => pa3, 4 => pa4, 5 => pa5, 6 => pa6, 7 => pa7,
- 8 => pa8, 9 => pa9, 10 => pa10, 11 => pa11, 12 => pa12, 13 => pa13, 14 => pa14, 15 => pa15] }
+ 8 => pa8, 9 => pa9, 10 => pa10, 11 => pa11, 12 => pa12, 15 => pa15] }
 gpio_pin_struct! { PortBPins, "B", 1,
 [0 => pb0, 1 => pb1, 2 => pb2, 3 => pb3, 4 => pb4, 5 => pb5, 6 => pb6, 7 => pb7,
  8 => pb8, 9 => pb9, 10 => pb10, 11 => pb11, 12 => pb12, 13 => pb13, 14 => pb14, 15 => pb15] }

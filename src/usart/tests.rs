@@ -640,3 +640,77 @@ fn new_refuses_gate_capable_pins_the_layer_7_backstop() {
         Some(crate::error::DescriptorError::PinOwnership)
     );
 }
+
+/// `specs/usart-pin-remap.md` section 4, "A USART is brought up once": a second `Usart::new` on an
+/// instance already brought up returns `InUse` and writes no register, so the first keeps running.
+/// A call refused earlier (here, a pin pair naming a different instance) does not use the
+/// instance up.
+#[test]
+fn new_refuses_an_instance_already_brought_up_and_writes_nothing() {
+    for desc in [
+        crate::detect::descriptor_f103(),
+        crate::detect::descriptor_f130(),
+    ] {
+        let _g = seed_reset();
+        let chip = Chip::from_descriptor(desc);
+        let clock = ClockConfig::REFERENCE_72M_IRC8M;
+        let pin = |p: u8| chip.pin(p).unwrap();
+
+        // A refused call before the first bring-up: the pins drive USART1, not USART0.
+        assert_eq!(
+            Usart::new(
+                &chip,
+                &clock,
+                PeriphLabel::Usart0,
+                (pin(0x02), pin(0x03)),
+                115_200
+            )
+            .err(),
+            Some(crate::error::DescriptorError::SelectorAddrMismatch)
+        );
+        let _first = Usart::new(
+            &chip,
+            &clock,
+            PeriphLabel::Usart1,
+            (pin(0x02), pin(0x03)),
+            115_200,
+        )
+        .expect("the first bring-up of USART1");
+
+        // Every word the second call could touch: the USART1 block, the RCU, both GPIO ports.
+        let words: Vec<(u32, u32)> = [
+            (chip.base(PeriphLabel::Usart1).unwrap(), 0x30),
+            (chip.rcu_base().unwrap(), 0x30),
+            (chip.base(PeriphLabel::Gpioa).unwrap(), 0x2C),
+            (chip.base(PeriphLabel::Gpiob).unwrap(), 0x2C),
+            (0x4001_0000, 0x08), // the F10x AFIO block (reads 0 on the F1x0 mock too)
+        ]
+        .iter()
+        .flat_map(|&(base, len)| (0..len).step_by(4).map(move |off| (base, off)))
+        .collect();
+        let before: Vec<u32> = words
+            .iter()
+            .map(|&(b, o)| Reg32::new(b, o).read())
+            .collect();
+
+        assert_eq!(
+            Usart::new(
+                &chip,
+                &clock,
+                PeriphLabel::Usart1,
+                (pin(0x02), pin(0x03)),
+                9600
+            )
+            .err(),
+            Some(crate::error::DescriptorError::InUse)
+        );
+        let after: Vec<u32> = words
+            .iter()
+            .map(|&(b, o)| Reg32::new(b, o).read())
+            .collect();
+        assert_eq!(
+            before, after,
+            "the refused second bring-up wrote a register"
+        );
+    }
+}

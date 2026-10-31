@@ -379,8 +379,8 @@ pub mod backend {
         }
 
         /// Zero the whole simulated register space (call at the start of a test case). Also clears
-        /// any frozen (non-responsive) word, any armed read ramp, and every registered device
-        /// rule.
+        /// any frozen (non-responsive) word, any armed read ramp, every registered device rule, and
+        /// the [`crate::usart::Usart::new`] bring-up claims (a fresh space is a fresh boot).
         pub fn reset() {
             FROZEN.store(u64::MAX, Ordering::Relaxed);
             RAMP.store(u64::MAX, Ordering::Relaxed);
@@ -394,6 +394,8 @@ pub mod backend {
             W1C_PAIRS.lock().unwrap_or_else(|e| e.into_inner()).clear();
             let mut s = SPACE.lock().unwrap_or_else(|e| e.into_inner());
             s.clear();
+            // A fresh register space is a fresh boot: no USART has been brought up yet.
+            crate::usart::reset_claims_for_test();
         }
 
         /// Peek a single byte (for assertions about width/endianness).

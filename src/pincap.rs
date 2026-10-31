@@ -320,6 +320,24 @@ pub fn usart_pins(chip: &Chip, tx: u8, rx: u8) -> Option<UsartMapping> {
 
 // --- the per-configuration ownership backstop (Layer 7) ---------------------------------------
 
+/// The serial-wire debug pins, PA13 (SWDIO) and PA14 (SWCLK): the same pins on both families
+/// (GD32F103xx Datasheet Rev2.14 Table 2-7, GD32F130xx Datasheet Rev3.7 Table 2-9, both at their
+/// reset function). SWD is the configuration path of every board, so no function may take them.
+const SWD_PINS: [u8; 2] = [0x0D, 0x0E];
+
+/// Refuse the SWD pins ([`SWD_PINS`]) with [`DescriptorError::SwdPin`]. The one owner of that fact:
+/// [`check_pin_ownership`] asks it for every claim, and [`Chip::pin`]'s port resolution asks it for
+/// every typed pin handed out by packed byte, so every entry point that drives or routes a pin
+/// reaches it through one of the two.
+#[inline]
+pub(crate) fn check_not_swd(pin: u8) -> Result<(), DescriptorError> {
+    if pin == SWD_PINS[0] || pin == SWD_PINS[1] {
+        Err(DescriptorError::SwdPin)
+    } else {
+        Ok(())
+    }
+}
+
 /// What a configure call claims a pin FOR, the question [`check_pin_ownership`] answers.
 ///
 /// Two claims, because the property being defended is one bit: a gate-capable pin drives a
@@ -351,7 +369,12 @@ pub enum PinClaim {
 /// Density-dependence is the point, not an artifact: on a part with a second advanced timer
 /// PB0/PB1 are TIMER7 complementary outputs, so the same pins that are legitimate ADC sense
 /// inputs on a medium-density part are refused for analog use on a high-density one.
+///
+/// **The SWD pins come first.** PA13 (SWDIO) and PA14 (SWCLK) are refused with
+/// [`DescriptorError::SwdPin`] for EVERY claim, gate or not ([`check_not_swd`]): SWD is how every
+/// board is configured, and a layout that took either pin would leave the board unreachable.
 pub fn check_pin_ownership(chip: &Chip, pin: u8, claim: PinClaim) -> Result<(), DescriptorError> {
+    check_not_swd(pin)?;
     if gate_capable(chip, pin) == matches!(claim, PinClaim::Gate) {
         Ok(())
     } else {
@@ -473,6 +496,33 @@ mod tests {
                     check_pin_ownership(&chip, other, PinClaim::Gate),
                     Err(DescriptorError::PinOwnership),
                     "non-gate pin {other:#04x} claimed as a gate"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_swd_pins_are_refused_for_every_claim_on_every_part() {
+        // `specs/usart-pin-remap.md` section 3: PA13/PA14 refused with SwdPin for both claims on
+        // both families. The neighbours keep their answers (PA12 and PA15 are plain pins).
+        for chip in [f103c8(), f130c8(), f103rc()] {
+            for swd in [0x0Du8, 0x0E] {
+                for claim in [PinClaim::Gate, PinClaim::NonGate] {
+                    assert_eq!(
+                        check_pin_ownership(&chip, swd, claim),
+                        Err(DescriptorError::SwdPin),
+                        "{swd:#04x} {claim:?}"
+                    );
+                }
+            }
+            for neighbour in [0x0Cu8, 0x0F] {
+                assert_eq!(
+                    check_pin_ownership(&chip, neighbour, PinClaim::NonGate),
+                    Ok(())
+                );
+                assert_eq!(
+                    check_pin_ownership(&chip, neighbour, PinClaim::Gate),
+                    Err(DescriptorError::PinOwnership)
                 );
             }
         }
