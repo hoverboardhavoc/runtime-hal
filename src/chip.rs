@@ -203,6 +203,10 @@ impl Chip {
     /// [`GpioPort::split`]'s: this resolves and clocks a pin, it does not configure one. Whether the
     /// pin may be claimed for the caller's function is still the ownership backstop's answer, asked
     /// by whichever configure seam consumes the handle.
+    ///
+    /// PA13 (SWDIO) and PA14 (SWCLK) are refused with [`DescriptorError::SwdPin`] before the port is
+    /// clocked (`pincap::check_not_swd`): a pin handle can be reconfigured with no further
+    /// check ([`Pin::into_push_pull_output`]), so the refusal belongs where the handle is made.
     #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn pin(&self, packed: u8) -> Result<Pin<Input<Floating>>, DescriptorError> {
         let base = self.clocked_port_base(packed)?;
@@ -220,6 +224,7 @@ impl Chip {
     #[inline(never)]
     #[cfg_attr(runtime_hal_nightly, optimize(size))]
     fn clocked_port_base(&self, packed: u8) -> Result<u32, DescriptorError> {
+        crate::pincap::check_not_swd(packed)?;
         let port = gpio_port_label(packed)?;
         let base = self.base(port)?;
         crate::clock::enable_gpio_port(self.rcu_base()?, self.desc.clock, port)?;
@@ -913,6 +918,106 @@ mod tests {
             chip.route_spi_pin(PA5, gpio::PinRole::Tx(gpio::UsartAf::Af1)),
             Err(DescriptorError::UnsupportedRole)
         );
+    }
+
+    /// `specs/usart-pin-remap.md` section 3: PA13 (SWDIO) and PA14 (SWCLK) are refused with
+    /// `SwdPin` at every entry point that turns a pin into something driven or routed, on both
+    /// families, and nothing is clocked or configured on the way. The list is every public seam
+    /// that takes a pin: `Chip::pin` and `input_group` (through `clocked_port_base`), and
+    /// `output_pin`, `analog_pin`, the four `route_*` seams, `I2c::new` and `Usart::new` (through
+    /// `check_pin_ownership`). The port-A pin bag carries no `pa13`/`pa14` field at all, which the
+    /// compiler enforces.
+    #[test]
+    fn the_swd_pins_are_refused_at_every_entry_point() {
+        use crate::clock::ClockConfig;
+        use crate::gpio::{Pin, PinRole, UsartAf};
+        use crate::i2c::{I2c, I2cMode};
+        use crate::usart::Usart;
+
+        const PA13: u8 = 0x0D;
+        const PA14: u8 = 0x0E;
+        const SWD: Result<(), DescriptorError> = Err(DescriptorError::SwdPin);
+        let clock = ClockConfig::REFERENCE_72M_IRC8M;
+
+        for desc in [descriptor_f103(), descriptor_f130()] {
+            let _g = mock::lock();
+            mock::reset();
+            let chip = Chip::from_descriptor(desc);
+            let gpioa = chip.base(PeriphLabel::Gpioa).unwrap();
+            let path = chip.gpio();
+            for swd in [PA13, PA14] {
+                let n = swd & 0x0F;
+                assert_eq!(chip.pin(swd).map(|_| ()), SWD, "Chip::pin {swd:#04x}");
+                assert_eq!(
+                    chip.input_group([swd, 0x01, 0x2D]).map(|_| ()),
+                    SWD,
+                    "input_group {swd:#04x}"
+                );
+                assert_eq!(
+                    chip.output_pin(PeriphLabel::Gpioa, n).map(|_| ()),
+                    SWD,
+                    "output_pin {swd:#04x}"
+                );
+                assert_eq!(chip.analog_pin(PeriphLabel::Gpioa, n), SWD);
+                assert_eq!(chip.route_general_pwm_pin(swd), SWD);
+                assert_eq!(chip.route_advanced_pwm_pin(swd), SWD);
+                assert_eq!(chip.route_spi_pin(swd, PinRole::SpiAfPushPull), SWD);
+                assert_eq!(chip.route_usart_pin(swd, PinRole::Tx(UsartAf::Af1)), SWD);
+                // The two pin-handle constructors, handed a handle built in-crate (no public path
+                // makes one for these pins), as the SWD pin in either position.
+                let h = || Pin::<crate::gpio::Input<crate::gpio::Floating>>::new(gpioa, path, swd);
+                let other =
+                    || Pin::<crate::gpio::Input<crate::gpio::Floating>>::new(gpioa, path, 0x03);
+                assert_eq!(
+                    I2c::new(
+                        &chip,
+                        &clock,
+                        PeriphLabel::I2c0,
+                        (h(), other()),
+                        I2cMode::standard(100_000)
+                    )
+                    .map(|_| ()),
+                    SWD
+                );
+                assert_eq!(
+                    I2c::new(
+                        &chip,
+                        &clock,
+                        PeriphLabel::I2c0,
+                        (other(), h()),
+                        I2cMode::standard(100_000)
+                    )
+                    .map(|_| ()),
+                    SWD
+                );
+                assert_eq!(
+                    Usart::new(&chip, &clock, PeriphLabel::Usart1, (h(), other()), 115_200)
+                        .map(|_| ()),
+                    SWD
+                );
+                assert_eq!(
+                    Usart::new(&chip, &clock, PeriphLabel::Usart1, (other(), h()), 115_200)
+                        .map(|_| ()),
+                    SWD
+                );
+            }
+            // Nothing was clocked or configured: no RCU enable bit and no GPIOA config word moved.
+            for rcu_off in [0x14u32, 0x18, 0x1C] {
+                assert_eq!(Reg32::new(RCU_BASE, rcu_off).read(), 0, "RCU +{rcu_off:#x}");
+            }
+            for gpio_off in [0x00u32, 0x04, 0x08, 0x0C, 0x20, 0x24] {
+                assert_eq!(
+                    Reg32::new(gpioa, gpio_off).read(),
+                    0,
+                    "GPIOA +{gpio_off:#x}"
+                );
+            }
+            // An SWD pin later in an input group is refused too (the lines before it are clocked
+            // on the way, as for any other refused line).
+            for swd in [PA13, PA14] {
+                assert_eq!(chip.input_group([0x01, 0x2D, swd]).map(|_| ()), SWD);
+            }
+        }
     }
 
     #[test]

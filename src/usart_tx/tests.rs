@@ -23,7 +23,8 @@ use crate::dma::{DmaTxMap, DMA0_BASE};
 use crate::error::DescriptorError;
 use crate::irq::{
     install_mock, mock_advance_cycles, mock_reset_cycles, mock_vtor, F10X_DMA0_CH1_IRQ,
-    F10X_DMA0_CH6_IRQ, F1X0_DMA_CH1_2_IRQ, F1X0_DMA_CH3_4_IRQ,
+    F10X_DMA0_CH3_IRQ, F10X_DMA0_CH4_IRQ, F10X_DMA0_CH6_IRQ, F1X0_DMA_CH1_2_IRQ,
+    F1X0_DMA_CH3_4_IRQ,
 };
 use crate::reg::{mock, Reg32};
 use crate::usart::Usart;
@@ -584,56 +585,137 @@ fn self_check_failure_arms_nothing() {
     );
 }
 
-/// The module port's instance is per family, as on the receive side: `USART2` is the module on F10x
-/// and `USART0` on F1x0. The OTHER family's module label resolves to no transmit channel here (on
-/// F10x, `USART0`'s PB6/PB7 mapping needs an AFIO remap this HAL does not implement; on F1x0 there is
-/// no `USART2`), so a half from it is refused instead of being armed onto channel 1, whose request
-/// line belongs to a different USART.
+/// USART2 exists on the F10x only, so on the F1x0 a half from it resolves to no transmit channel
+/// and is refused instead of being armed onto channel 1, whose request line belongs to USART0 there.
 #[test]
 fn a_half_with_no_mapped_transmit_channel_is_refused() {
-    for (fam, other, other_base) in [
-        (f10x(), PeriphLabel::Usart0, USART0_BASE),
-        (f1x0(), PeriphLabel::Usart2, MODULE_BASE),
-    ] {
-        let _g = setup();
-        let chip = chip_for(&fam);
-        // The USART itself comes up (the instance exists in the descriptor); it is the transmit
-        // channel that has no mapping.
-        let usart =
-            Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg(other)).unwrap();
-        let buf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
+    let fam = f1x0();
+    let _g = setup();
+    let chip = chip_for(&fam);
+    // The USART itself comes up (the mock descriptor carries its base); it is the transmit channel
+    // that has no mapping.
+    let usart = Usart::bring_up(
+        &chip,
+        &ClockConfig::REFERENCE_72M_IRC8M,
+        &module_cfg(PeriphLabel::Usart2),
+    )
+    .unwrap();
+    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; 32]));
+    assert!(matches!(
+        DmaTx::new(&chip, usart.split().0, buf, CORE_HZ, MODULE_BAUD),
+        Err(DescriptorError::Unsupported)
+    ));
+    assert_eq!(
+        Reg32::new(MODULE_BASE, fam.ctl2).read() & CTL2_DENT,
+        0,
+        "the refused instance's DENT is untouched"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(MODULE_CH)).read() & CHEN,
+        0,
+        "channel 1 was not armed for a USART that does not own it"
+    );
+}
 
-        assert!(
-            matches!(
-                DmaTx::new(&chip, usart.split().0, buf, CORE_HZ, MODULE_BAUD),
-                Err(DescriptorError::Unsupported)
-            ),
-            "{other:?} has no transmit channel on {:?}",
-            fam.clock
-        );
-        assert_eq!(
-            Reg32::new(other_base, fam.ctl2).read() & CTL2_DENT,
-            0,
-            "the refused instance's DENT is untouched"
-        );
-        assert_eq!(
-            Reg32::new(DMA0_BASE, ch_ctl(MODULE_CH)).read() & CHEN,
-            0,
-            "channel 1 was not armed for a USART that does not own it"
-        );
+/// Bring up `usart` and arm a `DmaTx` of capacity `N` on its TX half. Does NOT install the RAM
+/// table. Returns the transmitter and the `TDATA` address.
+fn arm_usart<const N: usize>(fam: &Fam, usart: PeriphLabel) -> (DmaTx, u32) {
+    let chip = chip_for(fam);
+    let u = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg(usart)).unwrap();
+    let (tx_half, _rx_half) = u.split();
+    let tdata = tx_half.regs().tdata_addr();
+    let buf: &'static mut [u8] = Box::leak(Box::new([0u8; N]));
+    (
+        DmaTx::new(&chip, tx_half, buf, CORE_HZ, MODULE_BAUD).unwrap(),
+        tdata,
+    )
+}
+
+/// `specs/usart-pin-remap.md` section 4: USART0 transmits on the F10x on DMA0 Channel 3 (UM Rev2.6
+/// Figure 9-4), its own vector `DMA0_Channel3_IRQn` = 14, and only that vector completes it.
+#[test]
+fn f10x_usart0_transmits_on_channel_3_and_completes_on_vector_14() {
+    let fam = f10x();
+    let _g = setup();
+    let map = DmaTxMap::usart0_tx(&chip_for(&fam));
+    assert_eq!((map.channel, map.grouped), (3, false));
+    let (mut tx, tdata) = arm_usart::<8>(&fam, PeriphLabel::Usart0);
+    install_mock(fam.irq, RAM_ADDR);
+
+    assert_eq!(
+        Reg32::new(USART0_BASE, fam.ctl2).read() & CTL2_DENT,
+        CTL2_DENT,
+        "DENT set on USART0"
+    );
+    assert_eq!(tx.try_send(&[1, 2, 3]), Ok(3));
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_paddr(3)).read(),
+        tdata,
+        "CH3PADDR = USART0 TDATA"
+    );
+    assert_eq!(Reg32::new(DMA0_BASE, ch_cnt(3)).read(), 3);
+    assert_eq!(Reg32::new(DMA0_BASE, ch_ctl(3)).read() & CHEN, CHEN);
+
+    complete(3);
+    // USART0's receive vector (15) and USART2's transmit vector (12) do not complete it.
+    for other in [F10X_DMA0_CH4_IRQ, F10X_DMA0_CH1_IRQ] {
+        // SAFETY: the F10x table is installed; every slot holds a handler.
+        unsafe { mock_vtor::dispatch(other) };
+        assert!(tx.in_flight(), "vector {other} must not service Ch3");
     }
+    // SAFETY: as above; slot 14 holds USART0's transmit handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH3_IRQ) };
+    assert!(!tx.in_flight(), "vector 14 serviced Ch3");
+    assert_eq!(
+        Reg32::new(DMA0_BASE, 0x00).read() & ftf_flag(3),
+        0,
+        "Ch3 FTFIF cleared"
+    );
+}
+
+/// Every USART the F10x has transmits at once, each on its own context: a completion on one never
+/// clears another, and a busy one never refuses another's frame (the three-context `DMA_TX`).
+#[test]
+fn f10x_three_transmitters_are_independent() {
+    let fam = f10x();
+    let _g = setup();
+    let (mut t1, _) = arm_usart::<8>(&fam, PeriphLabel::Usart1);
+    let (mut t2, _) = arm_usart::<8>(&fam, PeriphLabel::Usart2);
+    let (mut t0, _) = arm_usart::<8>(&fam, PeriphLabel::Usart0);
+    install_mock(fam.irq, RAM_ADDR);
+
+    for t in [&mut t1, &mut t2, &mut t0] {
+        assert_eq!(t.try_send(&[0xAA]), Ok(1));
+    }
+    // Complete USART0's channel only.
+    complete(3);
+    // SAFETY: the F10x table is installed; slot 14 holds USART0's transmit handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH3_IRQ) };
+    assert!(!t0.in_flight(), "USART0 completed");
+    assert!(
+        t1.in_flight() && t2.in_flight(),
+        "the others still in flight"
+    );
+    assert_eq!(t0.try_send(&[0xBB]), Ok(1), "USART0 takes its next frame");
+    assert_eq!(t1.try_send(&[0xCC]), Err(TxBusy), "USART1 is still busy");
+    assert_eq!(t2.try_send(&[0xDD]), Err(TxBusy), "USART2 is still busy");
+    // And USART1's own vector (17) completes USART1 alone.
+    complete(6);
+    // SAFETY: as above; slot 17 holds USART1's transmit handler.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH6_IRQ) };
+    assert!(!t1.in_flight() && t2.in_flight() && t0.in_flight());
 }
 
 // --- The module port: its own channel, vector and in-flight state ------------------------------
 
 #[test]
 fn tx_map_resolves_the_module_port_channel_per_family() {
-    let f103 = DmaTxMap::module_tx();
+    let f103 = DmaTxMap::usart2_tx();
     assert_eq!(f103.channel, 1, "GD USART2_TX is DMA0 Ch1 on F10x");
     assert_eq!(f103.base, DMA0_BASE);
     assert!(!f103.grouped, "F10x DMA0_Channel1 has its own vector");
 
-    let f130 = DmaTxMap::usart0_tx();
+    let f130 = DmaTxMap::usart0_tx(&chip_for(&f1x0()));
     assert_eq!(f130.channel, 1, "USART0_TX is Ch1 on F1x0, unremapped");
     assert_eq!(f130.base, DMA0_BASE);
     assert!(f130.grouped, "F1x0 Ch1/2 share a grouped vector");

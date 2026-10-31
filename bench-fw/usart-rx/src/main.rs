@@ -1,6 +1,6 @@
 //! On-silicon validator for the multi-instance USART RX spec (`specs/uart-rx-multi-instance.md`)
-//! and the TX/RX split + reconfigure spec (`specs/usart-split.md`), in TWO images from this one
-//! crate:
+//! and the TX/RX split + reconfigure spec (`specs/usart-split.md`), plus the USART0 remap
+//! (`specs/usart-pin-remap.md`), in THREE images from this one crate:
 //!
 //! **Default image (single F103 bluepill, intra-board cross-wire):**
 //!   - `PA2`  (HAL `PeriphLabel::Usart1` TX, GD USART1 block @0x4000_4400) -> `PB11` (`Usart2` RX,
@@ -31,6 +31,11 @@
 //!     same sequence; the slave streams 4096 bytes and the master's `RingBufferedRx` (Ch5) drains
 //!     them. Expected: the same 4096 / 0 / 0 + IDLE.
 //!
+//! **Remap image (`--features remap`, single F103 bluepill, its own jumpers PB6->PB11, PB10->PB7,
+//! PA2->PA3):** USART0 on its remapped PB6/PB7 (`specs/usart-pin-remap.md` section 5): polled with
+//! the remap bit clear and then set, DMA on all three USARTs at once, and the AFIO/GPIO registers.
+//! See `src/remap.rs` for the checks and the result block.
+//!
 //! Result is a fixed RAM block at [`RESULT_ADDR`] (the reserved RAM tail, 8 KiB-safe so the pair
 //! image fits the F130), `magic` written LAST. PB9 pulses on a full pass (default image). Busy-spin
 //! forever, NEVER `wfi` (a bare `wfi` with `DBG_CTL0 = 0` locks SWD re-attach on the GD32).
@@ -52,20 +57,27 @@ use runtime_hal::{
     descriptor::ClockPath,
     detect_chip,
     irq::{install, RamVectorTable, MAX_VECTORS},
-    Chip, PeriphLabel, RingBufferedRx, Usart, UsartRx, UsartTx,
+    Chip, PeriphLabel, RingBufferedRx, Usart,
 };
+#[cfg(not(feature = "remap"))]
+use runtime_hal::{UsartRx, UsartTx};
+
+#[cfg(all(feature = "pair", feature = "remap"))]
+compile_error!("`pair` and `remap` are separate images; build one at a time");
 
 // --- shared tunables / result plumbing ---------------------------------------------------------
 
 const CLOCK: ClockConfig = ClockConfig::REFERENCE_72M_IRC8M;
+#[cfg(not(feature = "remap"))]
 const BAUD: u32 = 115_200;
 /// Deployment-representative baud (the BLE module's rate), used by the reprogram stages.
+#[cfg(not(feature = "remap"))]
 const BAUD_9600: u32 = 9_600;
 /// The DMA ring buffer size (per instance). 256 B is the pre-split S3/S5-validated default.
 const DMA_CAP: usize = 256;
 /// Empty-iteration budget for a bounded drain wait (bounds a stalled stage so a missed frame
 /// cannot hang the run). Single-image only (the pair receiver waits unbounded for a stage start).
-#[cfg(not(feature = "pair"))]
+#[cfg(not(any(feature = "pair", feature = "remap")))]
 const RX_ITERS: u32 = 2_000_000;
 
 const RESULT_ADDR: u32 = 0x2000_1F00;
@@ -78,17 +90,19 @@ static mut VECTORS: RamVectorTable = RamVectorTable {
 /// The application-owned `'static` DMA ring buffers. The module + USART1 buffers are distinct so
 /// two live DMA channels write disjoint memory (single-image coexistence); the pair image uses
 /// only the first.
+#[cfg(not(feature = "remap"))]
 static mut DMA_BUF_U1: [u8; DMA_CAP] = [0; DMA_CAP];
-#[cfg(not(feature = "pair"))]
+#[cfg(not(any(feature = "pair", feature = "remap")))]
 static mut DMA_BUF_MOD: [u8; DMA_CAP] = [0; DMA_CAP];
 
 /// A fresh `'static` view of a DMA buffer (one active receiver per phase on each buffer; the
 /// channel is disabled by `release`/the next `new` before re-use).
+#[cfg(not(feature = "remap"))]
 fn buf_u1() -> &'static mut [u8] {
     // SAFETY: 'static; a single USART1 RingBufferedRx is active at a time.
     unsafe { core::slice::from_raw_parts_mut(addr_of_mut!(DMA_BUF_U1) as *mut u8, DMA_CAP) }
 }
-#[cfg(not(feature = "pair"))]
+#[cfg(not(any(feature = "pair", feature = "remap")))]
 fn buf_mod() -> &'static mut [u8] {
     // SAFETY: as `buf_u1`, on the distinct module buffer.
     unsafe { core::slice::from_raw_parts_mut(addr_of_mut!(DMA_BUF_MOD) as *mut u8, DMA_CAP) }
@@ -114,7 +128,7 @@ fn halt() -> ! {
 
 /// Send a frame on the TX half (polled): `write_byte` blocks until TC, so each byte has fully
 /// shifted out (and the receiver's DMA/ISR serviced it) by the time this returns.
-#[cfg(not(feature = "pair"))]
+#[cfg(not(any(feature = "pair", feature = "remap")))]
 fn send(tx: &UsartTx, frame: &[u8]) {
     for &b in frame {
         tx.write_byte(b);
@@ -123,6 +137,7 @@ fn send(tx: &UsartTx, frame: &[u8]) {
 
 /// Stream `n` bytes back-to-back with value `(start + i) & 0xFF` (the contiguous pattern the DMA
 /// receiver checks for loss).
+#[cfg(not(feature = "remap"))]
 fn stream(tx: &UsartTx, n: usize, start: usize) {
     for i in 0..n {
         tx.write_byte(((start + i) & 0xFF) as u8);
@@ -132,6 +147,7 @@ fn stream(tx: &UsartTx, n: usize, start: usize) {
 /// Contiguity checker for a known stream (value = position & 0xFF): counts delivered bytes and
 /// FORWARD gaps (real loss), ignoring a backward jump (a spurious resync, no data lost).
 /// Self-calibrates from the first byte.
+#[cfg(not(feature = "remap"))]
 struct SeqCheck {
     expected: u8,
     started: bool,
@@ -140,6 +156,7 @@ struct SeqCheck {
     first: u8,
 }
 
+#[cfg(not(feature = "remap"))]
 impl SeqCheck {
     fn new() -> Self {
         SeqCheck {
@@ -168,7 +185,7 @@ impl SeqCheck {
 /// Drain a `RingBufferedRx` until `expect` bytes have arrived or its IDLE boundary / a bounded
 /// timeout. Returns `(recv, loss, overrun-count, IDLE-seen, first-byte)`. Single-image only (the
 /// pair receiver's stage drain waits unbounded for the stream start).
-#[cfg(not(feature = "pair"))]
+#[cfg(not(any(feature = "pair", feature = "remap")))]
 fn drain_dma(rx: &mut RingBufferedRx, expect: usize) -> (u16, u16, u8, bool, u8) {
     let mut seq = SeqCheck::new();
     let mut ovr = 0u8;
@@ -226,6 +243,7 @@ fn drain_dma(rx: &mut RingBufferedRx, expect: usize) -> (u16, u16, u8, bool, u8)
 /// The spec's reconfigure sequence (`specs/usart-split.md` D4): rejoin the halves, reprogram the
 /// baud on the whole peripheral, split again. The ONLY way to change baud; a live receiver must
 /// have been `release`d first to get the RX half back.
+#[cfg(not(feature = "remap"))]
 fn reprogram_split(tx: UsartTx, rx: UsartRx, baud: u32) -> (UsartTx, UsartRx) {
     let mut whole = Usart::rejoin(tx, rx);
     whole.set_baud(&CLOCK, baud);
@@ -234,7 +252,7 @@ fn reprogram_split(tx: UsartTx, rx: UsartRx, baud: u32) -> (UsartTx, UsartRx) {
 
 // ================================ default image: single-chip S0/S1/S2 ==========================
 
-#[cfg(not(feature = "pair"))]
+#[cfg(not(any(feature = "pair", feature = "remap")))]
 mod single {
     use super::*;
     use embedded_hal::digital::OutputPin;
@@ -693,6 +711,9 @@ mod single {
 
 // ================================ pair image: bidirectional F103 <-> F130 DMA gate =============
 
+#[cfg(feature = "remap")]
+mod remap;
+
 #[cfg(feature = "pair")]
 mod pair {
     use super::*;
@@ -950,8 +971,10 @@ mod pair {
 
 #[entry]
 fn main() -> ! {
-    #[cfg(not(feature = "pair"))]
+    #[cfg(not(any(feature = "pair", feature = "remap")))]
     single::run();
     #[cfg(feature = "pair")]
     pair::run();
+    #[cfg(feature = "remap")]
+    remap::run();
 }

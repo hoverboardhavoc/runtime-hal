@@ -110,15 +110,26 @@ fn reference_config() -> PwmConfig {
 }
 
 /// Check the motor-era interrupt-priority ordering back out of the NVIC/SCB (R7's read-back
-/// companion): the period (ADC injected-EOC) vector, the USART1 RX vector and the DMA-RX vector at
-/// their named priorities, and SysTick at the stock 0xF0. The per-family vector numbers come from the
-/// detected [`runtime_hal::descriptor::IrqLayout`], so the same check is meaningful on both families.
-/// The bench reads the same IPR bytes over SWD; this is the on-board half of that gate.
+/// companion): the period (ADC injected-EOC) vector, every USART instance's RX, DMA-RX and DMA-TX
+/// vectors at their named priorities, and SysTick at the stock 0xF0. The per-family vector numbers
+/// come from the detected [`runtime_hal::descriptor::IrqLayout`], so the same check is meaningful on
+/// both families. The bench reads the same IPR bytes over SWD; this is the on-board half of that
+/// gate.
 fn verify_priorities(layout: runtime_hal::descriptor::IrqLayout) -> bool {
-    let (period, usart1, dma) = irq::motor_era_irqs(layout);
-    irq::irq_priority(period) == irq::MOTOR_ISR_PRIORITY
-        && irq::irq_priority(usart1) == irq::USART1_RX_PRIORITY
-        && irq::irq_priority(dma) == irq::DMA_RX_PRIORITY
+    let usarts_ok = [
+        PeriphLabel::Usart0,
+        PeriphLabel::Usart1,
+        PeriphLabel::Usart2,
+    ]
+    .into_iter()
+    .filter_map(|l| irq::usart_irqs(layout, l))
+    .all(|v| {
+        irq::irq_priority(v.rx) == irq::USART_RX_PRIORITY
+            && irq::irq_priority(v.dma_rx) == irq::DMA_RX_PRIORITY
+            && irq::irq_priority(v.dma_tx) == irq::DMA_RX_PRIORITY
+    });
+    irq::irq_priority(irq::period_irq(layout)) == irq::MOTOR_ISR_PRIORITY
+        && usarts_ok
         && irq::systick_priority() == irq::SYSTICK_PRIORITY
 }
 

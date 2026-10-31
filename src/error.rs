@@ -42,6 +42,33 @@ pub enum DescriptorError {
     /// resolved base/clock is wrong (the DMA-ring write-back self-check, section 5.1 step 3). Bring-up
     /// fails loud rather than arming a channel that does not respond.
     SelfCheckFailed,
+    /// A configure call named PA13 (SWDIO) or PA14 (SWCLK). SWD is how every board is configured, so
+    /// those two pins are refused for every function, at every entry point that turns a pin into
+    /// something driven or routed ([`crate::pincap::check_pin_ownership`] and [`crate::Chip::pin`]).
+    SwdPin,
+    /// [`crate::usart::Usart::new`] was asked to bring up a USART instance it has already brought up.
+    /// Refused before any register is touched, so the first bring-up keeps running.
+    InUse,
+}
+
+impl DescriptorError {
+    /// A fixed one-byte number per variant, for a consumer that reports the refusal in a byte (the
+    /// hoverboard firmware's `board.status`). A new variant takes the next number; a number is never
+    /// reused. `MissingBase`'s label is not encoded.
+    pub const fn code(&self) -> u8 {
+        match self {
+            DescriptorError::SelectorAddrMismatch => 1,
+            DescriptorError::UnknownSelector => 2,
+            DescriptorError::MissingBase(_) => 3,
+            DescriptorError::UsartConfig => 4,
+            DescriptorError::UnsupportedRole => 5,
+            DescriptorError::PinOwnership => 6,
+            DescriptorError::Unsupported => 7,
+            DescriptorError::SelfCheckFailed => 8,
+            DescriptorError::SwdPin => 9,
+            DescriptorError::InUse => 10,
+        }
+    }
 }
 
 /// The runtime-detection boot entry's failure surface.
@@ -411,6 +438,34 @@ mod tests {
         // A polled timeout has no dedicated embedded-hal 1.0 i2c kind; it folds into Other.
         assert_eq!(I2cError::Timeout.kind(), I2cKind::Other);
         assert_eq!(I2cError::Other.kind(), I2cKind::Other);
+    }
+
+    #[test]
+    fn descriptor_error_codes_are_the_fixed_numbering() {
+        // `specs/usart-pin-remap.md` section 4: the firmware reports these bytes, so each variant's
+        // number is fixed and distinct.
+        let all = [
+            (DescriptorError::SelectorAddrMismatch, 1),
+            (DescriptorError::UnknownSelector, 2),
+            (DescriptorError::MissingBase(PeriphLabel::Usart0), 3),
+            (DescriptorError::UsartConfig, 4),
+            (DescriptorError::UnsupportedRole, 5),
+            (DescriptorError::PinOwnership, 6),
+            (DescriptorError::Unsupported, 7),
+            (DescriptorError::SelfCheckFailed, 8),
+            (DescriptorError::SwdPin, 9),
+            (DescriptorError::InUse, 10),
+        ];
+        for (e, want) in all {
+            assert_eq!(e.code(), want, "{e:?}");
+        }
+        for (i, (a, _)) in all.iter().enumerate() {
+            for (b, _) in &all[i + 1..] {
+                assert_ne!(a.code(), b.code(), "{a:?} and {b:?} share a code");
+            }
+        }
+        // The label MissingBase carries does not change its number.
+        assert_eq!(DescriptorError::MissingBase(PeriphLabel::Rcu).code(), 3);
     }
 
     #[test]

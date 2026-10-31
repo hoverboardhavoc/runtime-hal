@@ -112,7 +112,7 @@ pub(crate) fn apply_defaults(chip: &Chip, family: Family) -> Result<Usart, Descr
     let (tx_pin, rx_pin) = (CONSOLE_TX & 0x0F, CONSOLE_RX & 0x0F);
     // PA9/PA10 is USART0's DEFAULT mapping: AF1 on F1x0 (GD32F130xx Datasheet Rev3.7 Table 2-9).
     // Written directly rather than through `pincap::usart_pins`, which deliberately does not carry
-    // this pair (it is the TIMER0 gate set; see `USART_PIN_MAPPINGS`). That is exactly why this
+    // this pair (it is the TIMER0 gate set; see `USART_PINS`). That is exactly why this
     // whole function is compiled out of real builds behind `yes-console-on-pa9-pa10`.
     gpio::configure_af(gpioa, chip.gpio(), tx_pin, PinRole::Tx(gpio::UsartAf::Af1));
     gpio::configure_af(gpioa, chip.gpio(), rx_pin, PinRole::Rx(gpio::UsartAf::Af1));

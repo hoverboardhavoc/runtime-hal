@@ -3,7 +3,7 @@ name = "bench-fw-usart-rx"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "On-silicon S0+S1 validator for the multi-instance USART RX spec: a SINGLE F103 bluepill with an intra-board cross-wire (PA2->PB11, PB10->PA3). S0 drives the polled Usart path on both USART1 (PA2/PA3) and the module USART (Usart2 = GD USART2, PB10/PB11). S1 drives interrupt-buffered BufferedRx on both instances: the module receives via its own slot+vector (IRQ 39), USART1 regresses, and both run simultaneously without cross-talk. Pulses PB9 on a full pass and publishes a fixed RAM result block readable over SWD."
+description = "On-silicon validators (default S0-S2 image, --features pair, --features remap for the USART0 PB6/PB7 remap on a bluepill). Default image: S0+S1 validator for the multi-instance USART RX spec: a SINGLE F103 bluepill with an intra-board cross-wire (PA2->PB11, PB10->PA3). S0 drives the polled Usart path on both USART1 (PA2/PA3) and the module USART (Usart2 = GD USART2, PB10/PB11). S1 drives interrupt-buffered BufferedRx on both instances: the module receives via its own slot+vector (IRQ 39), USART1 regresses, and both run simultaneously without cross-talk. Pulses PB9 on a full pass and publishes a fixed RAM result block readable over SWD."
 
 [dependencies]
 # runtime-hal in its normal (real volatile MMIO, no_std) build: NOT the `mock` feature.
@@ -20,6 +20,10 @@ panic-halt = "0.2"
 # grouped-demux DMA gate with the split handles over the inter-board USART1 cross-wire. The default
 # (no-feature) image is the single-F103 intra-board S0/S1/S2 suite.
 pair = []
+# The single-F103 bluepill remap image (runtime-hal specs/usart-pin-remap.md section 5, Bench):
+# USART0 on its remapped PB6/PB7, witnessed by USART2, polled and then DMA on all three USARTs at
+# once. Its own jumpers (PB6->PB11, PB10->PB7, PA2->PA3), so its own image; see src/remap.rs.
+remap = []
 
 [[bin]]
 name = "bench-fw-usart-rx"

@@ -59,6 +59,36 @@ use crate::error::{DescriptorError, UsartError};
 use crate::gpio::{configure_af, Pin, PinRole};
 use crate::reg::Reg32;
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
+// --- the bring-up claim (one `Usart::new` per instance) ---------------------------------------
+
+/// One bit per USART instance [`Usart::new`] has brought up, at the label's index
+/// (`PeriphLabel::Usart0` = bit 0, `Usart1` = bit 1, `Usart2` = bit 2). Set by the claim in `new`,
+/// never cleared on silicon: a USART is brought up once per boot (`specs/usart-pin-remap.md`
+/// section 4), so two links that name one instance by mistake get [`DescriptorError::InUse`] for the
+/// second and the first keeps running.
+static BROUGHT_UP: AtomicU8 = AtomicU8::new(0);
+
+/// Claim `instance` for a bring-up: `Ok` exactly once per instance, [`DescriptorError::InUse`]
+/// after that. Touches no register.
+#[inline]
+fn claim_instance(instance: crate::addr::PeriphLabel) -> Result<(), DescriptorError> {
+    let bit = 1u8 << (instance as u8);
+    if BROUGHT_UP.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+        Err(DescriptorError::InUse)
+    } else {
+        Ok(())
+    }
+}
+
+/// Forget every bring-up claim (host-test teardown: every case starts from a fresh boot). Called by
+/// [`crate::reg::mock::reset`], which every case that brings a USART up already runs.
+#[cfg(feature = "mock")]
+pub(crate) fn reset_claims_for_test() {
+    BROUGHT_UP.store(0, Ordering::Release);
+}
+
 // --- bus + clock derivation -------------------------------------------------------------------
 
 /// Which APB bus a USART instance sits on, fixing which APB clock feeds its baud generator.
@@ -464,18 +494,24 @@ impl Usart {
     ///
     /// Steps, in order (mirroring `I2c::new`):
     /// 1. Ask the ownership backstop about both pins, then resolve the (TX, RX) pair through
-    ///    [`crate::pincap::usart_pins`]: it names the instance the pair actually drives and the AF
-    ///    the mapping routes through, and must agree with `instance`. Then resolve `instance` to its
+    ///    [`crate::pincap::usart_pins`]: it names the instance the pair actually drives, each pin's
+    ///    AF and the F10x remap the mapping routes through, and must agree with `instance`. Then resolve `instance` to its
     ///    base and pick the register model from the chip's clock path; the instance fixes the APB
     ///    bus (so the BAUD input clock is correct).
     /// 2. Enable the USART peripheral clock. The TX/RX **GPIO port** clock was already enabled when
     ///    the chip handed back the [`crate::gpio::GpioPort`] the pins were split from, so it is not
-    ///    re-enabled here.
+    ///    re-enabled here. Then, when the mapping needs one (USART0 on PB6/PB7 on the F10x), set the
+    ///    `AFIO_PCF0` remap through [`crate::afio`]; no other mapping writes `PCF0`.
     /// 3. Configure TX as AF push-pull ([`PinRole::Tx`]) and RX as AF input ([`PinRole::Rx`]) via
     ///    `configure_af`, taking each consumed pin's resolved port base / register-model path /
     ///    logical pin byte (the application never built them) and the AF-mux number the pin mapping
     ///    resolved to (step 1b), NOT one baked into the role.
     /// 4. Program BRR from `clock` + `baud`, the 8N1 /16 frame, and enable TX + RX + the peripheral.
+    ///
+    /// **An instance is brought up once.** A second `new` on an instance an earlier `new` brought up
+    /// returns [`DescriptorError::InUse`] before any register is touched, so the running one is left
+    /// alone. The claim is taken after every refusal that touches nothing (pin ownership, the pin
+    /// mapping, the base), so a refused call does not use up the instance.
     #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn new<TX, RX>(
         chip: &Chip,
@@ -508,14 +544,36 @@ impl Usart {
         let path = chip.clock();
         let bus = UsartBus::of(instance).ok_or(DescriptorError::UnknownSelector)?;
         let model = UsartModel::for_path(path);
+        let rcu = chip.rcu_base()?;
+
+        // 1c. The bring-up claim, the last check and the first thing before any register write.
+        claim_instance(instance)?;
 
         // 2. Enable the USART peripheral clock (the GPIO-port clock was enabled by `chip.gpioa()`).
-        crate::clock::enable_usart(chip.rcu_base()?, path, instance)?;
+        //    `instance` is a USART label (the pin model named it), so this cannot refuse.
+        crate::clock::enable_usart(rcu, path, instance)?;
+
+        // 2b. The F10x remap the mapping needs, before the pins are routed. Only USART0 on PB6/PB7
+        //     needs one; every other mapping (and every F1x0 one) leaves AFIO_PCF0 at reset.
+        match mapping.remap {
+            crate::pincap::UsartRemap::Default => {}
+            crate::pincap::UsartRemap::Usart0 => crate::afio::set_usart0_remap(rcu),
+        }
 
         // 3. TX as AF push-pull, RX as AF input. Take the resolved port base + register-model path +
         //    logical pin byte straight from each consumed Pin; the application never built them.
-        configure_af(tx.port_base(), tx.path(), tx.pin(), PinRole::Tx(mapping.af));
-        configure_af(rx.port_base(), rx.path(), rx.pin(), PinRole::Rx(mapping.af));
+        configure_af(
+            tx.port_base(),
+            tx.path(),
+            tx.pin(),
+            PinRole::Tx(mapping.tx_af),
+        );
+        configure_af(
+            rx.port_base(),
+            rx.path(),
+            rx.pin(),
+            PinRole::Rx(mapping.rx_af),
+        );
 
         // 4. BRR + 8N1 /16 frame + enable. The default M1 settings (the link-validated frame).
         Ok(Usart::program(

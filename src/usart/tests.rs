@@ -640,3 +640,143 @@ fn new_refuses_gate_capable_pins_the_layer_7_backstop() {
         Some(crate::error::DescriptorError::PinOwnership)
     );
 }
+
+/// `specs/usart-pin-remap.md` section 4, "A USART is brought up once": a second `Usart::new` on an
+/// instance already brought up returns `InUse` and writes no register, so the first keeps running.
+/// A call refused earlier (here, a pin pair naming a different instance) does not use the
+/// instance up.
+#[test]
+fn new_refuses_an_instance_already_brought_up_and_writes_nothing() {
+    for desc in [
+        crate::detect::descriptor_f103(),
+        crate::detect::descriptor_f130(),
+    ] {
+        let _g = seed_reset();
+        let chip = Chip::from_descriptor(desc);
+        let clock = ClockConfig::REFERENCE_72M_IRC8M;
+        let pin = |p: u8| chip.pin(p).unwrap();
+
+        // A refused call before the first bring-up: the pins drive USART1, not USART0.
+        assert_eq!(
+            Usart::new(
+                &chip,
+                &clock,
+                PeriphLabel::Usart0,
+                (pin(0x02), pin(0x03)),
+                115_200
+            )
+            .err(),
+            Some(crate::error::DescriptorError::SelectorAddrMismatch)
+        );
+        let _first = Usart::new(
+            &chip,
+            &clock,
+            PeriphLabel::Usart1,
+            (pin(0x02), pin(0x03)),
+            115_200,
+        )
+        .expect("the first bring-up of USART1");
+
+        // Every word the second call could touch: the USART1 block, the RCU, both GPIO ports.
+        let words: Vec<(u32, u32)> = [
+            (chip.base(PeriphLabel::Usart1).unwrap(), 0x30),
+            (chip.rcu_base().unwrap(), 0x30),
+            (chip.base(PeriphLabel::Gpioa).unwrap(), 0x2C),
+            (chip.base(PeriphLabel::Gpiob).unwrap(), 0x2C),
+            (0x4001_0000, 0x08), // the F10x AFIO block (reads 0 on the F1x0 mock too)
+        ]
+        .iter()
+        .flat_map(|&(base, len)| (0..len).step_by(4).map(move |off| (base, off)))
+        .collect();
+        let before: Vec<u32> = words
+            .iter()
+            .map(|&(b, o)| Reg32::new(b, o).read())
+            .collect();
+
+        assert_eq!(
+            Usart::new(
+                &chip,
+                &clock,
+                PeriphLabel::Usart1,
+                (pin(0x02), pin(0x03)),
+                9600
+            )
+            .err(),
+            Some(crate::error::DescriptorError::InUse)
+        );
+        let after: Vec<u32> = words
+            .iter()
+            .map(|&(b, o)| Reg32::new(b, o).read())
+            .collect();
+        assert_eq!(
+            before, after,
+            "the refused second bring-up wrote a register"
+        );
+    }
+}
+
+/// `specs/usart-pin-remap.md` section 5, host test 4: on an F10x, `Usart::new` with PB6/PB7 sets
+/// `AFIO_PCF0.USART0_REMAP` BEFORE it routes the pins, and routes them (TX AF push-pull, RX
+/// floating input). The order is observed through a device rule: a read of `PCF0` (the remap's
+/// read-modify-write) clears the PB6/PB7 `CTL0` nibbles, so the nibbles survive only if the pins
+/// were configured after the remap.
+#[test]
+fn new_on_f10x_pb6_pb7_sets_the_usart0_remap_before_routing_the_pins() {
+    const AFIO_PCF0: u32 = 0x4001_0004;
+    let _g = seed_reset();
+    let chip = Chip::from_descriptor(crate::detect::descriptor_f103());
+    let gpiob = chip.base(PeriphLabel::Gpiob).unwrap();
+    mock::read_clears(AFIO_PCF0, gpiob, 0xFF00_0000);
+
+    Usart::new(
+        &chip,
+        &ClockConfig::REFERENCE_72M_IRC8M,
+        PeriphLabel::Usart0,
+        (chip.pin(0x16).unwrap(), chip.pin(0x17).unwrap()),
+        115_200,
+    )
+    .expect("USART0 on PB6/PB7 is a routable mapping on F10x");
+
+    // CTL0 nibbles 6 and 7: PB6 = AF push-pull 50 MHz (0xB), PB7 = floating input (0x4). Read
+    // before PCF0, whose read would fire the rule again.
+    assert_eq!(
+        Reg32::new(gpiob, 0x00).read() >> 24,
+        0x4B,
+        "PB6/PB7 routed after the remap"
+    );
+    assert_eq!(
+        Reg32::new(AFIO_PCF0, 0).read(),
+        1 << 2,
+        "USART0_REMAP set, nothing else"
+    );
+}
+
+/// The other half of host test 4: the USART1 and USART2 default mappings need their remap fields
+/// at reset, so bringing them up on an F10x writes no `AFIO_PCF0` field and leaves the AFIO clock
+/// off.
+#[test]
+fn new_on_f10x_default_mappings_writes_no_pcf0_field() {
+    const AFIO_PCF0: u32 = 0x4001_0004;
+    for (usart, tx, rx) in [
+        (PeriphLabel::Usart1, 0x02u8, 0x03u8),
+        (PeriphLabel::Usart2, 0x1A, 0x1B),
+    ] {
+        let _g = seed_reset();
+        let chip = Chip::from_descriptor(crate::detect::descriptor_f103());
+        Usart::new(
+            &chip,
+            &ClockConfig::REFERENCE_72M_IRC8M,
+            usart,
+            (chip.pin(tx).unwrap(), chip.pin(rx).unwrap()),
+            115_200,
+        )
+        .expect("a default F10x mapping");
+        assert_eq!(
+            Reg32::new(AFIO_PCF0, 0).read(),
+            0,
+            "{usart:?}: PCF0 untouched"
+        );
+        let apb2en = Reg32::new(chip.rcu_base().unwrap(), 0x18).read();
+        assert_eq!(apb2en & 1, 0, "{usart:?}: AFIOEN untouched");
+    }
+}

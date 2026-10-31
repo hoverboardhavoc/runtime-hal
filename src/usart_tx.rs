@@ -7,14 +7,14 @@
 //! Here the CPU copies the frame into an owned buffer, arms a channel, and leaves; the DMA feeds
 //! `TDATA` byte by byte and raises one interrupt at the end.
 //!
-//! # Two ports
+//! # One transmitter per USART instance
 //!
-//! Two USARTs can transmit on DMA, each with its own channel, completion vector and in-flight state,
-//! so both can be live at once: the inter-board link (`USART1`), and the BLE module port (`USART2` on
-//! F10x, `USART0` on its PB6/PB7 mapping on F1x0; the same per-family split the receive side
-//! resolves). The module port is 9600 baud, where a 20 B frame is 21 ms of wire: polled, it can only
-//! go out a byte per main-loop visit, so the loop's pass rate sets the port's byte rate. On DMA the
-//! frame goes in one transfer and the pass rate stops mattering.
+//! Every USART instance the receive side resolves can transmit on DMA (`USART0` and `USART1` on both
+//! families, `USART2` on F10x), each with its own channel, completion vector and in-flight state,
+//! so all can be live at once. A firmware link can be any of them, so a transmit context belongs to
+//! the instance, not to a role. On a 9600 baud port a 20 B frame is 21 ms of wire: polled, it can
+//! only go out a byte per main-loop visit, so the loop's pass rate sets the port's byte rate. On DMA
+//! the frame goes in one transfer and the pass rate stops mattering.
 //!
 //! # What it is NOT
 //!
@@ -42,7 +42,6 @@
 
 use crate::addr::PeriphLabel;
 use crate::chip::Chip;
-use crate::descriptor::ClockPath;
 use crate::dma::{self, DmaTxMap};
 use crate::error::DescriptorError;
 use crate::irq;
@@ -111,66 +110,60 @@ const fn budget_cycles(per_byte: u32, len: usize) -> u32 {
 }
 
 /// Which transmit context a handle resolves to, and so which channel, vector and in-flight flag it
-/// owns. The index is the [`crate::dma`] context index.
+/// owns. The index is the [`crate::dma`] context index, the same as the receive side's slot index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxPort {
-    /// The inter-board link's `USART1`: context 0.
-    Link,
-    /// The BLE module port: `USART2` on F10x, `USART0` (PB6/PB7) on F1x0. Context 1, shared by the
-    /// two instances because no part has both.
-    Module,
+    /// `USART1`: context 0.
+    Usart1,
+    /// `USART2` (F10x only): context 1.
+    Usart2,
+    /// `USART0` (its PB6/PB7 mapping): context 2.
+    Usart0,
 }
 
 impl TxPort {
     #[inline]
     const fn ctx(self) -> usize {
         match self {
-            TxPort::Link => 0,
-            TxPort::Module => 1,
+            TxPort::Usart1 => 0,
+            TxPort::Usart2 => 1,
+            TxPort::Usart0 => 2,
         }
     }
 }
 
-/// Resolve a TX half's register base to the port it transmits for, and that port's channel map.
+/// Resolve a TX half's register base to the instance it transmits for, that instance's channel
+/// map, and its transmit vector.
 ///
 /// Keyed on the handle's base rather than on a selector the caller passes, so a channel can only be
 /// armed for the USART whose `TDATA` it feeds: the instance is what the caller actually handed over.
-/// The module instance follows the receive side's family rule (`usart_rx::resolve_instance`):
-/// `USART2` is the module on F10x and does not exist on F1x0; `USART0` is the module on F1x0 and is
-/// refused on F10x, where its PB6/PB7 mapping needs an AFIO remap this HAL does not implement. A
-/// label the descriptor has no address for simply does not match. Anything else is
+/// An instance transmits on a family exactly where [`irq::usart_irqs`] names its vectors (the
+/// receive side's rule): `USART2` on F10x only, `USART0` and `USART1` on both. A label the
+/// descriptor has no address for simply does not match. Anything else is
 /// [`DescriptorError::Unsupported`].
-fn resolve_port(chip: &Chip, base: u32) -> Result<(TxPort, DmaTxMap), DescriptorError> {
-    let is = |label: PeriphLabel| chip.base(label).ok() == Some(base);
-    if is(PeriphLabel::Usart1) {
-        return Ok((TxPort::Link, DmaTxMap::usart1_tx(chip)));
-    }
-    match chip.clock() {
-        ClockPath::F10xRcc if is(PeriphLabel::Usart2) => {
-            Ok((TxPort::Module, DmaTxMap::module_tx()))
+fn resolve_port(chip: &Chip, base: u32) -> Result<(TxPort, DmaTxMap, usize), DescriptorError> {
+    for (label, port) in [
+        (PeriphLabel::Usart1, TxPort::Usart1),
+        (PeriphLabel::Usart2, TxPort::Usart2),
+        (PeriphLabel::Usart0, TxPort::Usart0),
+    ] {
+        if chip.base(label).ok() != Some(base) {
+            continue;
         }
-        ClockPath::F1x0Rcu if is(PeriphLabel::Usart0) => {
-            Ok((TxPort::Module, DmaTxMap::usart0_tx()))
-        }
-        _ => Err(DescriptorError::Unsupported),
+        let Some(irqs) = irq::usart_irqs(chip.irq(), label) else {
+            break;
+        };
+        let map = match port {
+            TxPort::Usart1 => DmaTxMap::usart1_tx(chip),
+            TxPort::Usart2 => DmaTxMap::usart2_tx(),
+            TxPort::Usart0 => DmaTxMap::usart0_tx(chip),
+        };
+        return Ok((port, map, irqs.dma_tx));
     }
+    Err(DescriptorError::Unsupported)
 }
 
-/// The DMA transmit IRQ number for `port` on `chip`'s family. The link: its own `DMA0_Channel6` = 17
-/// on F10x, the grouped `DMA_Channel3_4` = 11 on F1x0. The module port: its own `DMA0_Channel1` = 12
-/// on F10x, the grouped `DMA_Channel1_2` = 10 on F1x0. A grouped vector is shared with the port's
-/// receive channel, where unmasking it a second time is idempotent. Hardware-build-only (drives the
-/// NVIC).
-#[cfg(not(feature = "mock"))]
-#[inline]
-fn tx_irq_num(chip: &Chip, port: TxPort) -> usize {
-    match port {
-        TxPort::Link => irq::dma_tx_irq(chip.irq()),
-        TxPort::Module => irq::module_tx_irq(chip.irq()),
-    }
-}
-
-/// One-shot DMA USART transmitter for the inter-board link's port or the BLE module port (G-DMA-TX).
+/// One-shot DMA USART transmitter for one USART instance (G-DMA-TX).
 ///
 /// Built from the TX half of a split [`crate::usart::Usart`], consuming it the way
 /// [`crate::usart_rx::RingBufferedRx`] consumes the RX half: the transmit path now owns that
@@ -226,10 +219,10 @@ impl DmaTx {
     /// frame in CPU cycles); `core_hz` is a parameter for the same reason
     /// [`crate::serial::PolledSerial::from_usart`]'s is.
     ///
-    /// **`tx` must be the half of a USART this HAL maps a transmit channel for**: `USART1` (the link)
-    /// on either family, `USART2` (the module port) on F10x, `USART0` (the module port) on F1x0. Any
-    /// other handle is refused with [`DescriptorError::Unsupported`] rather than armed onto a
-    /// channel that feeds a different peripheral's `TDATA`. A buffer that is empty or longer than
+    /// **`tx` must be the half of a USART this HAL maps a transmit channel for**: `USART0` or
+    /// `USART1` on either family, `USART2` on F10x. Any other handle is refused with
+    /// [`DescriptorError::Unsupported`] rather than armed onto a channel that feeds a different
+    /// peripheral's `TDATA`. A buffer that is empty or longer than
     /// `CHxCNT`'s 16-bit range is [`DescriptorError::Unsupported`] too, and a failed self-check is
     /// [`DescriptorError::SelfCheckFailed`].
     #[cfg_attr(runtime_hal_nightly, optimize(size))]
@@ -250,7 +243,7 @@ impl DmaTx {
         // A channel's request line belongs to one USART, so a handle armed on another instance's
         // channel would either never advance or feed the wrong port. Resolve the channel from the
         // handle the caller actually passed (the `resolve_instance` posture on the RX side).
-        let (port, map) = resolve_port(chip, tx.regs().base())?;
+        let (port, map, tx_irq) = resolve_port(chip, tx.regs().base())?;
 
         // The DMA controller clock (shared with the receive ring, which may already have enabled it;
         // the write is idempotent).
@@ -278,8 +271,9 @@ impl DmaTx {
         // start stamp move.
         dma::install_tx(&map, port.ctx());
         irq::enable_cycle_counter();
+        let _ = tx_irq;
         #[cfg(not(feature = "mock"))]
-        nvic_unmask(tx_irq_num(chip, port));
+        nvic_unmask(tx_irq);
 
         Ok(DmaTx {
             map,

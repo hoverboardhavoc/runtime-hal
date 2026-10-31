@@ -15,15 +15,13 @@
 //! 2. Preserve `SWJ_CFG[26:24]` (only [`set_swj_sw_only`] touches it, and only to SW-only).
 //! 3. Enable the AFIO clock (`RCU_APB2EN.AFIOEN`, idempotent RMW) before the first `PCF0` write.
 //!
-//! Per-field helpers exist ONLY for fields with a real writer today (`SWJ_CFG`, `TIMER1_REMAP`).
-//! **`USART0_REMAP` (UM 7.5.9 bit 2) deliberately has none.** It is the only way to reach USART0 on
-//! PB6/PB7 on F10x, but no F10x board needs it: the chassis that puts its BLE module there is F1x0,
-//! where the same mapping is a per-pin `AFSEL` = AF0 selection and needs no AFIO at all
-//! ([`crate::pincap::usart_pins`]). Adding the field helper with no writer would be exactly the
-//! speculative primitive this module's one-writer-per-field rule exists to avoid, so the F10x
-//! answer stays an honest "not expressible" until a board exercises it. **F10x-only**: the F1x0 has no
-//! AFIO at all (per-pin `GPIOx_AFSEL` routing; the AFIO address region is reserved and must not be
-//! written), so nothing here is reachable from an F1x0 code path.
+//! Per-field helpers exist ONLY for fields with a real writer: `SWJ_CFG`, `TIMER1_REMAP` and
+//! `USART0_REMAP` (UM 7.5.9 bit 2, the only way to reach USART0 on PB6/PB7 on F10x, written by
+//! [`crate::usart::Usart::new`] when [`crate::pincap::usart_pins`] resolves that pair). The USART1
+//! and USART2 default mappings need their remap fields at the reset value, so they have no helper
+//! and nothing writes those fields. **F10x-only**: the F1x0 has no AFIO at all (per-pin
+//! `GPIOx_AFSEL` routing; the AFIO address region is reserved and must not be written), so nothing
+//! here is reachable from an F1x0 code path.
 
 use crate::reg::Reg32;
 
@@ -56,6 +54,10 @@ const PCF0_TIMER1_REMAP: u32 = 0b11 << 8;
 /// and does NOT put any channel on PB3. We name this constant `..._PARTIAL0` to match the SPL and
 /// avoid that trap; the written register value remains `01`.
 const PCF0_TIMER1_REMAP_PARTIAL0: u32 = 0b01 << 8;
+
+/// `USART0_REMAP` in `AFIO_PCF0`, bit 2 (UM 7.5.9; the SPL's `AFIO_PCF0_USART0_REMAP` = `BIT(2)`,
+/// `gd32f10x_gpio.h`). `1` = USART0_TX on PB6, USART0_RX on PB7.
+const PCF0_USART0_REMAP: u32 = 1 << 2;
 
 /// Enable the AFIO peripheral clock (`RCU_APB2EN.AFIOEN`). Idempotent RMW; every field helper calls
 /// it so each is self-contained regardless of caller order.
@@ -91,6 +93,16 @@ pub(crate) fn set_swj_sw_only(rcu_base: u32) {
 pub(crate) fn remap_timer1_partial0(rcu_base: u32) {
     enable_clock(rcu_base);
     Reg32::new(AFIO_BASE, AFIO_PCF0).modify(PCF0_TIMER1_REMAP, PCF0_TIMER1_REMAP_PARTIAL0);
+}
+
+/// **F10x-only**: set `USART0_REMAP` (value `1`), putting USART0_TX on **PB6** and USART0_RX on
+/// **PB7**, by RMW of that one bit of `AFIO_PCF0`; `SWJ_CFG` and every other remap field are left
+/// as they are. The one writer of the bit: [`crate::usart::Usart::new`], when the mapping it
+/// resolved carries [`crate::pincap::UsartRemap::Usart0`], before it routes the pins.
+#[inline]
+pub(crate) fn set_usart0_remap(rcu_base: u32) {
+    enable_clock(rcu_base);
+    Reg32::new(AFIO_BASE, AFIO_PCF0).modify(PCF0_USART0_REMAP, PCF0_USART0_REMAP);
 }
 
 #[cfg(all(test, feature = "mock"))]
@@ -141,5 +153,26 @@ mod tests {
         assert_eq!(pcf0 & (0b111 << 24), 0b010 << 24, "SWJ_CFG = SW-only");
         assert_eq!(pcf0 & (0b11 << 8), 0b01 << 8, "TIMER1_REMAP untouched");
         assert_eq!(Reg32::new(RCU_BASE, 0x18).read() & 1, 1, "AFIOEN on");
+    }
+
+    #[test]
+    fn set_usart0_remap_sets_bit_2_alone_from_any_starting_value() {
+        // `specs/usart-pin-remap.md` section 5, host test 3: bit 2 changes and nothing else, so every
+        // SWJ_CFG value (the brick-hazard field) and every other remap field survive.
+        let others = [0u32, 0x0000_0300, 0x00FF_FFFB, 0x001F_7FFB, 0xF8FF_FFFB];
+        for swj in 0u32..8 {
+            for &other in &others {
+                let _g = seed();
+                let before = (swj << 24) | (other & !(0b111 << 24));
+                Reg32::new(AFIO_PCF0_ABS, 0).write(before);
+                super::set_usart0_remap(RCU_BASE);
+                assert_eq!(
+                    Reg32::new(AFIO_PCF0_ABS, 0).read(),
+                    before | (1 << 2),
+                    "from {before:#010x}"
+                );
+                assert_eq!(Reg32::new(RCU_BASE, 0x18).read() & 1, 1, "AFIOEN on");
+            }
+        }
     }
 }

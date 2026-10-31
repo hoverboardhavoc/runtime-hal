@@ -17,8 +17,9 @@ use crate::descriptor::{AdcPath, ClockPath, GpioPath, IrqLayout, McuDescriptor, 
 use crate::dma::{DmaRxMap, DMA0_BASE};
 use crate::error::{DescriptorError, UsartError};
 use crate::irq::{
-    install_mock, mock_vtor, F10X_DMA0_CH2_IRQ, F10X_DMA0_CH5_IRQ, F10X_USART1_IRQ,
-    F10X_USART_MODULE_IRQ, F1X0_DMA_CH3_4_IRQ, F1X0_USART0_IRQ, F1X0_USART1_IRQ,
+    install_mock, mock_vtor, F10X_DMA0_CH2_IRQ, F10X_DMA0_CH4_IRQ, F10X_DMA0_CH5_IRQ,
+    F10X_USART0_IRQ, F10X_USART1_IRQ, F10X_USART2_IRQ, F1X0_DMA_CH3_4_IRQ, F1X0_USART0_IRQ,
+    F1X0_USART1_IRQ,
 };
 use crate::reg::{mock, Reg32};
 use crate::usart::Usart;
@@ -31,7 +32,7 @@ const USART_BASE: u32 = 0x4000_4400;
 /// `USART_BASE` in the mock window (idx 0x4800 vs 0x4400), so the two slots' register spaces never
 /// alias: this is what the two-instances-live coexistence case keys on.
 const MODULE_BASE: u32 = 0x4000_4800;
-/// GD `USART0`'s register base (`0x4001_3800`, APB2): the F1x0-only third instance's own space, so
+/// GD `USART0`'s register base (`0x4001_3800`, APB2): the third instance's own space, so
 /// its ISR can be driven independently of USART1's and the module's.
 const USART0_BASE: u32 = 0x4001_3800;
 /// A non-zero RAM-table address for `install_mock` (stands in for the section).
@@ -175,7 +176,7 @@ fn bring_up_module<const N: usize>(chip: &Chip) -> BufferedRx {
     BufferedRx::new(chip, usart.split().1, PeriphLabel::Usart2, storage).unwrap()
 }
 
-/// A `UsartConfig` for USART0 (its PB6/PB7 mapping): the F1x0-only third instance.
+/// A `UsartConfig` for USART0 (its PB6/PB7 mapping): the third instance, on both families.
 fn usart0_cfg() -> UsartConfig {
     UsartConfig {
         usart: PeriphLabel::Usart0,
@@ -372,7 +373,7 @@ fn b5_line_error_is_cleared_surfaced_and_rx_recovers() {
 //
 // The interrupt-path generalization: a BufferedRx can target the BLE-module USART (HAL `Usart2`),
 // which has its OWN static slot (index 1) and its OWN F10x vector (`USART2_IRQn` = 39,
-// `F10X_USART_MODULE_IRQ`), independent of USART1's slot 0 / vector 38. The module instance is
+// `F10X_USART2_IRQ`), independent of USART1's slot 0 / vector 38. The module instance is
 // F10x-only; constructing it on F1x0 (or naming any other label) fails loud.
 
 // --- B14: the module instance uses its own slot, driven by its own vector (IRQ 39) ------------
@@ -390,7 +391,7 @@ fn b14_module_instance_uses_its_own_slot_and_vector() {
     for &b in &pattern {
         stage_byte_at(MODULE_BASE, &fam, b);
         // SAFETY: the RAM table is installed and slot 39 holds the module RX handler.
-        unsafe { mock_vtor::dispatch(F10X_USART_MODULE_IRQ) };
+        unsafe { mock_vtor::dispatch(F10X_USART2_IRQ) };
     }
     assert!(
         rx.ready(),
@@ -428,7 +429,7 @@ fn b15_two_instances_live_no_slot_or_vector_collision() {
     unsafe { mock_vtor::dispatch(F10X_USART1_IRQ) };
     stage_byte_at(MODULE_BASE, &fam, 0xB2);
     // SAFETY: table installed; slot 39 holds the module RX handler.
-    unsafe { mock_vtor::dispatch(F10X_USART_MODULE_IRQ) };
+    unsafe { mock_vtor::dispatch(F10X_USART2_IRQ) };
 
     // Each receiver holds exactly its own byte: the ISRs filled different slots, no cross-talk.
     let mut b1 = [0u8; 4];
@@ -484,23 +485,92 @@ fn b17_unknown_instance_selector_is_rejected() {
     );
 }
 
-// --- B17b: USART0 is F1x0-only, and refused on F10x for a stated reason -----------------------
+// --- B17b: USART0 on the F10x (its remapped PB6/PB7): its own slot and vector (IRQ 37) --------
 
 #[test]
-fn b17b_usart0_is_f1x0_only_and_refused_on_f10x() {
+fn b17b_usart0_uses_its_own_slot_and_vector_on_f10x() {
     let fam = f10x();
     let _g = setup();
     let chip = chip_for(&fam);
-    let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
-    let storage: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
-    // USART0 means its PB6/PB7 mapping (the PA9/PA10 default is the TIMER0 gate set, refused
-    // everywhere). On F10x that mapping needs the AFIO USART0_REMAP field the HAL does not
-    // implement, so it is `Unsupported` - a stated family limit, not an unknown label.
+    let mut rx = bring_up_usart0::<8>(&chip);
+    // A USART1 receiver live at the same time, on its own slot and vector (38).
+    let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let s1: &'static RxRing<8> = Box::leak(Box::new(RxRing::new()));
+    let mut rx1 = BufferedRx::new(&chip, u1.split().1, PeriphLabel::Usart1, s1).unwrap();
+    install_mock(fam.irq, RAM_ADDR);
+
+    // Stage bytes in USART0's OWN register space and fire USART0's F10x vector (37,
+    // `gd32f10x.h` USART0_IRQn), never USART1's (38).
+    let pattern = [0x51u8, 0x52, 0x53];
+    for &b in &pattern {
+        stage_byte_at(USART0_BASE, &fam, b);
+        // SAFETY: the F10x RAM table is installed and slot 37 holds the USART0 RX handler.
+        unsafe { mock_vtor::dispatch(F10X_USART0_IRQ) };
+    }
+    let mut buf = [0u8; 8];
+    let n = rx.read(&mut buf).unwrap();
     assert_eq!(
-        BufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart0, storage).map(|_| ()),
-        Err(DescriptorError::Unsupported),
-        "USART0's PB6/PB7 mapping is not expressible on F10x (no AFIO remap primitive)"
+        &buf[..n],
+        &pattern,
+        "USART0 slot received its own bytes via IRQ 37"
     );
+    assert_eq!(
+        rx1.read(&mut buf),
+        Ok(0),
+        "no cross-talk into USART1's ring"
+    );
+}
+
+// --- B17e: a USART0 DMA ring on the F10x arms DMA0 Ch4 and counts wraps on its own vector (15) --
+
+#[test]
+fn b17e_usart0_ring_on_f10x_uses_channel_4_and_its_own_context() {
+    let _g = setup();
+    let chip = chip_for(&f10x());
+    let map = DmaRxMap::usart0_rx(&chip);
+    assert_eq!(
+        (map.channel, map.grouped),
+        (4, false),
+        "USART0_RX is DMA0 Ch4 on F10x (UM Rev2.6 Figure 9-4), its own vector"
+    );
+    let u0 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &usart0_cfg()).unwrap();
+    let buf: &'static mut [u8] = vec![0u8; 8].leak();
+    let ptr = buf.as_mut_ptr();
+    let mut rx = RingBufferedRx::new(&chip, u0.split().1, PeriphLabel::Usart0, buf).unwrap();
+    // A USART1 ring live too (Ch5, context 0, vector 16).
+    let u1 = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &bench_cfg()).unwrap();
+    let b1: &'static mut [u8] = vec![0u8; 16].leak();
+    let _r1 = RingBufferedRx::new(&chip, u1.split().1, PeriphLabel::Usart1, b1).unwrap();
+    install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
+
+    // The channel was armed circular against USART0's data register.
+    assert_eq!(
+        Reg32::new(DMA0_BASE, ch_ctl(4)).read() & CHEN,
+        CHEN,
+        "Ch4 armed"
+    );
+    assert_eq!(
+        Reg32::new(DMA0_BASE, 0x10 + 0x14 * 4).read(),
+        USART0_BASE + 0x04,
+        "CH4PADDR = USART0's DATA (F10x offset 0x04)"
+    );
+
+    for (i, b) in [7u8, 8, 9].into_iter().enumerate() {
+        dma_write(ptr, i, b);
+    }
+    Reg32::new(DMA0_BASE, ch_cnt(4)).write(8 - 3);
+    let mut out = [0u8; 8];
+    assert_eq!(rx.read(&mut out), Ok(3));
+    assert_eq!(&out[..3], &[7, 8, 9]);
+
+    // A wrap on Ch4 is counted on context 2 by vector 15; USART1's vector (16) does not count it.
+    Reg32::new(DMA0_BASE, 0x00).write(ftf_flag(4));
+    // SAFETY: the F10x table is installed; slots 16 and 15 hold the USART1 and USART0 DMA handlers.
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH5_IRQ) };
+    assert_eq!(crate::dma::wraps(2), 0, "USART1's vector left Ch4 alone");
+    unsafe { mock_vtor::dispatch(F10X_DMA0_CH4_IRQ) };
+    assert_eq!(crate::dma::wraps(2), 1, "USART0 wrap counted on context 2");
+    assert_eq!(crate::dma::wraps(0), 0, "USART1 context untouched");
 }
 
 // --- B17c: USART0 resolves on F1x0 and installs its OWN slot/vector ---------------------------
@@ -1055,7 +1125,7 @@ fn install_ring_module(len: usize) -> (RingBufferedRx, u8, *mut u8) {
     let usart = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
     let buf: &'static mut [u8] = vec![0u8; len].leak();
     let ptr = buf.as_mut_ptr();
-    let ch = DmaRxMap::module_rx().channel;
+    let ch = DmaRxMap::usart2_rx().channel;
     let rx = RingBufferedRx::new(&chip, usart.split().1, PeriphLabel::Usart2, buf).unwrap();
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
     (rx, ch, ptr)
@@ -1065,7 +1135,7 @@ fn install_ring_module(len: usize) -> (RingBufferedRx, u8, *mut u8) {
 
 #[test]
 fn b18_dma_rx_map_module_resolves_channel2() {
-    let m = DmaRxMap::module_rx();
+    let m = DmaRxMap::usart2_rx();
     assert_eq!(
         m.channel, 2,
         "GD USART2_RX is DMA0 Ch2 on F10x (UM Table 9-3, the USART row)"
@@ -1121,7 +1191,7 @@ fn b20_two_dma_instances_live_no_channel_or_context_collision() {
     let um = Usart::bring_up(&chip, &ClockConfig::REFERENCE_72M_IRC8M, &module_cfg()).unwrap();
     let bm: &'static mut [u8] = vec![0u8; 16].leak();
     let _rm = RingBufferedRx::new(&chip, um.split().1, PeriphLabel::Usart2, bm).unwrap();
-    let ch_mod = DmaRxMap::module_rx().channel;
+    let ch_mod = DmaRxMap::usart2_rx().channel;
     assert_eq!((ch_u1, ch_mod), (5, 2), "distinct channels, no collision");
     install_mock(IrqLayout::F10xSeparate, RAM_ADDR);
 
@@ -1318,26 +1388,15 @@ fn supports_rx_answers_from_the_model() {
         !supports_rx(&f1x0_chip, PeriphLabel::Usart2),
         "the module USART is F10x-only (the chip-blind-flag bug this query fixes)"
     );
-    // Usart0 = its PB6/PB7 mapping, which is per-family: a plain AF0 mux selection on F1x0
-    // (GD32F130xx Datasheet Rev3.7 Table 2-10), but an AFIO USART0_REMAP field on F10x that the HAL
-    // does not implement. The query tracks `resolve_instance` automatically, as its docs promise.
-    assert!(
-        supports_rx(&f1x0_chip, PeriphLabel::Usart0),
-        "USART0 on PB6/PB7 resolves on F1x0"
-    );
-    assert!(
-        !supports_rx(&f10x_chip, PeriphLabel::Usart0),
-        "USART0's PB6/PB7 mapping needs an AFIO remap on F10x: not yet expressible"
-    );
-    // The capability query and the pin model agree about which family carries the mapping.
-    assert_eq!(
-        supports_rx(&f1x0_chip, PeriphLabel::Usart0),
-        crate::pincap::usart_pins(&f1x0_chip, 0x16, 0x17).is_some()
-    );
-    assert_eq!(
-        supports_rx(&f10x_chip, PeriphLabel::Usart0),
-        crate::pincap::usart_pins(&f10x_chip, 0x16, 0x17).is_some()
-    );
+    // Usart0 = its PB6/PB7 mapping: an AF0 mux selection on F1x0, AFIO USART0_REMAP on F10x. The
+    // receive instance exists on both, and the query agrees with the pin model on each.
+    for chip in [&f1x0_chip, &f10x_chip] {
+        assert!(supports_rx(chip, PeriphLabel::Usart0), "USART0 on PB6/PB7");
+        assert_eq!(
+            supports_rx(chip, PeriphLabel::Usart0),
+            crate::pincap::usart_pins(chip, 0x16, 0x17).is_some()
+        );
+    }
     // A non-USART label is never RX-capable.
     assert!(!supports_rx(&f10x_chip, PeriphLabel::Gpioa));
 }
