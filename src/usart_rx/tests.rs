@@ -1318,26 +1318,19 @@ fn supports_rx_answers_from_the_model() {
         !supports_rx(&f1x0_chip, PeriphLabel::Usart2),
         "the module USART is F10x-only (the chip-blind-flag bug this query fixes)"
     );
-    // Usart0 = its PB6/PB7 mapping, which is per-family: a plain AF0 mux selection on F1x0
-    // (GD32F130xx Datasheet Rev3.7 Table 2-10), but an AFIO USART0_REMAP field on F10x that the HAL
-    // does not implement. The query tracks `resolve_instance` automatically, as its docs promise.
+    // Usart0 = its PB6/PB7 mapping. The pin model routes it on both families (an AF0 mux selection
+    // on F1x0, AFIO USART0_REMAP on F10x); the receive instance exists on F1x0 only until the F10x
+    // USART0 vectors and DMA channels are wired (`specs/usart-pin-remap.md` section 4).
     assert!(
         supports_rx(&f1x0_chip, PeriphLabel::Usart0),
         "USART0 on PB6/PB7 resolves on F1x0"
     );
     assert!(
         !supports_rx(&f10x_chip, PeriphLabel::Usart0),
-        "USART0's PB6/PB7 mapping needs an AFIO remap on F10x: not yet expressible"
+        "the F10x USART0 receive instance is not wired yet"
     );
-    // The capability query and the pin model agree about which family carries the mapping.
-    assert_eq!(
-        supports_rx(&f1x0_chip, PeriphLabel::Usart0),
-        crate::pincap::usart_pins(&f1x0_chip, 0x16, 0x17).is_some()
-    );
-    assert_eq!(
-        supports_rx(&f10x_chip, PeriphLabel::Usart0),
-        crate::pincap::usart_pins(&f10x_chip, 0x16, 0x17).is_some()
-    );
+    assert!(crate::pincap::usart_pins(&f1x0_chip, 0x16, 0x17).is_some());
+    assert!(crate::pincap::usart_pins(&f10x_chip, 0x16, 0x17).is_some());
     // A non-USART label is never RX-capable.
     assert!(!supports_rx(&f10x_chip, PeriphLabel::Gpioa));
 }

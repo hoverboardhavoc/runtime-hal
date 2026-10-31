@@ -494,13 +494,14 @@ impl Usart {
     ///
     /// Steps, in order (mirroring `I2c::new`):
     /// 1. Ask the ownership backstop about both pins, then resolve the (TX, RX) pair through
-    ///    [`crate::pincap::usart_pins`]: it names the instance the pair actually drives and the AF
-    ///    the mapping routes through, and must agree with `instance`. Then resolve `instance` to its
+    ///    [`crate::pincap::usart_pins`]: it names the instance the pair actually drives, each pin's
+    ///    AF and the F10x remap the mapping routes through, and must agree with `instance`. Then resolve `instance` to its
     ///    base and pick the register model from the chip's clock path; the instance fixes the APB
     ///    bus (so the BAUD input clock is correct).
     /// 2. Enable the USART peripheral clock. The TX/RX **GPIO port** clock was already enabled when
     ///    the chip handed back the [`crate::gpio::GpioPort`] the pins were split from, so it is not
-    ///    re-enabled here.
+    ///    re-enabled here. Then, when the mapping needs one (USART0 on PB6/PB7 on the F10x), set the
+    ///    `AFIO_PCF0` remap through [`crate::afio`]; no other mapping writes `PCF0`.
     /// 3. Configure TX as AF push-pull ([`PinRole::Tx`]) and RX as AF input ([`PinRole::Rx`]) via
     ///    `configure_af`, taking each consumed pin's resolved port base / register-model path /
     ///    logical pin byte (the application never built them) and the AF-mux number the pin mapping
@@ -552,10 +553,27 @@ impl Usart {
         //    `instance` is a USART label (the pin model named it), so this cannot refuse.
         crate::clock::enable_usart(rcu, path, instance)?;
 
+        // 2b. The F10x remap the mapping needs, before the pins are routed. Only USART0 on PB6/PB7
+        //     needs one; every other mapping (and every F1x0 one) leaves AFIO_PCF0 at reset.
+        match mapping.remap {
+            crate::pincap::UsartRemap::Default => {}
+            crate::pincap::UsartRemap::Usart0 => crate::afio::set_usart0_remap(rcu),
+        }
+
         // 3. TX as AF push-pull, RX as AF input. Take the resolved port base + register-model path +
         //    logical pin byte straight from each consumed Pin; the application never built them.
-        configure_af(tx.port_base(), tx.path(), tx.pin(), PinRole::Tx(mapping.af));
-        configure_af(rx.port_base(), rx.path(), rx.pin(), PinRole::Rx(mapping.af));
+        configure_af(
+            tx.port_base(),
+            tx.path(),
+            tx.pin(),
+            PinRole::Tx(mapping.tx_af),
+        );
+        configure_af(
+            rx.port_base(),
+            rx.path(),
+            rx.pin(),
+            PinRole::Rx(mapping.rx_af),
+        );
 
         // 4. BRR + 8N1 /16 frame + enable. The default M1 settings (the link-validated frame).
         Ok(Usart::program(
