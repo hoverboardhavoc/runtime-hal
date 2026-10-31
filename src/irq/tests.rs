@@ -35,9 +35,11 @@ use super::{
     INTF_BRKIF, INTF_CMTIF, INTF_TRGIF, INTF_UPIF, MAX_VECTORS, SYSTEM_VECTORS, TIMER_INTF,
 };
 use super::{
-    DMA_RX_ISR_METRIC, F1X0_DMA_CH1_2_IRQ, F1X0_DMA_CH3_4_IRQ, F1X0_USART1_IRQ, SYSTICK_ISR_METRIC,
+    DMA_RX_ISR_METRIC, F10X_DMA0_CH3_IRQ, F10X_DMA0_CH4_IRQ, F10X_USART0_IRQ, F10X_USART2_IRQ,
+    F1X0_DMA_CH1_2_IRQ, F1X0_DMA_CH3_4_IRQ, F1X0_USART0_IRQ, F1X0_USART1_IRQ, SYSTICK_ISR_METRIC,
     USART1_RX_ISR_METRIC,
 };
+use crate::addr::PeriphLabel;
 use crate::descriptor::IrqLayout;
 use crate::reg::{mock, Reg32};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -86,19 +88,38 @@ fn f1x0_grouped_slots_match_spl_layout() {
     // unrelated TIMER1 vector and the transmit channel is on the grouped slot above.
     assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(default_isr));
 
-    // The module port's DMA vector (IRQ 10, grouped Ch1/2) is the same two-body shape: USART0's
-    // receive on Ch2 and its transmit on Ch1 share it, so the slot must not be a receive-only body.
+    // USART0's DMA vector (IRQ 10, grouped Ch1/2) is the same two-body shape: USART0's receive on
+    // Ch2 and its transmit on Ch1 share it, so the slot must not be a receive-only body.
     assert_eq!(
         slot(&t, F1X0_DMA_CH1_2_IRQ),
         handler_addr(super::dma_ch1_2_isr)
     );
-    // F10x's separate module-transmit vector (IRQ 12) is the ADC vector on this layout, asserted
-    // above; the F10x body must not appear anywhere in this table.
-    let module_tx = handler_addr(super::module_dma_tx_isr);
-    assert!(
-        !t.iter().any(|&s| s == module_tx),
-        "the F10x module-transmit body must not appear in the F1x0 grouped table"
+    // USART0's own RX vector is IRQ 27 here.
+    assert_eq!(
+        slot(&t, F1X0_USART0_IRQ),
+        handler_addr(super::usart0_rx_isr)
     );
+    // The F10x-only bodies (USART2's three vectors, USART0's separate DMA vectors) must not appear
+    // anywhere in this table: on this layout their F10x numbers are other vectors (12 = ADC,
+    // 14 = TIMER0 channel, 13 = the grouped timer demux).
+    for (body, name) in [
+        (handler_addr(super::usart2_rx_isr), "USART2 RX"),
+        (handler_addr(super::usart2_dma_rx_isr), "USART2 DMA RX"),
+        (handler_addr(super::usart2_dma_tx_isr), "USART2 DMA TX"),
+        (
+            handler_addr(super::usart0_dma_rx_isr),
+            "USART0 DMA RX (Ch4)",
+        ),
+        (
+            handler_addr(super::usart0_dma_tx_isr),
+            "USART0 DMA TX (Ch3)",
+        ),
+    ] {
+        assert!(
+            !t.iter().any(|&s| s == body),
+            "the F10x {name} body must not appear in the F1x0 grouped table"
+        );
+    }
 
     // A slot the layout does not route (the table's last, an unused gap) stays the default ISR. This is
     // the "misplaced slot points at the wrong handler" guard: only the named slots diverge.
@@ -140,25 +161,43 @@ fn f10x_separate_slots_match_spl_layout() {
     assert_eq!(slot(&t, F10X_EXTI10_15_IRQ), handler_addr(super::exti_isr));
 
     // IRQ 13 differs by family: on F1x0 it is the grouped TIMER0_BRK_UP_TRG_COM demux, but on F10x it
-    // is DMA0_Channel2 = the module USART's DMA-ring RX vector (GD USART2_RX). The advanced timer does
-    // NOT use slot 13 on F10x; the module DMA channel does.
+    // is DMA0_Channel2 = USART2's DMA-ring RX vector. The advanced timer does NOT use slot 13 on
+    // F10x; USART2's DMA channel does.
     assert_eq!(
         F10X_DMA0_CH2_IRQ, F1X0_TIMER0_BRK_UP_TRG_COM_IRQ,
         "both are IRQ 13"
     );
     assert_eq!(
         slot(&t, F10X_DMA0_CH2_IRQ),
-        handler_addr(super::module_dma_rx_isr)
+        handler_addr(super::usart2_dma_rx_isr)
     );
     // The link's two DMA channels have a vector each on this layout: receive on Ch5 (IRQ 16),
     // transmit on Ch6 (IRQ 17), no demux between them.
     assert_eq!(slot(&t, F10X_DMA0_CH5_IRQ), handler_addr(super::dma_rx_isr));
     assert_eq!(slot(&t, F10X_DMA0_CH6_IRQ), handler_addr(super::dma_tx_isr));
-    // The module port's transmit (GD USART2_TX) is DMA0 Ch1, its own vector (IRQ 12), next to its
-    // receive on Ch2 (IRQ 13) above.
+    // USART2's transmit (GD USART2_TX) is DMA0 Ch1, its own vector (IRQ 12), next to its receive on
+    // Ch2 (IRQ 13) above, and its RX vector is 39.
     assert_eq!(
         slot(&t, F10X_DMA0_CH1_IRQ),
-        handler_addr(super::module_dma_tx_isr)
+        handler_addr(super::usart2_dma_tx_isr)
+    );
+    assert_eq!(
+        slot(&t, F10X_USART2_IRQ),
+        handler_addr(super::usart2_rx_isr)
+    );
+    // USART0 on its remapped PB6/PB7: RX vector 37, DMA receive Ch4 (IRQ 15) and transmit Ch3
+    // (IRQ 14), each its own slot (`gd32f10x.h`: USART0_IRQn = 37, DMA0_Channel3/4_IRQn = 14/15).
+    assert_eq!(
+        slot(&t, F10X_USART0_IRQ),
+        handler_addr(super::usart0_rx_isr)
+    );
+    assert_eq!(
+        slot(&t, F10X_DMA0_CH4_IRQ),
+        handler_addr(super::usart0_dma_rx_isr)
+    );
+    assert_eq!(
+        slot(&t, F10X_DMA0_CH3_IRQ),
+        handler_addr(super::usart0_dma_tx_isr)
     );
     // The grouped Ch3/4 and Ch1/2 bodies belong to the other layout and must not appear here.
     for (grouped_dma, name) in [
@@ -509,18 +548,18 @@ fn isr_metrics_count_entries_per_vector() {
 // --- R7: NVIC / SysTick interrupt-priority configuration --------------------------------------
 
 use super::{
-    apply_motor_era_priorities, irq_priority, motor_era_irqs, set_irq_priority,
-    set_systick_priority, systick_priority, DMA_RX_PRIORITY, F10X_ADC0_1_IRQ as R7_F10X_ADC,
+    apply_motor_era_priorities, irq_priority, period_irq, set_irq_priority, set_systick_priority,
+    systick_priority, usart_irqs, UsartIrqs, DMA_RX_PRIORITY, F10X_ADC0_1_IRQ as R7_F10X_ADC,
     F10X_USART1_IRQ, MOTOR_ISR_PRIORITY, NVIC_IPR_BASE, SCB_SHPR3, SYSTICK_PRIORITY,
-    USART1_RX_PRIORITY,
+    USART_RX_PRIORITY,
 };
 
 /// The priority levels are strictly ordered (lower numeric = higher urgency): period ISR ABOVE
-/// USART1 RX ABOVE DMA RX ABOVE SysTick, the execution-model ordering the IPR read-back gate checks.
+/// USART RX ABOVE DMA ABOVE SysTick, the execution-model ordering the IPR read-back gate checks.
 #[test]
 fn r7_priority_constants_strictly_ordered() {
-    assert!(MOTOR_ISR_PRIORITY < USART1_RX_PRIORITY);
-    assert!(USART1_RX_PRIORITY < DMA_RX_PRIORITY);
+    assert!(MOTOR_ISR_PRIORITY < USART_RX_PRIORITY);
+    assert!(USART_RX_PRIORITY < DMA_RX_PRIORITY);
     assert!(DMA_RX_PRIORITY < SYSTICK_PRIORITY);
 }
 
@@ -550,8 +589,8 @@ fn r7_set_irq_priority_round_trips_and_preserves_neighbours() {
     );
 
     // A byte at a non-zero shift (IRQ 28 = word 7, shift 0; IRQ 30 = word 7, shift 16).
-    set_irq_priority(30, USART1_RX_PRIORITY);
-    assert_eq!(irq_priority(30), USART1_RX_PRIORITY);
+    set_irq_priority(30, USART_RX_PRIORITY);
+    assert_eq!(irq_priority(30), USART_RX_PRIORITY);
 }
 
 /// `set_systick_priority` writes SHPR3's top byte and `systick_priority` reads it back; the low
@@ -570,152 +609,131 @@ fn r7_set_systick_priority_round_trips_top_byte_only() {
     );
 }
 
-/// `motor_era_irqs` resolves the per-family (period, usart1, dma) vector numbers: the ADC
-/// injected-EOC vector is the period ISR on both families.
+/// `period_irq` resolves the ADC injected-EOC vector per family: the period ISR on both.
 #[test]
-fn r7_motor_era_irqs_resolve_per_family() {
-    assert_eq!(
-        motor_era_irqs(IrqLayout::F1x0Grouped),
-        (F1X0_ADC_CMP_IRQ, F1X0_USART1_IRQ, F1X0_DMA_CH3_4_IRQ)
-    );
-    assert_eq!(
-        motor_era_irqs(IrqLayout::F10xSeparate),
-        (R7_F10X_ADC, F10X_USART1_IRQ, F10X_DMA0_CH5_IRQ)
-    );
+fn r7_period_irq_resolves_per_family() {
+    assert_eq!(period_irq(IrqLayout::F1x0Grouped), F1X0_ADC_CMP_IRQ);
+    assert_eq!(period_irq(IrqLayout::F10xSeparate), R7_F10X_ADC);
 }
 
-/// `apply_motor_era_priorities` sets the full ordering (period > usart1 > dma > systick) for both
-/// families, read back the way the silicon stage-1 gate reads the IPR + SHPR3 over SWD.
+/// `usart_irqs` against the GD SPL `IRQn_Type` values (`gd32f1x0.h` / `gd32f10x.h`) and the DMA
+/// request tables (GD32F1x0 UM Rev3.6 Table 8-3, GD32F10x UM Rev2.6 Figure 9-4): every instance's
+/// three vectors on each family, USART2 absent on the F1x0, and no non-USART label.
 #[test]
-fn r7_apply_motor_era_priorities_both_families() {
-    for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
-        let _g = mock::lock();
-        mock::reset();
-        apply_motor_era_priorities(layout);
-        let (period, usart1, dma) = motor_era_irqs(layout);
-        assert_eq!(
-            irq_priority(period),
-            MOTOR_ISR_PRIORITY,
-            "period ISR highest"
-        );
-        assert_eq!(
-            irq_priority(usart1),
-            USART1_RX_PRIORITY,
-            "usart1 RX below period"
-        );
-        assert_eq!(irq_priority(dma), DMA_RX_PRIORITY, "dma RX below usart1");
-        // The link's DMA TRANSMIT vector is covered too: a transmitter unmasks it, and an NVIC
-        // priority byte resets to 0, the most urgent value there is, so an unwritten one would
-        // preempt the period ISR. On F1x0 it is the same vector as the receive side.
-        assert_eq!(
-            irq_priority(super::dma_tx_irq(layout)),
-            DMA_RX_PRIORITY,
-            "dma TX below usart1"
-        );
-        assert!(
-            irq_priority(super::dma_tx_irq(layout)) > irq_priority(period),
-            "{layout:?}: a transmit completion must not outrank the period ISR"
-        );
-        assert_eq!(systick_priority(), SYSTICK_PRIORITY, "systick lowest");
-        // The ordering is strict: period < usart1 < dma < systick (numeric = inverse urgency).
-        assert!(irq_priority(period) < irq_priority(usart1));
-        assert!(irq_priority(usart1) < irq_priority(dma));
-        assert!(irq_priority(dma) < systick_priority());
+fn usart_irqs_match_the_spl_per_instance_and_family() {
+    let v = |rx, dma_rx, dma_tx| Some(UsartIrqs { rx, dma_rx, dma_tx });
+    // F1x0: the numbers themselves, then the resolver.
+    assert_eq!((F1X0_USART0_IRQ, F1X0_USART1_IRQ), (27, 28));
+    assert_eq!((F1X0_DMA_CH1_2_IRQ, F1X0_DMA_CH3_4_IRQ), (10, 11));
+    let f1 = IrqLayout::F1x0Grouped;
+    assert_eq!(usart_irqs(f1, PeriphLabel::Usart0), v(27, 10, 10));
+    assert_eq!(usart_irqs(f1, PeriphLabel::Usart1), v(28, 11, 11));
+    assert_eq!(
+        usart_irqs(f1, PeriphLabel::Usart2),
+        None,
+        "no USART2 on F1x0"
+    );
+    // F10x: USART0_IRQn 37, USART1_IRQn 38, USART2_IRQn 39; DMA0_Channel1..6_IRQn = 12..17.
+    assert_eq!(
+        (F10X_USART0_IRQ, F10X_USART1_IRQ, F10X_USART2_IRQ),
+        (37, 38, 39)
+    );
+    assert_eq!(
+        (
+            F10X_DMA0_CH1_IRQ,
+            F10X_DMA0_CH2_IRQ,
+            F10X_DMA0_CH3_IRQ,
+            F10X_DMA0_CH4_IRQ,
+            F10X_DMA0_CH5_IRQ,
+            F10X_DMA0_CH6_IRQ
+        ),
+        (12, 13, 14, 15, 16, 17)
+    );
+    let f10 = IrqLayout::F10xSeparate;
+    assert_eq!(usart_irqs(f10, PeriphLabel::Usart0), v(37, 15, 14));
+    assert_eq!(usart_irqs(f10, PeriphLabel::Usart1), v(38, 16, 17));
+    assert_eq!(usart_irqs(f10, PeriphLabel::Usart2), v(39, 13, 12));
+    for layout in [f1, f10] {
+        assert_eq!(usart_irqs(layout, PeriphLabel::Gpioa), None);
+        assert_eq!(usart_irqs(layout, PeriphLabel::I2c0), None);
     }
 }
 
-/// `module_tx_irq` resolves the module port's transmit vector: its own DMA0 Ch1 vector on the
-/// standard family (GD `USART2_TX`), the grouped Ch1/2 vector it shares with the port's receive on
-/// the offroad one (GD `USART0_TX`). Never one of the link's vectors, so the two transmitters'
-/// completions cannot arrive on each other's slot.
+/// No two instances share a vector on either family (a grouped DMA vector is shared by the two
+/// halves of ONE instance only), and none is the period vector, so the instances' receivers and
+/// transmitters cannot arrive on each other's slots.
 #[test]
-fn module_tx_irq_resolves_per_family_and_is_not_a_link_vector() {
-    use super::{dma_tx_irq, module_rx_irqs, module_tx_irq};
-    assert_eq!(module_tx_irq(IrqLayout::F10xSeparate), F10X_DMA0_CH1_IRQ);
-    assert_eq!(module_tx_irq(IrqLayout::F1x0Grouped), F1X0_DMA_CH1_2_IRQ);
-    assert_eq!(
-        module_tx_irq(IrqLayout::F1x0Grouped),
-        module_rx_irqs(IrqLayout::F1x0Grouped).1,
-        "F1x0: the module port's two DMA channels share one grouped vector"
-    );
+fn usart_irqs_never_collide_across_instances_or_with_the_period_vector() {
     for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
-        let (period, usart1, dma) = motor_era_irqs(layout);
-        for link in [period, usart1, dma, dma_tx_irq(layout)] {
-            assert_ne!(module_tx_irq(layout), link, "{layout:?}");
-        }
-    }
-}
-
-/// `module_rx_irqs` resolves the mirrored BLE-module port's `(usart_rx, dma_rx)` vectors: USART2 +
-/// its own DMA0 Ch2 vector on the standard family, USART0 + the grouped Ch1/2 vector on the offroad
-/// one. Distinct from the inter-board triplet on BOTH families, which is what lets the two ports
-/// carry independent receivers.
-#[test]
-fn r7_module_rx_irqs_resolve_per_family_and_never_collide() {
-    use super::{
-        module_rx_irqs, F10X_DMA0_CH2_IRQ, F10X_USART_MODULE_IRQ, F1X0_DMA_CH1_2_IRQ,
-        F1X0_USART0_IRQ,
-    };
-    assert_eq!(
-        module_rx_irqs(IrqLayout::F1x0Grouped),
-        (F1X0_USART0_IRQ, F1X0_DMA_CH1_2_IRQ)
-    );
-    assert_eq!(
-        module_rx_irqs(IrqLayout::F10xSeparate),
-        (F10X_USART_MODULE_IRQ, F10X_DMA0_CH2_IRQ)
-    );
-    for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
-        let (period, usart1, dma) = motor_era_irqs(layout);
-        let (m_usart, m_dma) = module_rx_irqs(layout);
-        let all = [period, usart1, dma, m_usart, m_dma];
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b, "{layout:?}: two policy vectors share a number");
+        let all: Vec<(PeriphLabel, UsartIrqs)> = [
+            PeriphLabel::Usart0,
+            PeriphLabel::Usart1,
+            PeriphLabel::Usart2,
+        ]
+        .into_iter()
+        .filter_map(|l| usart_irqs(layout, l).map(|v| (l, v)))
+        .collect();
+        for (i, (la, a)) in all.iter().enumerate() {
+            for n in [a.rx, a.dma_rx, a.dma_tx] {
+                assert_ne!(n, period_irq(layout), "{layout:?} {la:?}");
+            }
+            for (lb, b) in &all[i + 1..] {
+                for x in [a.rx, a.dma_rx, a.dma_tx] {
+                    for y in [b.rx, b.dma_rx, b.dma_tx] {
+                        assert_ne!(x, y, "{layout:?}: {la:?} and {lb:?} share vector {x}");
+                    }
+                }
             }
         }
     }
 }
 
-/// The BLE port's vectors are covered by the policy, not left at the reset value.
-///
-/// This is the regression the BLE RX ring turns on. An NVIC priority byte resets to **0**, the most
-/// urgent value there is, so a vector the policy never writes outranks the period ISR. That was
-/// harmless only while nothing unmasked the module port; a `RingBufferedRx` armed there unmasks both
-/// of its vectors, and an un-covered pair would preempt the 16 kHz motor ISR on every inbound BLE
-/// character. Assert they carry the RX priorities and sit strictly BELOW the period ISR.
+/// `specs/usart-pin-remap.md` section 5, host test 7: `apply_motor_era_priorities` sets every
+/// instance's three vectors on both families, the F10x USART0 ones (37, 15, 14) included, below the
+/// period ISR and above SysTick. Every byte starts at its reset value 0 (the most urgent there is),
+/// so a vector the policy missed would show up as outranking the period ISR.
 #[test]
-fn r7_module_rx_vectors_are_ordered_below_the_period_isr() {
-    use super::{module_rx_irqs, module_tx_irq};
+fn r7_apply_motor_era_priorities_covers_every_instance_on_both_families() {
     for layout in [IrqLayout::F1x0Grouped, IrqLayout::F10xSeparate] {
         let _g = mock::lock();
         mock::reset();
-        // Pre-state: the reset value really is the most-urgent byte, so this is not vacuous.
-        let (m_usart, m_dma) = module_rx_irqs(layout);
-        let m_tx = module_tx_irq(layout);
-        assert_eq!(irq_priority(m_usart), 0, "{layout:?}: reset byte is 0");
-        assert_eq!(irq_priority(m_dma), 0, "{layout:?}: reset byte is 0");
-        assert_eq!(irq_priority(m_tx), 0, "{layout:?}: reset byte is 0");
+        let instances: Vec<UsartIrqs> = [
+            PeriphLabel::Usart0,
+            PeriphLabel::Usart1,
+            PeriphLabel::Usart2,
+        ]
+        .into_iter()
+        .filter_map(|l| usart_irqs(layout, l))
+        .collect();
+        for v in &instances {
+            assert_eq!(irq_priority(v.rx), 0, "{layout:?}: reset byte is 0");
+        }
 
         apply_motor_era_priorities(layout);
 
-        let (period, ..) = motor_era_irqs(layout);
-        assert_eq!(irq_priority(m_usart), USART1_RX_PRIORITY);
-        assert_eq!(irq_priority(m_dma), DMA_RX_PRIORITY);
-        // The module port's DMA TRANSMIT vector: a `DmaTx` on the BLE port unmasks it.
-        assert_eq!(irq_priority(m_tx), DMA_RX_PRIORITY);
-        assert!(
-            irq_priority(period) < irq_priority(m_tx),
-            "{layout:?}: the module transmit completion must not outrank the period ISR"
+        let period = period_irq(layout);
+        assert_eq!(
+            irq_priority(period),
+            MOTOR_ISR_PRIORITY,
+            "period ISR highest"
         );
-        assert!(
-            irq_priority(period) < irq_priority(m_usart),
-            "{layout:?}: the module USART must not outrank the period ISR"
-        );
-        assert!(
-            irq_priority(period) < irq_priority(m_dma),
-            "{layout:?}: the module DMA must not outrank the period ISR"
-        );
+        assert_eq!(systick_priority(), SYSTICK_PRIORITY, "systick lowest");
+        for v in &instances {
+            assert_eq!(irq_priority(v.rx), USART_RX_PRIORITY, "{layout:?} {v:?}");
+            assert_eq!(irq_priority(v.dma_rx), DMA_RX_PRIORITY, "{layout:?} {v:?}");
+            assert_eq!(irq_priority(v.dma_tx), DMA_RX_PRIORITY, "{layout:?} {v:?}");
+            assert!(irq_priority(period) < irq_priority(v.rx));
+            assert!(irq_priority(v.rx) < irq_priority(v.dma_rx));
+            assert!(irq_priority(v.dma_tx) < systick_priority());
+        }
     }
+    // The F10x USART0 vectors by number, the ones that sat at reset priority 0 before this change.
+    let _g = mock::lock();
+    mock::reset();
+    apply_motor_era_priorities(IrqLayout::F10xSeparate);
+    assert_eq!(irq_priority(37), USART_RX_PRIORITY);
+    assert_eq!(irq_priority(15), DMA_RX_PRIORITY);
+    assert_eq!(irq_priority(14), DMA_RX_PRIORITY);
 }
 
 /// `unmask_irq` is the crate's NVIC set-enable owner and is a no-op under the host `mock` build

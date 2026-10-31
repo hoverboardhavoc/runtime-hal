@@ -34,15 +34,11 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize
 
 use crate::addr::PeriphLabel;
 use crate::chip::Chip;
-use crate::descriptor::ClockPath;
-// `IrqLayout` is used only by the NVIC-IRQ-number helpers, which are hardware-build-only.
-#[cfg(not(feature = "mock"))]
-use crate::descriptor::IrqLayout;
 use crate::error::{DescriptorError, UsartError};
 use crate::irq;
 use crate::usart::{UsartRegs, UsartRx};
 
-// --- the static RX contexts (one independent slot per supported instance: USART1 + module) -----
+// --- the static RX contexts (one independent slot per USART instance) -------------------------
 
 /// Sticky line-error codes stored in [`RxSlot::line_error`] (0 = none). The buffered path surfaces a
 /// line error through the next [`BufferedRx::read`], the way the polled path surfaces it inline.
@@ -96,38 +92,34 @@ impl RxSlot {
     }
 }
 
-/// The static RX contexts, one independent slot per supported buffered-RX instance: index 0 = USART1
-/// (family-generic), index 1 = the BLE-module USART (HAL [`PeriphLabel::Usart2`], F10x-only),
-/// index 2 = USART0 on its PB6/PB7 mapping (HAL [`PeriphLabel::Usart0`], F1x0-only). Several
-/// [`BufferedRx`] may be live at once, so the slots must not share state
-/// (`uart-rx-multi-instance.md` item 1). Each slot is inert until a `new` installs it.
+/// The static RX contexts, one independent slot per USART instance: index 0 = USART1, index 1 =
+/// USART2 (F10x-only), index 2 = USART0 on its PB6/PB7 mapping. Several [`BufferedRx`] may be live
+/// at once, so the slots must not share state (`uart-rx-multi-instance.md` item 1). Each slot is
+/// inert until a `new` installs it. The DMA contexts in [`crate::dma`] use the same index.
 static RX_SLOTS: [RxSlot; 3] = [RxSlot::new(), RxSlot::new(), RxSlot::new()];
 
-/// Which buffered-RX instance a receiver targets, resolved from the caller's [`PeriphLabel`] selector.
-/// Selects the static RX slot, the NVIC vector, and (S2) the DMA channel. The module USART is F10x-only
-/// (`uart-rx-multi-instance.md` family scope); any other selector, or the module on F1x0, fails loud in
-/// [`resolve_instance`].
+/// Which receive instance a receiver targets, resolved from the caller's [`PeriphLabel`] selector.
+/// Selects the static RX slot, the NVIC vectors and the DMA channel.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RxInstance {
-    /// USART1 (HAL [`PeriphLabel::Usart1`], base 0x4000_4400): slot 0, the family-generic first instance.
+    /// USART1 (HAL [`PeriphLabel::Usart1`], base 0x4000_4400): slot 0, on both families.
     Usart1,
-    /// The BLE-module USART (HAL [`PeriphLabel::Usart2`], base 0x4000_4800, F10x-only): slot 1.
-    Module,
-    /// USART0 (HAL [`PeriphLabel::Usart0`], base 0x4001_3800) on its **PB6/PB7** mapping: slot 2.
-    /// **F1x0-only**: that mapping is the per-pin AF0 mux there (GD32F130xx Datasheet Rev3.7 Table
-    /// 2-10), while on F10x it needs the AFIO `USART0_REMAP` field the HAL does not implement.
-    /// USART0's DEFAULT mapping (PA9/PA10) is the TIMER0 gate set and is refused on both families,
-    /// so this instance means PB6/PB7 and nothing else (see [`crate::pincap::usart_pins`]).
+    /// USART2 (HAL [`PeriphLabel::Usart2`], base 0x4000_4800): slot 1, F10x-only (the F1x0 has none).
+    Usart2,
+    /// USART0 (HAL [`PeriphLabel::Usart0`], base 0x4001_3800) on its **PB6/PB7** mapping: slot 2, on
+    /// both families (an AF0 mux selection on F1x0, `AFIO_PCF0.USART0_REMAP` on F10x). USART0's
+    /// DEFAULT mapping (PA9/PA10) is the TIMER0 gate set and is refused on both families, so this
+    /// instance means PB6/PB7 and nothing else (see [`crate::pincap::usart_pins`]).
     Usart0,
 }
 
 impl RxInstance {
-    /// The static-slot index for this instance (`RX_SLOTS[..]`).
+    /// The static-slot index for this instance (`RX_SLOTS[..]`, and the [`crate::dma`] contexts).
     #[inline]
     const fn slot_index(self) -> usize {
         match self {
             RxInstance::Usart1 => 0,
-            RxInstance::Module => 1,
+            RxInstance::Usart2 => 1,
             RxInstance::Usart0 => 2,
         }
     }
@@ -139,28 +131,24 @@ impl RxInstance {
     }
 }
 
-/// Resolve a [`PeriphLabel`] selector to a supported [`RxInstance`] for `chip`'s family, fail-loud
-/// otherwise (`uart-rx-multi-instance.md` item 4):
-/// - `Usart1` -> the family-generic first instance.
-/// - `Usart2` on F10x -> the BLE-module instance; on F1x0 -> [`DescriptorError::Unsupported`] (the
-///   module USART is F10x-only; no F1x0 board validates its vector/channel).
-/// - `Usart0` on F1x0 -> the PB6/PB7 instance; on F10x -> [`DescriptorError::Unsupported`] (see
-///   [`RxInstance::Usart0`]: reaching USART0 on a non-gate pin pair needs the AFIO `USART0_REMAP`
-///   field there, which the HAL does not implement).
+/// Resolve a [`PeriphLabel`] selector to a receive instance and its vectors for `chip`'s family,
+/// fail-loud otherwise (`uart-rx-multi-instance.md` item 4). An instance exists on a family exactly
+/// where [`irq::usart_irqs`] names its vectors, so there is no second family table here:
+/// - `Usart0` / `Usart1` -> on both families.
+/// - `Usart2` on F10x -> its instance; on F1x0 -> [`DescriptorError::Unsupported`] (no USART2).
 /// - anything else -> [`DescriptorError::UnknownSelector`].
-fn resolve_instance(chip: &Chip, selector: PeriphLabel) -> Result<RxInstance, DescriptorError> {
-    match selector {
-        PeriphLabel::Usart1 => Ok(RxInstance::Usart1),
-        PeriphLabel::Usart2 => match chip.clock() {
-            ClockPath::F10xRcc => Ok(RxInstance::Module),
-            ClockPath::F1x0Rcu => Err(DescriptorError::Unsupported),
-        },
-        PeriphLabel::Usart0 => match chip.clock() {
-            ClockPath::F1x0Rcu => Ok(RxInstance::Usart0),
-            ClockPath::F10xRcc => Err(DescriptorError::Unsupported),
-        },
-        _ => Err(DescriptorError::UnknownSelector),
-    }
+fn resolve_instance(
+    chip: &Chip,
+    selector: PeriphLabel,
+) -> Result<(RxInstance, irq::UsartIrqs), DescriptorError> {
+    let inst = match selector {
+        PeriphLabel::Usart1 => RxInstance::Usart1,
+        PeriphLabel::Usart2 => RxInstance::Usart2,
+        PeriphLabel::Usart0 => RxInstance::Usart0,
+        _ => return Err(DescriptorError::UnknownSelector),
+    };
+    let irqs = irq::usart_irqs(chip.irq(), selector).ok_or(DescriptorError::Unsupported)?;
+    Ok((inst, irqs))
 }
 
 /// The public RX capability query (`specs/uart-rx-multi-instance.md`, "The public capability
@@ -170,15 +158,12 @@ fn resolve_instance(chip: &Chip, selector: PeriphLabel) -> Result<RxInstance, De
 ///
 /// **Pure** (no register or GPIO access) and answered from the model: it returns exactly
 /// [`resolve_instance`]`.is_ok()`, so it can never drift from what [`BufferedRx::new`] /
-/// [`RingBufferedRx::new`] will actually accept. Today: `Usart1` -> `true` on both families;
-/// `Usart2` -> `true` on F10x, `false` on F1x0 (the module USART is F10x-only); `Usart0` -> `true`
-/// on F1x0, `false` on F10x; every other selector -> `false`.
+/// [`RingBufferedRx::new`] will actually accept: `Usart0` and `Usart1` -> `true` on both families;
+/// `Usart2` -> `true` on F10x, `false` on F1x0 (no USART2); every other selector -> `false`.
 ///
-/// The `Usart0` answer is per-FAMILY because the pin mapping is: USART0's default PA9/PA10 mapping
-/// is the TIMER0 gate set and is refused on both families, so USART0 means its **PB6/PB7** mapping
-/// here. On F1x0 that is a per-pin AF0 mux selection ([`crate::pincap::usart_pins`]) and is
-/// supported; on F10x it needs the global AFIO `USART0_REMAP` field, which [`crate::afio`] does not
-/// implement and no board exercises, so F10x keeps the honest "not yet expressible" `false`.
+/// USART0 means its **PB6/PB7** mapping here (its default PA9/PA10 mapping is the TIMER0 gate set
+/// and is refused on both families): a per-pin AF0 mux selection on F1x0, `AFIO_PCF0.USART0_REMAP`
+/// on F10x ([`crate::pincap::usart_pins`]).
 pub fn supports_rx(chip: &Chip, selector: PeriphLabel) -> bool {
     resolve_instance(chip, selector).is_ok()
 }
@@ -321,17 +306,16 @@ extern "C" fn rx_irq_handler() {
     on_usart_rx_irq(&RX_SLOTS[0]);
 }
 
-/// The registered ISR body for the module USART (slot 1, F10x-only). Reached from the
-/// `module_usart_rx_isr` vector slot through the crate-internal `irq::call_usart_rx_handler2`.
-/// Independent of
-/// [`rx_irq_handler`] so the two instances never touch each other's slot (item 1/2 coexistence).
-extern "C" fn module_rx_irq_handler() {
+/// The registered ISR body for USART2 (slot 1, F10x-only). Reached from the `usart2_rx_isr` vector
+/// slot through the crate-internal `irq::call_usart_rx_handler2`. Independent of
+/// [`rx_irq_handler`] so the instances never touch each other's slot (item 1/2 coexistence).
+extern "C" fn usart2_rx_irq_handler() {
     on_usart_rx_irq(&RX_SLOTS[1]);
 }
 
-/// The registered ISR body for USART0 (slot 2, F1x0-only). Reached from the `usart0_rx_isr` vector
-/// slot through the crate-internal `irq::call_usart_rx_handler3`. Independent of the other two so
-/// no instance touches another's slot (item 1/2 coexistence).
+/// The registered ISR body for USART0 (slot 2, both families). Reached from the `usart0_rx_isr`
+/// vector slot through the crate-internal `irq::call_usart_rx_handler3`. Independent of the other
+/// two so no instance touches another's slot (item 1/2 coexistence).
 extern "C" fn usart0_rx_irq_handler() {
     on_usart_rx_irq(&RX_SLOTS[2]);
 }
@@ -441,48 +425,11 @@ fn install_usart_ctx(regs: &UsartRegs, instance: RxInstance, queue: *mut (), pus
     slot.line_error.store(ERR_NONE, Ordering::Release);
     slot.installed.store(true, Ordering::Release);
     // Register the ISR body for THIS instance's vector (each instance has its own handler pair, so the
-    // two slots never collide). The module USART is F10x-only, so its handler only ever fires there.
+    // slots never collide).
     match instance {
         RxInstance::Usart1 => irq::register_usart_rx_handler(rx_irq_handler),
-        RxInstance::Module => irq::register_usart_rx_handler2(module_rx_irq_handler),
+        RxInstance::Usart2 => irq::register_usart_rx_handler2(usart2_rx_irq_handler),
         RxInstance::Usart0 => irq::register_usart_rx_handler3(usart0_rx_irq_handler),
-    }
-}
-
-/// The USART RX IRQ number for `chip`'s family + `instance`. The vector differs by family for USART1
-/// (28 on F1x0, 38 on F10x) and is the F10x-only module vector (39) for the module instance (the module
-/// USART cannot exist on F1x0, so its IRQ is unconditionally the F10x one). Hardware-build-only (drives
-/// the NVIC).
-#[cfg(not(feature = "mock"))]
-#[inline]
-fn usart_irq_num(chip: &Chip, instance: RxInstance) -> usize {
-    match instance {
-        RxInstance::Usart1 => match chip.irq() {
-            IrqLayout::F1x0Grouped => irq::F1X0_USART1_IRQ,
-            IrqLayout::F10xSeparate => irq::F10X_USART1_IRQ,
-        },
-        // `resolve_instance` only yields `Module` on F10x, so its vector is always the F10x module IRQ.
-        RxInstance::Module => irq::F10X_USART_MODULE_IRQ,
-        // `resolve_instance` only yields `Usart0` on F1x0, so its vector is always the F1x0 one.
-        RxInstance::Usart0 => irq::F1X0_USART0_IRQ,
-    }
-}
-
-/// The DMA-RX IRQ number for `chip`'s family + `instance`. USART1's channel: separate `DMA0_Channel5`
-/// = 16 on F10x, grouped `DMA_Channel3_4` = 11 on F1x0. The module's channel: F10x-only `DMA0_Channel2`
-/// = 13 (`resolve_instance` only yields `Module` on F10x, so its vector is unconditionally that one).
-/// Hardware-build-only (drives the NVIC).
-#[cfg(not(feature = "mock"))]
-#[inline]
-fn dma_irq_num(chip: &Chip, instance: RxInstance) -> usize {
-    match instance {
-        RxInstance::Usart1 => match chip.irq() {
-            IrqLayout::F1x0Grouped => irq::F1X0_DMA_CH3_4_IRQ,
-            IrqLayout::F10xSeparate => irq::F10X_DMA0_CH5_IRQ,
-        },
-        RxInstance::Module => irq::F10X_DMA0_CH2_IRQ,
-        // USART0_RX is DMA Ch2 unremapped, on the grouped F1x0 Ch1/2 vector (F1x0-only, as above).
-        RxInstance::Usart0 => irq::F1X0_DMA_CH1_2_IRQ,
     }
 }
 
@@ -518,7 +465,7 @@ pub struct BufferedRx {
     pop: fn(*mut ()) -> Option<u8>,
     ready: fn(*mut ()) -> bool,
     unclaim: fn(*mut ()),
-    /// This receiver's `'static` RX slot (USART1 or the module USART): `read` / `take_idle` reference
+    /// This receiver's `'static` RX slot (one per USART instance): `read` / `take_idle` reference
     /// it directly, so two `BufferedRx` on different instances never touch each other's state.
     slot: &'static RxSlot,
     /// The consumed RX half, held for [`release`](BufferedRx::release).
@@ -541,9 +488,9 @@ impl BufferedRx {
         instance: PeriphLabel,
         storage: &'static RxRing<N>,
     ) -> Result<BufferedRx, DescriptorError> {
-        // Resolve the instance selector to a slot + vector (fail-loud on F1x0 module / unknown label),
-        // before touching any hardware (`uart-rx-multi-instance.md` item 4).
-        let inst = resolve_instance(chip, instance)?;
+        // Resolve the instance selector to a slot + vectors (fail-loud on F1x0 USART2 / an unknown
+        // label), before touching any hardware (`uart-rx-multi-instance.md` item 4).
+        let (inst, irqs) = resolve_instance(chip, instance)?;
 
         // Exclusivity claim (fail loud): one ring, one receiver. Two receivers pushing into one
         // ring from two ISRs is interleaved corruption; heapless carried this in `&'static mut`,
@@ -565,9 +512,9 @@ impl BufferedRx {
         rx.regs().listen_idle();
 
         // 3. Unmask this instance's USART IRQ in the NVIC (hardware only).
-        let _ = chip;
+        let _ = irqs;
         #[cfg(not(feature = "mock"))]
-        nvic_unmask(usart_irq_num(chip, inst));
+        nvic_unmask(irqs.rx);
 
         Ok(BufferedRx {
             queue,
@@ -679,7 +626,7 @@ pub struct RingBufferedRx {
     /// Monotonic count of bytes the application has consumed (the read cursor). `% len` is the buffer
     /// position; comparing it to `wraps * len + (len - CHxCNT)` detects a lapped (overwritten) cursor.
     cursor: u64,
-    /// This receiver's shared USART RX slot (USART1 or the module): `read` reads its sticky line error,
+    /// This receiver's shared USART RX slot (one per instance): `read` reads its sticky line error,
     /// `take_idle` its IDLE latch. Two `RingBufferedRx` on different instances never touch each other's.
     slot: &'static RxSlot,
     /// This receiver's DMA-RX wrap-counter context index (`crate::dma::wraps`), independent per instance.
@@ -705,9 +652,9 @@ impl RingBufferedRx {
         instance: PeriphLabel,
         dma_buf: &'static mut [u8],
     ) -> Result<RingBufferedRx, DescriptorError> {
-        // Resolve the instance selector to a slot + DMA channel + vectors (fail-loud on F1x0 module /
-        // unknown label) before touching hardware (`uart-rx-multi-instance.md` items 3-4).
-        let inst = resolve_instance(chip, instance)?;
+        // Resolve the instance selector to a slot + DMA channel + vectors (fail-loud on F1x0 USART2 /
+        // an unknown label) before touching hardware (`uart-rx-multi-instance.md` items 3-4).
+        let (inst, irqs) = resolve_instance(chip, instance)?;
 
         let len = dma_buf.len();
         if len == 0 || len > u16::MAX as usize {
@@ -715,12 +662,12 @@ impl RingBufferedRx {
         }
         let buf = dma_buf.as_mut_ptr();
 
-        // 1. Resolve the DMA mapping for this instance: USART1's channel is family-generic; the module's
-        //    is the F10x-only GD `USART2_RX` channel (DMA0 Ch2).
+        // 1. Resolve the DMA mapping for this instance (the channel differs by family for USART1 and
+        //    USART0; USART2 is F10x-only).
         let map = match inst {
             RxInstance::Usart1 => crate::dma::DmaRxMap::usart1_rx(chip),
-            RxInstance::Module => crate::dma::DmaRxMap::module_rx(),
-            RxInstance::Usart0 => crate::dma::DmaRxMap::usart0_rx(),
+            RxInstance::Usart2 => crate::dma::DmaRxMap::usart2_rx(),
+            RxInstance::Usart0 => crate::dma::DmaRxMap::usart0_rx(chip),
         };
 
         // 2. Enable the DMA controller clock.
@@ -761,11 +708,11 @@ impl RingBufferedRx {
         crate::dma::install(&map, inst.slot_index());
 
         // 7. Unmask both the DMA-channel and the USART IRQ for this instance (hardware only).
-        let _ = chip;
+        let _ = irqs;
         #[cfg(not(feature = "mock"))]
         {
-            nvic_unmask(dma_irq_num(chip, inst));
-            nvic_unmask(usart_irq_num(chip, inst));
+            nvic_unmask(irqs.dma_rx);
+            nvic_unmask(irqs.rx);
         }
 
         Ok(RingBufferedRx {
@@ -851,7 +798,7 @@ impl RingBufferedRx {
         // Returns the DISTINCT `LineError` (not `RingOverrun`) so a diagnostic can tell a wire glitch
         // from a slow-consumer lap. A transient line glitch (a peer rebooting / a cable connecting)
         // must not strand an always-on link; a persistent bad line surfaces upstream as `comms_loss`,
-        // never a dead peripheral. Reads THIS instance's shared RX slot (independent of the module's).
+        // never a dead peripheral. Reads THIS instance's shared RX slot (independent of the others).
         if self.slot.line_error.swap(ERR_NONE, Ordering::AcqRel) != ERR_NONE {
             let (wraps, rem) = self.snapshot();
             let write_total = wraps as u64 * self.len as u64 + (self.len as u64 - rem as u64);
@@ -957,8 +904,8 @@ impl RingBufferedRx {
     }
 }
 
-/// Reset every static RX slot and both registered handlers (host-test teardown between cases). Both
-/// instances' slots are reset so a case that installed the module slot cannot leak into the next.
+/// Reset every static RX slot and every registered handler (host-test teardown between cases), so a
+/// case that installed one instance cannot leak into the next.
 #[cfg(feature = "mock")]
 pub fn reset_for_test() {
     for slot in &RX_SLOTS {
@@ -973,6 +920,7 @@ pub fn reset_for_test() {
     }
     irq::clear_usart_rx_handler();
     irq::clear_usart_rx_handler2();
+    irq::clear_usart_rx_handler3();
 }
 
 #[cfg(test)]

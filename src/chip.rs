@@ -205,7 +205,7 @@ impl Chip {
     /// by whichever configure seam consumes the handle.
     ///
     /// PA13 (SWDIO) and PA14 (SWCLK) are refused with [`DescriptorError::SwdPin`] before the port is
-    /// clocked ([`crate::pincap::check_not_swd`]): a pin handle can be reconfigured with no further
+    /// clocked (`pincap::check_not_swd`): a pin handle can be reconfigured with no further
     /// check ([`Pin::into_push_pull_output`]), so the refusal belongs where the handle is made.
     #[cfg_attr(runtime_hal_nightly, optimize(size))]
     pub fn pin(&self, packed: u8) -> Result<Pin<Input<Floating>>, DescriptorError> {
