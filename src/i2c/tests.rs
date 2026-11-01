@@ -708,7 +708,7 @@ fn timeout_maps_to_other() {
 
 // --- warm-reset bus-clear sequencer (round-10 hang) -------------------------------------------
 //
-// The bit-bang itself is silicon-only; the DECISION LOGIC (only-if-needed, the pulse bound, the
+// The bit-bang's timing is silicon-only; the DECISION LOGIC (only-if-needed, the pulse bound, the
 // early-stop, the trailing STOP) is pure and host-tested here through `bus_clear_seq` with recording
 // closures. Levels: `drive_*(true)` releases the line, `drive_*(false)` drives it low.
 
@@ -810,6 +810,177 @@ fn bus_clear_generates_a_trailing_stop_after_recovery() {
         vec![Ev::Scl(true), Ev::Sda(false), Ev::Sda(true)],
         "STOP = SDA low->high while SCL is high: {ev:?}"
     );
+}
+
+// --- the bus clear through the gpio surface (`specs/i2c-bus-clear.md`) -------------------------
+//
+// The same sequencer, now driven through the real gpio calls on the host backend, with the GPIOB
+// writes logged in order. The space keeps only each register's last value; the log is what shows
+// whether a pin's output latch was set before the pin became an output. SDA's level is the GPIOB
+// input register, seeded high for a clean bus and left 0 for a slave that never releases.
+
+/// The GPIOB register offsets the bus clear touches, per register model: (BOP, CTL, ISTAT).
+fn gpio_regs(path: GpioPath) -> (u32, u32, u32) {
+    match path {
+        GpioPath::ApbCrlCrh => (0x10, 0x00, 0x08),
+        GpioPath::AhbCtlAfsel => (0x18, 0x00, 0x10),
+    }
+}
+
+/// Whether a write of `value` to the mode register at `off` makes PB6 or PB7 a GPIO open-drain
+/// output (F10x nibble 0x7 in CTL0; F1x0 output mode 1 in CTL).
+fn makes_output(path: GpioPath, off: u32, value: u32) -> bool {
+    let (_, ctl, _) = gpio_regs(path);
+    if off != ctl {
+        return false;
+    }
+    match path {
+        GpioPath::ApbCrlCrh => [6, 7].iter().any(|n| (value >> (4 * n)) & 0xF == 0x7),
+        GpioPath::AhbCtlAfsel => [6, 7].iter().any(|n| (value >> (2 * n)) & 0x3 == 1),
+    }
+}
+
+/// Arm the GPIOB write log.
+fn log_gpiob() {
+    mock::log_writes(GPIOB_BASE, GPIOB_BASE + 0x400);
+}
+
+/// The logged GPIOB writes as (offset, value).
+fn gpiob_writes() -> Vec<(u32, u32)> {
+    mock::writes()
+        .into_iter()
+        .map(|(a, v)| (a - GPIOB_BASE, v))
+        .collect()
+}
+
+/// SDA (PB7) reads high: the slave is not holding the bus.
+fn seed_sda_high(path: GpioPath) {
+    let (_, _, istat) = gpio_regs(path);
+    Reg32::new(GPIOB_BASE, istat).write(1 << 7);
+}
+
+#[test]
+fn bus_clear_before_claim_sets_both_latches_high_before_either_pin_is_an_output() {
+    for path in [GpioPath::ApbCrlCrh, GpioPath::AhbCtlAfsel] {
+        let (bop, _, _) = gpio_regs(path);
+        for clean in [true, false] {
+            let _g = seed_reset();
+            if clean {
+                seed_sda_high(path);
+            }
+            log_gpiob();
+            let _dev = new_on(&chip_for(path), 100_000, FastDuty::Two);
+            let log = gpiob_writes();
+
+            let first_output = log
+                .iter()
+                .position(|&(off, v)| makes_output(path, off, v))
+                .expect("the bus clear makes the pins outputs");
+            let set_before = |bit: u32| {
+                log[..first_output]
+                    .iter()
+                    .any(|&(off, v)| off == bop && v & (1 << bit) != 0)
+            };
+            assert!(set_before(6), "{path:?}: SCL latch high before any output");
+            assert!(set_before(7), "{path:?}: SDA latch high before any output");
+
+            // No low level before the sequencer: every BOP write ahead of its first edge is a set.
+            // On a clean bus there is no low level at all (no pulses, no STOP).
+            let first_low = log.iter().position(|&(off, v)| off == bop && v >> 16 != 0);
+            match (clean, first_low) {
+                (true, None) => {}
+                (false, Some(i)) => assert!(
+                    i > first_output,
+                    "{path:?}: the first low drive is the sequencer's, after the pins are outputs"
+                ),
+                other => panic!("{path:?}: clean={clean}, first low drive {other:?}: {log:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn bus_clear_on_a_clean_bus_issues_no_pulses_and_reprograms_the_block_as_new_leaves_it() {
+    let _g = seed_reset();
+    seed_sda_high(GpioPath::ApbCrlCrh);
+    let mut dev = brought_up();
+    let regs = [CTL0, CTL1, SADDR0, CKCFG, RT];
+    let after_new: Vec<u32> = regs.iter().map(|&o| r(o)).collect();
+    // The register values the bring-up test asserts, so the comparison is against a known state.
+    assert_eq!(after_new, [CTL0_I2CEN | CTL0_ACKEN, 0x24, 0x24, 0xB4, 0x25]);
+    let pins_after_new = gb(0x00);
+
+    // Scramble the block so the reprogramming is observable.
+    for &o in &regs {
+        w(o, 0);
+    }
+    w(CTL0, CTL0_START | CTL0_POAP);
+    log_gpiob();
+
+    assert_eq!(dev.bus_clear(), Ok(()));
+    let after_clear: Vec<u32> = regs.iter().map(|&o| r(o)).collect();
+    assert_eq!(
+        after_clear, after_new,
+        "reprogrammed exactly as new leaves it"
+    );
+    assert_eq!(gb(0x00), pins_after_new, "SCL/SDA back on AF open-drain");
+    let (bop, _, _) = gpio_regs(GpioPath::ApbCrlCrh);
+    assert!(
+        !gpiob_writes()
+            .iter()
+            .any(|&(off, v)| off == bop && v >> 16 != 0),
+        "a clean bus drives neither line low: {:?}",
+        gpiob_writes()
+    );
+}
+
+#[test]
+fn bus_clear_with_a_slave_that_never_releases_is_bus_held() {
+    let _g = seed_reset();
+    let mut dev = brought_up();
+    w(CKCFG, 0);
+    log_gpiob();
+
+    assert_eq!(dev.bus_clear(), Err(I2cError::BusHeld));
+    assert_eq!(I2cError::BusHeld.kind(), ErrorKind::Bus);
+    let (bop, _, _) = gpio_regs(GpioPath::ApbCrlCrh);
+    let scl_pulses = gpiob_writes()
+        .iter()
+        .filter(|&&(off, v)| off == bop && v & (1 << (6 + 16)) != 0)
+        .count();
+    assert_eq!(
+        scl_pulses as u32, BUS_CLEAR_MAX_PULSES,
+        "the full pulse bound"
+    );
+    let ctl0 = gb(0x00);
+    assert_eq!((ctl0 >> 24) & 0xF, 0xF, "SCL back on AF open-drain");
+    assert_eq!((ctl0 >> 28) & 0xF, 0xF, "SDA back on AF open-drain");
+    assert_eq!(
+        r(CKCFG),
+        0xB4,
+        "the block is reprogrammed on a held bus too"
+    );
+}
+
+#[test]
+fn i2c_error_codes_are_distinct_and_never_a_descriptor_code() {
+    let all = [
+        I2cError::Bus,
+        I2cError::ArbitrationLoss,
+        I2cError::NoAcknowledgeAddress,
+        I2cError::NoAcknowledgeData,
+        I2cError::Overrun,
+        I2cError::Timeout,
+        I2cError::Other,
+        I2cError::BusHeld,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        assert_ne!(a.code() & 0x80, 0, "{a:?}: high bit set");
+        for b in &all[i + 1..] {
+            assert_ne!(a.code(), b.code(), "{a:?} and {b:?} share a code");
+        }
+    }
+    assert_eq!(I2cError::BusHeld.code(), 0x88);
 }
 
 // --- the control-loop blocking bound (the 16 ms demand-stale coast) ---------------------------
