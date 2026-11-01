@@ -82,7 +82,7 @@ pub use adc::{
     TriggeredAdc,
 };
 pub use addr::{AddrTable, PeriphLabel};
-pub use chip::Chip;
+pub use chip::{Chip, UniqueId};
 pub use clock::{
     clear_reset_flags, configure_tree, configure_tree_timeout, enable_adc, enable_general_timer,
     enable_gpio_port, enable_i2c, enable_lsi, enable_spi, enable_timer, enable_usart, reset_cause,

@@ -41,6 +41,13 @@
 //!   so `f10x_probe == 0` = not-run), `gpioa_base == 0x4800_0000`, `gpio == AhbCtlAfsel(1)`,
 //!   `clock == F1x0Rcu(1)`, `adc_count == 1`, `adv_timers == 1` (measured), `flash_page == K1(0)`,
 //!   `no_family == 0`, `magic == MAGIC`.
+//!
+//! # The unique ID (`specs/unique-id.md`)
+//!
+//! After detect, `unique_id` (offset `0x18`) holds `chip.unique_id()`, the three factory-ID words in
+//! address order. On both boards it must equal an SWD read of the family's signature block on the
+//! same part: `0x1FFF_F7AC` (3 words) on the F130, `0x1FFF_F7E8` (3 words) on the F103. It stays
+//! zero if the probe matched no family.
 
 #![no_std]
 #![no_main]
@@ -51,7 +58,7 @@ use panic_halt as _;
 use runtime_hal::detect::probe::{self, F10X_GPIOA_BASE, F1X0_GPIOA_BASE};
 // `Family` / `synthesize` come from the crate-root re-export gated behind the `detect-internals`
 // feature (enabled in this crate's Cargo.toml), not the `detect` module path.
-use runtime_hal::{synthesize, Chip, ClockPath, Family, GpioPath, PageSize};
+use runtime_hal::{synthesize, Chip, ClockPath, Family, GpioPath, PageSize, UniqueId};
 
 /// The probe-record sentinels for a per-candidate probe field (`f1x0_probe` / `f10x_probe`).
 mod probe_code {
@@ -96,7 +103,12 @@ struct DetectResult {
     syn_flash_page: u8,
     /// `FLASH_DENSITY[15:0]` read at 0x1FFF_F7E0 (KiB of flash; the F10x page-size cross-check).
     flash_density: u16,
+    /// `chip.unique_id()`: the three factory-ID words in address order, at offset 0x18.
+    unique_id: [u32; 3],
 }
+
+// The SWD reader indexes the ID by this offset (module doc).
+const _: () = assert!(core::mem::offset_of!(DetectResult, unique_id) == 0x18);
 
 /// The magic value written last once the whole run completed.
 const MAGIC: u32 = 0x4DF7_0B1E;
@@ -125,6 +137,7 @@ const INIT_RESULT: DetectResult = DetectResult {
     syn_adv_timers: 0,
     syn_flash_page: 0xFF,
     flash_density: 0,
+    unique_id: [0; 3],
 };
 
 // --- entry -------------------------------------------------------------------------------------
@@ -184,6 +197,10 @@ fn main() -> ! {
             let density =
                 unsafe { core::ptr::read_volatile(runtime_hal::FLASH_DENSITY_ADDR as *const u32) };
             store_u16(StructField::FlashDensity, (density & 0xFFFF) as u16);
+
+            // The factory unique ID, read through the HAL from the family's signature block. The
+            // SWD reader compares it against a direct read of that block on the same part.
+            store_unique_id(chip.unique_id());
         }
         None => {
             // NoFamily (neither candidate matched): fail safe. Record no_family so the human sees the
@@ -267,6 +284,11 @@ fn store_u32(field: StructField, val: u32) {
             _ => unreachable!(),
         }
     }
+}
+
+fn store_unique_id(id: UniqueId) {
+    // SAFETY: as above.
+    unsafe { core::ptr::addr_of_mut!((*result_ptr()).unique_id).write_volatile(id.0) }
 }
 
 fn store_u16(field: StructField, val: u16) {

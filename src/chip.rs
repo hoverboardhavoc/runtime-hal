@@ -23,6 +23,7 @@ use crate::gpio::{
     PortDPins, PortFPins, PortPins,
 };
 use crate::pincap::PinClaim;
+use crate::reg::Reg32;
 
 /// The chip context: built once from the parsed descriptor, it resolves a [`PeriphLabel`] to a base
 /// and carries the register-model selectors and the RCU base. This is the descriptor's chip-only
@@ -30,6 +31,23 @@ use crate::pincap::PinClaim;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chip {
     desc: McuDescriptor,
+}
+
+/// The 96-bit factory unique device ID: `UNIQUE_ID[31:0]`, `[63:32]`, `[95:64]`, in address order.
+/// Read by [`Chip::unique_id`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniqueId(pub [u32; 3]);
+
+impl UniqueId {
+    /// The 12 bytes as they sit in memory (each word little-endian, words in address order), the
+    /// order an SWD byte dump of the region shows.
+    pub const fn to_bytes(self) -> [u8; 12] {
+        let [a, b, c] = self.0;
+        let (a, b, c) = (a.to_le_bytes(), b.to_le_bytes(), c.to_le_bytes());
+        [
+            a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], c[0], c[1], c[2], c[3],
+        ]
+    }
 }
 
 impl Chip {
@@ -303,6 +321,30 @@ impl Chip {
     #[inline]
     pub const fn flash_size_bytes(&self) -> u32 {
         (self.desc.flash_kib as u32) * 1024
+    }
+
+    /// Read the unique ID from the family's signature block: three 32-bit reads, every call.
+    ///
+    /// The block's base is [`PeriphLabel::UniqueId`] in the address table, which every family model
+    /// populates, so a detected chip always resolves it. The manuals require word access ("This
+    /// register has to be accessed by word (32-bit)"), so each word is one [`Reg32`] read. Not
+    /// stored in the descriptor: a caller that wants it once keeps the returned value.
+    ///
+    /// # Panics
+    ///
+    /// Only on a hand-built descriptor whose table lacks the `UniqueId` base; no family model or
+    /// `synthesize` output can produce one.
+    pub fn unique_id(&self) -> UniqueId {
+        let base = self
+            .desc
+            .addrs
+            .get(PeriphLabel::UniqueId)
+            .expect("every family model populates the UniqueId base");
+        UniqueId([
+            Reg32::new(base, 0x0).read(),
+            Reg32::new(base, 0x4).read(),
+            Reg32::new(base, 0x8).read(),
+        ])
     }
 
     /// Advanced-timer count capability (1 or 2).
@@ -587,6 +629,49 @@ mod tests {
     const RCU_BASE: u32 = 0x4002_1000;
     const RCU_APB2EN: u32 = 0x18;
     const AFIO_PCF0: u32 = 0x4001_0004;
+
+    /// The rover master's (F103) unique ID as an SWD byte dump of `0x1FFF_F7E8` shows it
+    /// (`specs/unique-id.md`), and the three words those bytes are.
+    const ROVER_MASTER_BYTES: [u8; 12] = [
+        0x8a, 0xdc, 0x39, 0x32, 0x33, 0x35, 0x38, 0x12, 0x55, 0x34, 0x33, 0x33,
+    ];
+    const ROVER_MASTER_WORDS: [u32; 3] = [0x3239_dc8a, 0x1238_3533, 0x3333_3455];
+
+    #[test]
+    fn unique_id_to_bytes_is_the_swd_dump_order() {
+        assert_eq!(UniqueId(ROVER_MASTER_WORDS).to_bytes(), ROVER_MASTER_BYTES);
+    }
+
+    #[test]
+    fn unique_id_reads_three_words_at_the_family_base_and_nothing_else() {
+        // The offroad slave's (F130) words for the F1x0 case, the rover master's for the F10x.
+        let offroad_slave = [0x3939_ce51, 0x0137_3333, 0x3937_3134];
+        for (desc, base, words) in [
+            (descriptor_f130(), 0x1FFF_F7AC, offroad_slave),
+            (descriptor_f103(), 0x1FFF_F7E8, ROVER_MASTER_WORDS),
+        ] {
+            let _g = mock::lock();
+            mock::reset();
+            for (i, w) in words.iter().enumerate() {
+                Reg32::new(base, 4 * i as u32).write(*w);
+            }
+            let chip = Chip::from_descriptor(desc);
+            // Every read anywhere in the space: exactly three.
+            mock::watch_reads(0, u32::MAX);
+            assert_eq!(chip.unique_id(), UniqueId(words));
+            assert_eq!(mock::read_count(), 3);
+            // And all three inside the 12-byte block.
+            mock::watch_reads(base, base + 12);
+            assert_eq!(chip.unique_id(), UniqueId(words));
+            assert_eq!(mock::read_count(), 3);
+            // Read-only: the block is unchanged, and nothing was written either side of it.
+            for (i, w) in words.iter().enumerate() {
+                assert_eq!(Reg32::new(base, 4 * i as u32).read(), *w);
+            }
+            assert_eq!(Reg32::new(base - 4, 0).read(), 0);
+            assert_eq!(Reg32::new(base + 12, 0).read(), 0);
+        }
+    }
 
     #[test]
     fn gpio_selector_matches_the_descriptor() {
