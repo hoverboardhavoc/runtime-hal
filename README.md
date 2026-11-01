@@ -1,5 +1,10 @@
 # runtime-hal
 
+> **Abandoned (2026-11-02).** This crate is no longer developed or used. The hoverboard firmware
+> moved to a compile-time HAL with one image per chip, `motorcontroller/hal` in
+> [hoverboard-firmware](https://github.com/hoverboardhavoc/hoverboard-firmware/tree/main/motorcontroller/hal)
+>. Nothing here receives fixes; the code stays as a reference.
+
 > ⚠️ **Work in progress, not properly tested.** Beware of
 > [shoot-through](https://en.wikipedia.org/wiki/Shoot-through): a bug in the dead-time or hot path can
 > turn both FETs of a half-bridge on at once, shorting the DC bus and destroying FETs (and possibly the
