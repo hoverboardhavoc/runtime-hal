@@ -162,6 +162,14 @@ pub mod backend {
     /// Reads observed inside [`WATCHED`] since the last [`mock::reset`].
     static WATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
+    /// A half-open address RANGE whose WRITES are recorded in order, packed `(lo << 32) | hi`.
+    /// `u64::MAX` = none. The space keeps only each register's last value, which cannot show the
+    /// order a driver wrote in (a pin's output latch set before or after its mode); the log can.
+    /// Reset clears it.
+    static LOGGED: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// The writes observed inside [`LOGGED`], `(addr, value)` in program order.
+    static WRITE_LOG: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
     /// A single address whose READS hand back a counting ramp instead of the stored value
     /// (`u64::MAX` = none), with [`RAMP_NEXT`] the value the next read of it yields. A data
     /// register that returns a constant cannot tell a right store DESTINATION from a wrong one:
@@ -192,6 +200,22 @@ pub mod backend {
         let (lo, hi) = ((w >> 32) as u32, w as u32);
         if addr >= lo && addr < hi {
             WATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a write if `addr` falls in the logged range.
+    #[inline]
+    fn note_write(addr: u32, value: u32) {
+        let w = LOGGED.load(Ordering::Relaxed);
+        if w == u64::MAX {
+            return;
+        }
+        let (lo, hi) = ((w >> 32) as u32, w as u32);
+        if addr >= lo && addr < hi {
+            WRITE_LOG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((addr, value));
         }
     }
 
@@ -266,6 +290,7 @@ pub mod backend {
     /// Write a 16-bit little-endian value to the mock register backing store.
     #[inline]
     pub fn write16(addr: u32, value: u16) {
+        note_write(addr, value as u32);
         if addr as u64 == FROZEN.load(Ordering::Relaxed) {
             return; // non-responsive register: the write does not stick
         }
@@ -297,6 +322,7 @@ pub mod backend {
     /// Write a 32-bit little-endian value to the mock register backing store.
     #[inline]
     pub fn write32(addr: u32, value: u32) {
+        note_write(addr, value);
         if addr as u64 == FROZEN.load(Ordering::Relaxed) {
             return; // non-responsive register: the write does not stick
         }
@@ -313,8 +339,8 @@ pub mod backend {
     /// Test helpers for the backing map.
     pub mod mock {
         use super::{
-            FROZEN, RAMP, RAMP_NEXT, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS, WATCHED,
-            WATCH_COUNT,
+            FROZEN, LOGGED, RAMP, RAMP_NEXT, READ_CLEARS, SPACE, TEST_SERIAL, W1C_PAIRS, WATCHED,
+            WATCH_COUNT, WRITE_LOG,
         };
         use std::sync::atomic::Ordering;
         use std::sync::MutexGuard;
@@ -330,6 +356,19 @@ pub mod backend {
         /// Reads observed at the [`watch_reads`] address since it was armed.
         pub fn read_count() -> u64 {
             WATCH_COUNT.load(Ordering::Relaxed)
+        }
+
+        /// Record every write in `[lo, hi)` from now on, in order, emptying the log. One logged
+        /// range at a time. Lets a test assert the ORDER of a driver's writes, which the space's
+        /// last-value-per-register cannot show. Cleared by [`reset`].
+        pub fn log_writes(lo: u32, hi: u32) {
+            WRITE_LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            LOGGED.store(((lo as u64) << 32) | hi as u64, Ordering::Relaxed);
+        }
+
+        /// The writes recorded since [`log_writes`] armed the log, `(addr, value)` in order.
+        pub fn writes() -> Vec<(u32, u32)> {
+            WRITE_LOG.lock().unwrap_or_else(|e| e.into_inner()).clone()
         }
 
         /// Make every READ of `addr` hand back a counting value starting at `start` instead of the
@@ -379,7 +418,8 @@ pub mod backend {
         }
 
         /// Zero the whole simulated register space (call at the start of a test case). Also clears
-        /// any frozen (non-responsive) word, any armed read ramp, every registered device rule, and
+        /// any frozen (non-responsive) word, any armed read ramp, the write log, every registered
+        /// device rule, and
         /// the [`crate::usart::Usart::new`] bring-up claims (a fresh space is a fresh boot).
         pub fn reset() {
             FROZEN.store(u64::MAX, Ordering::Relaxed);
@@ -387,6 +427,8 @@ pub mod backend {
             RAMP_NEXT.store(0, Ordering::Relaxed);
             WATCHED.store(u64::MAX, Ordering::Relaxed);
             WATCH_COUNT.store(0, Ordering::Relaxed);
+            LOGGED.store(u64::MAX, Ordering::Relaxed);
+            WRITE_LOG.lock().unwrap_or_else(|e| e.into_inner()).clear();
             READ_CLEARS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

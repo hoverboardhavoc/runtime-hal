@@ -95,8 +95,9 @@ use embedded_hal::i2c::{self, Operation, SevenBitAddress};
 use crate::addr::PeriphLabel;
 use crate::chip::Chip;
 use crate::clock::ClockConfig;
+use crate::descriptor::GpioPath;
 use crate::error::{DescriptorError, I2cError};
-use crate::gpio::{configure_af, Pin, PinRole};
+use crate::gpio::{configure_af, configure_output_od, read_pin, set_pin, Pin, PinRole};
 use crate::reg::Reg32;
 
 // --- register offsets (identical on both families) --------------------------------------------
@@ -391,6 +392,52 @@ pub struct I2c {
     /// transfer that acquires the bus (`fresh`); a repeated-START continuation keeps counting down
     /// the same one, so a whole `write_read` is bounded, not each of its two halves separately.
     txn_left: Cell<u32>,
+    /// The SCL/SDA pins `new` consumed, kept so [`I2c::bus_clear`] can take them back from the
+    /// peripheral and clear the bus again without a reset.
+    pins: BusPins,
+    /// The bus-clear settle between edges, in core cycles (a ~100 kHz half-period at the bring-up
+    /// core clock, `sysclk / 200_000`).
+    settle_cycles: u32,
+}
+
+/// The SCL/SDA pins an [`I2c`] owns, as the gpio surface addresses them (port base, register-model
+/// path, logical pin byte). Taken from the consumed [`Pin`] handles at bring-up.
+#[derive(Debug, Clone, Copy)]
+struct BusPins {
+    path: GpioPath,
+    scl_base: u32,
+    scl: u8,
+    sda_base: u32,
+    sda: u8,
+}
+
+impl BusPins {
+    fn of<S, D>(scl: &Pin<S>, sda: &Pin<D>) -> Self {
+        BusPins {
+            path: scl.path(),
+            scl_base: scl.port_base(),
+            scl: scl.pin(),
+            sda_base: sda.port_base(),
+            sda: sda.pin(),
+        }
+    }
+
+    /// SCL/SDA as AF open-drain with pull-up ([`PinRole::I2cAfOpenDrain`]): the peripheral owns
+    /// the bus from here.
+    fn claim_af(&self) {
+        configure_af(self.scl_base, self.path, self.scl, PinRole::I2cAfOpenDrain);
+        configure_af(self.sda_base, self.path, self.sda, PinRole::I2cAfOpenDrain);
+    }
+}
+
+/// Busy-wait `cycles` core cycles between two bus-clear edges. The host has no bus to time, so
+/// the host build waits for nothing and the edge order is what its tests observe.
+#[inline(always)]
+fn settle(cycles: u32) {
+    #[cfg(target_arch = "arm")]
+    cortex_m::asm::delay(cycles);
+    #[cfg(not(target_arch = "arm"))]
+    let _ = cycles;
 }
 
 /// The master own-address value programmed into `SADDR0` (the bench probe's `0x24`). As a
@@ -418,7 +465,6 @@ const BUS_CLEAR_MAX_PULSES: u32 = 9;
 /// [`read_pin`](crate::gpio)); this function pokes no registers itself (SPEC: no ad-hoc register access
 /// from the I2C module, route through the HAL gpio surface). `drive_*(true)` RELEASES the open-drain
 /// line (high-Z, pulled up); `drive_*(false)` drives it low.
-#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
 fn bus_clear_seq(
     mut read_sda: impl FnMut() -> bool,
     mut drive_scl: impl FnMut(bool),
@@ -507,23 +553,16 @@ impl I2c {
         //     (imu_configured=0; POR-cleared only). BEFORE the peripheral claims the pins, clock the
         //     stuck slave out and STOP, as a GPIO-level bit-bang through the HAL's own gpio surface
         //     (open-drain drive + level read), NOT a raw-I2C probe. A clean bus (SDA already high) is a
-        //     no-op (only-if-needed), so this is harmless on every boot and on both families.
-        Self::bus_clear_before_claim(&scl, &sda, clock);
+        //     no-op (only-if-needed), so this is harmless on every boot and on both families. A bus
+        //     still held afterwards is not an error here: the owner's first transfer finds it, and
+        //     [`I2c::bus_clear`] is the owner's second attempt.
+        let pins = BusPins::of(&scl, &sda);
+        let settle_cycles = (clock.sysclk_hz / 200_000).max(1);
+        let _ = Self::bus_clear_before_claim(&pins, settle_cycles);
 
-        // 3. SCL/SDA as AF open-drain with pull-up. Take the resolved port base + register-model path
-        //    + logical pin byte straight from each consumed Pin; the application never built them.
-        configure_af(
-            scl.port_base(),
-            scl.path(),
-            scl.pin(),
-            PinRole::I2cAfOpenDrain,
-        );
-        configure_af(
-            sda.port_base(),
-            sda.path(),
-            sda.pin(),
-            PinRole::I2cAfOpenDrain,
-        );
+        // 3. SCL/SDA as AF open-drain with pull-up. The resolved port base + register-model path +
+        //    logical pin byte come straight from each consumed Pin; the application never built them.
+        pins.claim_af();
 
         // 4. Timing + mode + enable + ACK.
         let pclk1 = i2c_input_clock(clock);
@@ -534,6 +573,8 @@ impl I2c {
             poll_budget: poll_budget(clock.sysclk_hz),
             idle_budget: idle_budget(clock.sysclk_hz),
             txn_left: Cell::new(0),
+            pins,
+            settle_cycles,
         };
         dev.configure_timing(timing);
         dev.configure_mode_addr(MASTER_OWN_ADDR);
@@ -544,37 +585,61 @@ impl I2c {
         Ok(dev)
     }
 
-    /// Run the warm-reset bus-clear on the SCL/SDA pins BEFORE the peripheral claims them (hardware).
+    /// Run the bus clear again on the pins this `I2c` owns, for an owner whose transfer failed at
+    /// bring-up (`specs/i2c-bus-clear.md`): the pins back to GPIO open-drain, [`bus_clear_seq`],
+    /// the pins back to AF open-drain, then the peripheral's SRESET and the timing, mode, enable
+    /// and acknowledge programming [`I2c::new`] does.
     ///
-    /// Configures both pins as general-purpose OPEN-DRAIN outputs through the HAL gpio surface, then
-    /// runs [`bus_clear_seq`] with closures bound to `set_pin` / `read_pin` and a ~100 kHz busy-wait
-    /// settle (half-period = `sysclk / 200_000` cycles). No raw register access lives here: the drive
-    /// and level-read go through the gpio module. A clean bus issues zero pulses. The pins are left as
-    /// open-drain outputs; the caller's [`configure_af`] immediately re-claims them as AF open-drain.
-    #[cfg(target_arch = "arm")]
+    /// `Err(`[`I2cError::BusHeld`]`)` when SDA still reads low after the sequencer; the peripheral
+    /// is reprogrammed either way.
     #[cfg_attr(runtime_hal_nightly, optimize(size))]
-    fn bus_clear_before_claim<S, D>(scl: &Pin<S>, sda: &Pin<D>, clock: &ClockConfig) {
-        let (scl_base, path, scl_pin) = (scl.port_base(), scl.path(), scl.pin());
-        let (sda_base, sda_pin) = (sda.port_base(), sda.pin());
-        // Both bus pins as open-drain outputs with the internal pull-up (F1x0; F10x relies on the
-        // board's external I2C pull-up). Idle level is high (released) once driven high below.
-        crate::gpio::configure_output_od(scl_base, path, scl_pin, true);
-        crate::gpio::configure_output_od(sda_base, path, sda_pin, true);
-        // ~100 kHz half-period in CPU cycles for the busy-wait settle between edges.
-        let half = (clock.sysclk_hz / 200_000).max(1);
-        bus_clear_seq(
-            || crate::gpio::read_pin(sda_base, path, sda_pin),
-            |high| crate::gpio::set_pin(scl_base, path, scl_pin, high),
-            |high| crate::gpio::set_pin(sda_base, path, sda_pin, high),
-            || cortex_m::asm::delay(half),
-        );
+    pub fn bus_clear(&mut self) -> Result<(), I2cError> {
+        let released = Self::bus_clear_before_claim(&self.pins, self.settle_cycles);
+        self.pins.claim_af();
+        self.soft_reset_reinit();
+        if released {
+            Ok(())
+        } else {
+            Err(I2cError::BusHeld)
+        }
     }
 
-    /// Host stub for [`bus_clear_before_claim`]: the bit-bang needs real silicon + timing, so on the
-    /// host it is a no-op (the `new` host tests still exercise the AF-config path). The sequencer
-    /// logic is host-tested directly via [`bus_clear_seq`].
-    #[cfg(not(target_arch = "arm"))]
-    fn bus_clear_before_claim<S, D>(_scl: &Pin<S>, _sda: &Pin<D>, _clock: &ClockConfig) {}
+    /// Run the bus clear on the SCL/SDA pins BEFORE the peripheral claims them.
+    ///
+    /// Sets both output latches HIGH first, then configures both pins as general-purpose OPEN-DRAIN
+    /// outputs through the HAL gpio surface, then runs [`bus_clear_seq`] with closures bound to
+    /// `set_pin` / `read_pin` and a ~100 kHz busy-wait settle. The latch goes first because
+    /// `configure_output_od` does not preset it, and after a warm reset it is 0: a pin made an
+    /// output with its latch low drives the line low at once, so the slave would see an SCL edge,
+    /// then a STOP-like SDA edge, before the clean-bus check. With the latch high the pins come up
+    /// released and the first edge on the bus is the sequencer's own.
+    ///
+    /// No raw register access lives here: the drive and level-read go through the gpio module. A
+    /// clean bus issues zero pulses. The pins are left as open-drain outputs, released; the caller
+    /// re-claims them as AF open-drain. Returns whether SDA reads high (released) at the end.
+    #[cfg_attr(runtime_hal_nightly, optimize(size))]
+    fn bus_clear_before_claim(pins: &BusPins, settle_cycles: u32) -> bool {
+        let BusPins {
+            path,
+            scl_base,
+            scl,
+            sda_base,
+            sda,
+        } = *pins;
+        set_pin(scl_base, path, scl, true);
+        set_pin(sda_base, path, sda, true);
+        // Both bus pins as open-drain outputs with the internal pull-up (F1x0; F10x relies on the
+        // board's external I2C pull-up).
+        configure_output_od(scl_base, path, scl, true);
+        configure_output_od(sda_base, path, sda, true);
+        bus_clear_seq(
+            || read_pin(sda_base, path, sda),
+            |high| set_pin(scl_base, path, scl, high),
+            |high| set_pin(sda_base, path, sda, high),
+            || settle(settle_cycles),
+        );
+        read_pin(sda_base, path, sda)
+    }
 
     /// Program CTL1 I2CCLK, RT, then CKCFG, exactly as `i2c_clock_config` does (CTL1 via a
     /// clear-then-set of the I2CCLK field; RT and CKCFG are written directly, CKCFG from its reset

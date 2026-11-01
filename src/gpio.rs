@@ -590,9 +590,9 @@ fn configure_output_f1x0(port_base: u32, n: u32) {
 /// - F1x0 (CTL/OMODE/OSPD/PUD): `CTL` = output (`1`), `OMODE` = open-drain (`1`), `OSPD` = 50 MHz
 ///   (`3`), and `PUD` = pull-up (`01`) when `pull_up`, else floating (`gd32f1x0_gpio.c`).
 ///
-/// Bound by the arm-only I2C bus-clear (and the gpio host tests); on a non-arm lib build it is
-/// unreferenced, so allow dead code there (the same shape the other arm-only helpers use).
-#[cfg_attr(not(target_arch = "arm"), allow(dead_code))]
+/// It does NOT preset the output latch: a pin whose latch reads 0 (the reset value) drives low the
+/// moment it becomes an output. A caller that must not glitch the line sets the latch high with
+/// [`set_pin`] first, as the I2C bus clear does.
 #[cfg_attr(runtime_hal_nightly, optimize(size))]
 pub(crate) fn configure_output_od(port_base: u32, path: GpioPath, pin: u8, pull_up: bool) {
     let n = (pin & 0x0F) as u32;

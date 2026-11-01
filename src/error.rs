@@ -179,15 +179,38 @@ pub enum I2cError {
     Overrun,
     /// A polled handshake did not complete within its bound (the F130 hang-if-done-wrong class).
     Timeout,
+    /// The bus clear ([`crate::i2c::I2c::bus_clear`]) ran and SDA still read low: a slave holds
+    /// the data line through the clock pulses and the STOP.
+    BusHeld,
     /// An error the kind mapping does not name specifically.
     Other,
+}
+
+impl I2cError {
+    /// A fixed one-byte number per variant, for a consumer that reports the failure in a byte (the
+    /// hoverboard firmware's `board.status`). The high bit is set on every one, so a byte that can
+    /// carry either this or a [`DescriptorError::code`] (which counts up from 1) says which it is.
+    /// A new variant takes the next number; a number is never reused.
+    pub const fn code(&self) -> u8 {
+        match self {
+            I2cError::Bus => 0x81,
+            I2cError::ArbitrationLoss => 0x82,
+            I2cError::NoAcknowledgeAddress => 0x83,
+            I2cError::NoAcknowledgeData => 0x84,
+            I2cError::Overrun => 0x85,
+            I2cError::Timeout => 0x86,
+            I2cError::Other => 0x87,
+            I2cError::BusHeld => 0x88,
+        }
+    }
 }
 
 impl embedded_hal::i2c::Error for I2cError {
     fn kind(&self) -> embedded_hal::i2c::ErrorKind {
         use embedded_hal::i2c::{ErrorKind, NoAcknowledgeSource};
         match self {
-            I2cError::Bus => ErrorKind::Bus,
+            // A data line held through the bus clear is a bus-level fault, the same kind as BERR.
+            I2cError::Bus | I2cError::BusHeld => ErrorKind::Bus,
             I2cError::ArbitrationLoss => ErrorKind::ArbitrationLoss,
             I2cError::NoAcknowledgeAddress => {
                 ErrorKind::NoAcknowledge(NoAcknowledgeSource::Address)
