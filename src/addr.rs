@@ -89,11 +89,17 @@ pub enum PeriphLabel {
     /// offsets as the advanced TIMER0 in [`crate::timer`], MINUS the bridge-only fields. The
     /// cold-path general-PWM target ([`crate::pwm`]).
     Timer1 = 18,
+    /// The factory unique device ID: three read-only words (`UNIQUE_ID[31:0]`, `[63:32]`,
+    /// `[95:64]`) in the device electronic signature block, NOT a peripheral (no clock enable, no
+    /// register model). The base is a family fact: `0x1FFF_F7AC` on F1x0 (GD32F1x0 User Manual Rev3.6
+    /// 1.6.2) and `0x1FFF_F7E8` on F10x (GD32F10x User Manual Rev2.6 1.5.2), populated on every part
+    /// of both families by the family model. Read by [`crate::chip::Chip::unique_id`].
+    UniqueId = 19,
 }
 
 impl PeriphLabel {
     /// Number of labels; the [`AddrTable`] capacity.
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
 
     /// Index of this label into the address-table backing array.
     #[inline]
@@ -516,10 +522,12 @@ mod tests {
         assert_eq!(PeriphLabel::Timer7 as u8, 16);
         assert_eq!(PeriphLabel::Fwdgt as u8, 17);
         assert_eq!(PeriphLabel::Timer1 as u8, 18);
+        assert_eq!(PeriphLabel::UniqueId as u8, 19);
         assert_eq!(PeriphLabel::Rcu.index(), 8);
         assert_eq!(PeriphLabel::I2c1.index(), 10);
         assert_eq!(PeriphLabel::Timer1.index(), 18);
-        assert_eq!(PeriphLabel::COUNT, 19);
+        assert_eq!(PeriphLabel::UniqueId.index(), 19);
+        assert_eq!(PeriphLabel::COUNT, 20);
     }
 
     #[test]

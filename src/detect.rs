@@ -270,6 +270,8 @@ const fn family_model(family: Family) -> FamilyModel {
             addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
             addrs.set(PeriphLabel::Fwdgt, 0x4000_3000); // free watchdog, APB1, same base both families
             addrs.set(PeriphLabel::Timer1, 0x4000_0000); // general TIMER1, APB1, same base both families
+                                                         // Factory unique ID (GD32F10x User Manual Rev2.6 1.5.2); NOT the F1x0 address.
+            addrs.set(PeriphLabel::UniqueId, 0x1FFF_F7E8);
             FamilyModel {
                 gpio: GpioPath::ApbCrlCrh,
                 clock: ClockPath::F10xRcc,
@@ -300,6 +302,8 @@ const fn family_model(family: Family) -> FamilyModel {
             addrs.set(PeriphLabel::Timer0, 0x4001_2C00);
             addrs.set(PeriphLabel::Fwdgt, 0x4000_3000); // free watchdog, APB1, same base both families
             addrs.set(PeriphLabel::Timer1, 0x4000_0000); // general TIMER1, APB1, same base both families
+                                                         // Factory unique ID (GD32F1x0 User Manual Rev3.6 1.6.2); NOT the F10x address.
+            addrs.set(PeriphLabel::UniqueId, 0x1FFF_F7AC);
             FamilyModel {
                 gpio: GpioPath::AhbCtlAfsel,
                 clock: ClockPath::F1x0Rcu,
@@ -510,6 +514,30 @@ mod tests {
         let rc = synthesize(&detected(Family::F10x, 256, 2, 3));
         assert_eq!(rc.addrs.resolve(PeriphLabel::I2c1), Ok(0x4000_5800));
         assert_eq!(rc.addrs.check_i2c_base(PeriphLabel::I2c1), Ok(()));
+    }
+
+    /// The unique-ID base is a family fact (the two manuals' "Device electronic signature"
+    /// sections), carried on every part of each family whatever its density or measured counts.
+    #[test]
+    fn each_family_resolves_unique_id_to_its_manual_address() {
+        assert_eq!(
+            descriptor_f130().addrs.resolve(PeriphLabel::UniqueId),
+            Ok(0x1FFF_F7AC)
+        );
+        assert_eq!(
+            descriptor_f103().addrs.resolve(PeriphLabel::UniqueId),
+            Ok(0x1FFF_F7E8)
+        );
+        for (d, base) in [
+            (detected(Family::F1x0, 16, 1, 1), 0x1FFF_F7AC),
+            (detected(Family::F10x, 16, 1, 1), 0x1FFF_F7E8),
+            (detected(Family::F10x, 256, 2, 3), 0x1FFF_F7E8),
+        ] {
+            assert_eq!(
+                synthesize(&d).addrs.resolve(PeriphLabel::UniqueId),
+                Ok(base)
+            );
+        }
     }
 
     #[test]
